@@ -1,0 +1,22 @@
+/home/rv_nano/AIKB/LicheeRV-Nano-Build/middleware/v2/modules/bin/src/rw_json.o: \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/middleware/v2/modules/bin/src/rw_json.c \
+ include/rw_json.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/cvi_type.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/middleware/v2/include/cvi_bin.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/cvi_comm_video.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/types.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/asm/types.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/asm-generic/types.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/asm-generic/int-ll64.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/asm/bitsperlong.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/asm-generic/bitsperlong.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/posix_types.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/stddef.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/asm/posix_types.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/asm-generic/posix_types.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/cvi_common.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/cvi_defines.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/cvi_base.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/install/soc_sg2002_licheervnano_sd/mw_musl_riscv64/cvitek_mw_sdk/include/cvi_miniz/cvi_miniz.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/cvi_comm_sys.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/middleware/v2/include/cvi_debug.h

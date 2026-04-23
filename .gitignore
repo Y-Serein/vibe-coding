@@ -1,0 +1,60 @@
+# Local editor and cache files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*.tmp
+*.log
+*.pyc
+**/__pycache__/
+
+# SDK top-level generated content
+/install/
+/host-tools/
+
+# Prebuilt host-side binaries and container images
+/host/fuse2fs
+/host/*.so
+/host/*.so.*
+/host/ubuntu/*.sqfs
+
+# Build system generated files
+/build/output/
+/build/.config
+/build/.config*
+/build/config.cmake
+/build/config.all_vars
+/build/.defconfig
+/build/KERNEL_PATH.sh
+/build/mk_gpt
+
+# Buildroot outputs
+/buildroot/output/
+
+# Per-component build outputs
+/u-boot-2021.10/build/
+/linux_5.10/build/
+/opensbi/build/
+/fsbl/build/
+/ramdisk/build/
+
+# Common generated images and archives under install/output trees
+/build/output/**/*.img
+/build/output/**/*.bin
+/build/output/**/*.itb
+/build/output/**/*.cpio
+/build/output/**/*.cpio.gz
+/build/output/**/*.sqsh
+/build/output/**/*.ubifs
+/build/output/**/*.ext4
+/build/output/**/*.tar.gz
+/install/**/*.img
+/install/**/*.bin
+/install/**/*.itb
+/install/**/*.cpio
+/install/**/*.cpio.gz
+/install/**/*.sqsh
+/install/**/*.ubifs
+/install/**/*.ext4
+/install/**/*.tar.gz

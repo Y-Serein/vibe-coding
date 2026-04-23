@@ -1,0 +1,32 @@
+/home/rv_nano/AIKB/LicheeRV-Nano-Build/middleware/v2/modules/vpu/src/vi_ioctl.o: \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/middleware/v2/modules/vpu/src/vi_ioctl.c \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/cvi_comm_video.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/types.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/asm/types.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/asm-generic/types.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/asm-generic/int-ll64.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/asm/bitsperlong.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/asm-generic/bitsperlong.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/posix_types.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/stddef.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/asm/posix_types.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/asm-generic/posix_types.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/cvi_common.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/cvi_type.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/cvi_defines.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/cvi_base.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/cvi_comm_vo.h \
+ include/vi_ioctl.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/vi_isp.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/vi_snsr.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/cif_uapi.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/vi_tun_cfg.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/isp_reg.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/vi_reg_fields.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/vi_reg_blocks.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/vi_vreg_blocks.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/vi_uapi.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/version.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/time_types.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/cvi_comm_vi.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/cvi_comm_sys.h

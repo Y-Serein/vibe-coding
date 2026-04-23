@@ -1,0 +1,40 @@
+/home/rv_nano/AIKB/LicheeRV-Nano-Build/middleware/v2/modules/bin/src/cvi_bin.o: \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/middleware/v2/modules/bin/src/cvi_bin.c \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/middleware/v2/include/cvi_bin.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/cvi_type.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/cvi_comm_video.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/types.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/asm/types.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/asm-generic/types.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/asm-generic/int-ll64.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/asm/bitsperlong.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/asm-generic/bitsperlong.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/posix_types.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/stddef.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/asm/posix_types.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/asm-generic/posix_types.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/cvi_common.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/cvi_defines.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/cvi_base.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/middleware/v2/include/cvi_vi.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/cvi_comm_vi.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/cvi_comm_gdc.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/middleware/v2/include/cvi_comm_vb.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/cvi_errno.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/middleware/v2/include/cvi_debug.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/cvi_comm_sys.h \
+ include/rw_json.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/middleware/v2/modules/isp/include/sg200x/isp_bin.h \
+ include/vpss_bin.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/middleware/v2/modules/sys/include/cvi_base.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/middleware/v2/include/cvi_vpss.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/cvi_comm_vpss.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/middleware/v2/include/cvi_comm_vb.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/cvi_vip_sc.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/cvi_vip.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/version.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/cvi_vip_dwa.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/dwa_uapi.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/vo_disp.h \
+ include/md5.h include/vo_bin.h \
+ /home/rv_nano/AIKB/LicheeRV-Nano-Build/linux_5.10/build/sg2002_licheervnano_sd/riscv/usr/include/linux/cvi_comm_vo.h
