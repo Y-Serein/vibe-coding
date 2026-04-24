@@ -20,7 +20,7 @@
 /* cmd_mode: cmd_mode
  * bit[0]: dcs cmd mode. 0(hw)/1(sw)
  */
-static int cmd_mode = 1;
+static int cmd_mode = 0;
 unsigned int pixel_clk;
 u8 lane_num;
 u8 bits;
@@ -94,6 +94,10 @@ int mipi_tx_set_combo_dev_cfg(const struct combo_dev_cfg_s *dev_cfg)
 	struct combo_dev_cfg_s dev_cfg_t = *dev_cfg;
 	struct disp_ctrl_gpios ctrl_gpios;
 
+	lane_num = 0;
+	pixel_clk = 0;
+	bits = 0;
+
 	dphy_dsi_disable_lanes();
 	for (i = 0; i < LANE_MAX_NUM; i++) {
 		if ((dev_cfg_t.lane_id[i] < 0) || (dev_cfg_t.lane_id[i] >= MIPI_TX_LANE_MAX)) {
@@ -147,12 +151,20 @@ int mipi_tx_set_combo_dev_cfg(const struct combo_dev_cfg_s *dev_cfg)
 	sclr_disp_tgen_enable(true);
 
 	get_disp_ctrl_gpios(&ctrl_gpios);
+	printf("display gpio valid: power=%d pwm=%d reset=%d\n",
+	       dm_gpio_is_valid(&ctrl_gpios.disp_power_ct_gpio),
+	       dm_gpio_is_valid(&ctrl_gpios.disp_pwm_gpio),
+	       dm_gpio_is_valid(&ctrl_gpios.disp_reset_gpio));
 
-	ret = dm_gpio_set_value(&ctrl_gpios.disp_power_ct_gpio,
-				ctrl_gpios.disp_power_ct_gpio.flags & GPIOD_ACTIVE_LOW ? 0 : 1);
-	if (ret < 0) {
-		printf("dm_gpio_set_value(disp_power_ct_gpio, deassert) failed: %d", ret);
-		//return ret;
+	if (dm_gpio_is_valid(&ctrl_gpios.disp_power_ct_gpio)) {
+		ret = dm_gpio_set_value(&ctrl_gpios.disp_power_ct_gpio,
+					ctrl_gpios.disp_power_ct_gpio.flags & GPIOD_ACTIVE_LOW ? 0 : 1);
+		if (ret < 0) {
+			printf("dm_gpio_set_value(disp_power_ct_gpio, deassert) failed: %d", ret);
+			//return ret;
+		}
+	} else {
+		printf("disp_power_ct_gpio invalid, skip power control\n");
 	}
 	ret = dm_gpio_set_value(&ctrl_gpios.disp_pwm_gpio,
 				ctrl_gpios.disp_pwm_gpio.flags & GPIOD_ACTIVE_LOW ? 0 : 1);

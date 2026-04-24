@@ -107,6 +107,7 @@ int cvi_board_init(void)
 
         // lcd reset
         mmio_write_32(0x030010A4, 0x0); // PWRGPIO 0 GPIO_MODE
+        mmio_write_32(0x030010A8, 0x0); // PWRGPIO 1 GPIO_MODE
 
 	user_led_toggle();
         // lcd backlight

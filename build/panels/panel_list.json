@@ -2,6 +2,7 @@
 	"panel_list" : {
 		"mipi" : [
 			"zct2133v1",
+			"gc9503_cxw034",
 			"hx8394",
 			"ili9881c",
 			"ili9881d",

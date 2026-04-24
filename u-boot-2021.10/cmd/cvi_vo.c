@@ -14,10 +14,12 @@
 #include <cvi_lvds.h>
 #include "../drivers/video/cvitek/scaler.h"
 #include "../drivers/video/cvitek/dsi_phy.h"
+#include "../drivers/video/cvitek/vip_common.h"
 
 #include <cvi_panels/cvi_panels.h>
 
 #include <asm/io.h>
+#include <asm/gpio.h>
 #include "part.h"
 #include "fs.h"
 
@@ -78,6 +80,86 @@ static int dsi_init(int devno, const struct dsc_instr *cmds, int size)
 		}
 	}
 	return ret;
+}
+
+static void dsi_dump_panel_state(int devno)
+{
+	struct {
+		u8 cmd;
+		u8 len;
+		const char *name;
+	} reads[] = {
+		{0x04, 3, "RDID(0x04)"},
+		{0xDA, 1, "ID1(0xDA)"},
+		{0xDB, 1, "ID2(0xDB)"},
+		{0xDC, 1, "ID3(0xDC)"},
+		{0x0A, 1, "PowerMode(0x0A)"},
+		{0x0C, 1, "PixelFmt(0x0C)"},
+	};
+
+	for (int i = 0; i < ARRAY_SIZE(reads); i++) {
+		u8 buf[4] = {0};
+		struct get_cmd_info_s get_cmd_info = {
+			.devno = devno,
+			.data_type = 0x06,
+			.data_param = reads[i].cmd,
+			.get_data_size = reads[i].len,
+			.get_data = buf,
+		};
+		int ret = mipi_tx_get_cmd(&get_cmd_info);
+
+		if (ret < 0) {
+			printf("panel read %s failed: %d\n", reads[i].name, ret);
+			continue;
+		}
+
+		printf("panel read %s =", reads[i].name);
+		for (int j = 0; j < reads[i].len; j++)
+			printf(" %02x", buf[j]);
+		printf("\n");
+	}
+}
+
+static void gc9503_prepare_panel(void)
+{
+	struct disp_ctrl_gpios ctrl_gpios;
+	union vip_sys_reset reset_mask;
+
+	get_disp_ctrl_gpios(&ctrl_gpios);
+	printf("GC9503 prepare: enter LP init mode\n");
+	mipi_tx_set_mode(0);
+	sclr_disp_tgen_enable(false);
+
+	memset(&reset_mask, 0, sizeof(reset_mask));
+	reset_mask.b.disp = 1;
+	reset_mask.b.bt = 1;
+	reset_mask.b.dsi_mac = 1;
+	printf("GC9503 prepare: toggle VIP reset disp/bt/dsi_mac\n");
+	vip_toggle_reset(reset_mask);
+
+	if (!dm_gpio_is_valid(&ctrl_gpios.disp_reset_gpio)) {
+		printf("GC9503 prepare: reset GPIO invalid\n");
+		return;
+	}
+
+	/*
+	 * Vendor sequence from GC9503SSD 1.c:
+	 * LCD RESET high 200ms -> low 100ms -> high 200ms.
+	 * For an active-low reset line, logical 0/1/0 matches that sequence.
+	 */
+	dm_gpio_set_value(&ctrl_gpios.disp_reset_gpio, 0);
+	mdelay(200);
+	dm_gpio_set_value(&ctrl_gpios.disp_reset_gpio, 1);
+	mdelay(100);
+	dm_gpio_set_value(&ctrl_gpios.disp_reset_gpio, 0);
+	mdelay(200);
+}
+
+static void gc9503_finish_panel(void)
+{
+	printf("GC9503 prepare: switch to HS video mode\n");
+	mipi_tx_set_mode(1);
+	sclr_disp_tgen_enable(true);
 }
 
 #if PANLE_ADAPTIVITY
@@ -160,9 +242,16 @@ static void dsi_panel_init(void)
 	u8 prepare = panel_desc.hs_timing_cfg->prepare;
 	u8 zero = panel_desc.hs_timing_cfg->zero;
 	u8 trail = panel_desc.hs_timing_cfg->trail;
+	bool is_gc9503 = !strcmp(panel_desc.panel_name, "GC9503-CXW034-480x800");
 	printf("Init panel %s\n", panel_desc.panel_name);
 	mipi_tx_set_combo_dev_cfg(panel_desc.dev_cfg);
+	if (is_gc9503)
+		gc9503_prepare_panel();
 	dsi_init(0, panel_desc.dsi_init_cmds, panel_desc.dsi_init_cmds_size);
+	if (is_gc9503) {
+		dsi_dump_panel_state(0);
+		gc9503_finish_panel();
+	}
 	dphy_set_hs_settle(prepare, zero, trail);
 }
 #endif
@@ -414,6 +503,12 @@ static int do_startvo(struct cmd_tbl *cmdtp, int flag, int argc, char * const ar
 			panel_desc.hs_timing_cfg = &hs_timing_cfg_st7701_d310t9362v1_480x800;
 			panel_desc.dsi_init_cmds = dsi_init_cmds_st7701_d310t9362v1_480x800;
 			panel_desc.dsi_init_cmds_size = ARRAY_SIZE(dsi_init_cmds_st7701_d310t9362v1_480x800);		// g
+		} else if (strcmp(panel_name,"gc9503_cxw034") == 0) {
+			panel_desc.panel_name = "GC9503-CXW034-480x800";
+			panel_desc.dev_cfg = &dev_cfg_gc9503_cxw034_480x800;
+			panel_desc.hs_timing_cfg = &hs_timing_cfg_gc9503_cxw034_480x800;
+			panel_desc.dsi_init_cmds = dsi_init_cmds_gc9503_cxw034_480x800;
+			panel_desc.dsi_init_cmds_size = ARRAY_SIZE(dsi_init_cmds_gc9503_cxw034_480x800);
 		} else {
 			printf("panel %s not found\n\r", panel_name);
 		}
@@ -640,4 +735,3 @@ U_BOOT_CMD(setvobg
 	, "set vo background color"
 	, "    - setvobg [dev bgcolor]"
 );
-

@@ -35,12 +35,13 @@
 #ifndef __UBOOT__
 	/delete-property/ reset-gpio;
 	/delete-property/ pwm-gpio;
+	/delete-property/ power-ct-gpio;
 #else
 	// for uboot
         reset-gpio = <&porte 0 1>;
-        pwm-gpio = <&porte 2 1>;
+        pwm-gpio = <&porte 2 0>;
+        power-ct-gpio = <&porte 1 0>;
 #endif
-        /delete-property/ power-ct-gpio;
 
 };
 
@@ -48,12 +49,13 @@
 #ifndef __UBOOT__
 	// for linux kernel
         reset-gpio = <&porte 0 1>;
-        pwm-gpio = <&porte 2 1>;
+        pwm-gpio = <&porte 2 0>;
+        /delete-property/ power-ct-gpio;
 #else
         /delete-property/ reset-gpio;
         /delete-property/ pwm-gpio;
-#endif
         /delete-property/ power-ct-gpio;
+#endif
         status = "okay";
 };
 

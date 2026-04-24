@@ -101,6 +101,10 @@ static int cvi_vo_probe(struct udevice *dev)
 		printf("%s: Warning: cannot get power GPIO: ret=%d\n", __func__, ret);
 		if (ret != -ENOENT)
 			return ret;
+	} else {
+		printf("%s: power GPIO ready (valid=%d flags=0x%lx)\n", __func__,
+		       dm_gpio_is_valid(&priv->ctrl_gpios.disp_power_ct_gpio),
+		       priv->ctrl_gpios.disp_power_ct_gpio.flags);
 	}
 	set_disp_ctrl_gpios(&priv->ctrl_gpios);
 
