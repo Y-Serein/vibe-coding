@@ -38,9 +38,9 @@
 	/delete-property/ power-ct-gpio;
 #else
 	// for uboot
-        reset-gpio = <&porte 0 1>;
-        pwm-gpio = <&porte 2 0>;
-        power-ct-gpio = <&porte 1 0>;
+        reset-gpio = <&porte 0 GPIO_ACTIVE_LOW>;
+        pwm-gpio = <&porte 2 GPIO_ACTIVE_HIGH>;
+        power-ct-gpio = <&porte 1 GPIO_ACTIVE_HIGH>;
 #endif
 
 };
@@ -48,8 +48,8 @@
 &mipi_tx {
 #ifndef __UBOOT__
 	// for linux kernel
-        reset-gpio = <&porte 0 1>;
-        pwm-gpio = <&porte 2 0>;
+        reset-gpio = <&porte 0 GPIO_ACTIVE_LOW>;
+        pwm-gpio = <&porte 2 GPIO_ACTIVE_HIGH>;
         /delete-property/ power-ct-gpio;
 #else
         /delete-property/ reset-gpio;

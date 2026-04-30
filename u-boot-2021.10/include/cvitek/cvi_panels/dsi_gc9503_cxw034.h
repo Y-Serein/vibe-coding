@@ -12,16 +12,16 @@
 
 /*
  * Command sequence comes from docs/TFT/GC9503SSD 1.c.
- * Timing values currently use the in-tree 480x800/2-lane ST7701 profile,
- * which is a more conservative baseline for bring-up until CXW034BS001A
- * timing is confirmed from the panel PDF.
+ * CXW034BS001A.pdf identifies the module as a 3.4 inch
+ * 412RGB(W) x 960(H) panel. Keep the existing conservative porch values
+ * as a bring-up baseline until the vendor DSI video timing is confirmed.
  */
-#define GC9503_CXW034_VACT	800
+#define GC9503_CXW034_VACT	960
 #define GC9503_CXW034_VSA	10
 #define GC9503_CXW034_VBP	20
 #define GC9503_CXW034_VFP	20
 
-#define GC9503_CXW034_HACT	480
+#define GC9503_CXW034_HACT	412
 #define GC9503_CXW034_HSA	10
 #define GC9503_CXW034_HBP	50
 #define GC9503_CXW034_HFP	50
@@ -29,7 +29,7 @@
 #define GC9503_CXW034_PIXEL_CLK(x) ((x##_VACT + x##_VSA + x##_VBP + x##_VFP) \
 	* (x##_HACT + x##_HSA + x##_HBP + x##_HFP) * 60 / 1000)
 
-struct combo_dev_cfg_s dev_cfg_gc9503_cxw034_480x800 = {
+struct combo_dev_cfg_s dev_cfg_gc9503_cxw034_412x960 = {
 	.devno = 0,
 	/*
 	 * Board-level wiring supplied during bring-up:
@@ -57,7 +57,7 @@ struct combo_dev_cfg_s dev_cfg_gc9503_cxw034_480x800 = {
 	.pixel_clk = GC9503_CXW034_PIXEL_CLK(GC9503_CXW034),
 };
 
-const struct hs_settle_s hs_timing_cfg_gc9503_cxw034_480x800 = {
+const struct hs_settle_s hs_timing_cfg_gc9503_cxw034_412x960 = {
 	.prepare = 6,
 	.zero = 32,
 	.trail = 1,
@@ -108,9 +108,14 @@ static CVI_U8 data_gc9503_cxw034_display_on[] = {0x29};
 
 #define TYPE1_DCS_SHORT_WRITE 0x05
 #define TYPE2_DCS_SHORT_WRITE 0x15
-#define TYPE3_DCS_LONG_WRITE_GC9503 0x39
+/*
+ * The vendor GC9503SSD sequence wraps these private register writes in
+ * SSD_SEND(); Cvitek's other vendor-panel ports use MIPI generic long
+ * packets for the same style of private payloads.
+ */
+#define TYPE3_DCS_LONG_WRITE_GC9503 0x29
 
-const struct dsc_instr dsi_init_cmds_gc9503_cxw034_480x800[] = {
+const struct dsc_instr dsi_init_cmds_gc9503_cxw034_412x960[] = {
 	{.delay = 0, .data_type = TYPE3_DCS_LONG_WRITE_GC9503, .size = 6, .data = data_gc9503_cxw034_0 },
 	{.delay = 0, .data_type = TYPE3_DCS_LONG_WRITE_GC9503, .size = 3, .data = data_gc9503_cxw034_1 },
 	{.delay = 0, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_gc9503_cxw034_2 },

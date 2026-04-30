@@ -82,84 +82,129 @@ static int dsi_init(int devno, const struct dsc_instr *cmds, int size)
 	return ret;
 }
 
-static void dsi_dump_panel_state(int devno)
+#define GC9503_ENABLE_PANEL_BIST 0
+
+static int dsi_send_debug_cmd(int devno, u8 data_type, const void *data, u8 size)
 {
-	struct {
-		u8 cmd;
-		u8 len;
-		const char *name;
-	} reads[] = {
-		{0x04, 3, "RDID(0x04)"},
-		{0xDA, 1, "ID1(0xDA)"},
-		{0xDB, 1, "ID2(0xDB)"},
-		{0xDC, 1, "ID3(0xDC)"},
-		{0x0A, 1, "PowerMode(0x0A)"},
-		{0x0C, 1, "PixelFmt(0x0C)"},
+	struct cmd_info_s cmd_info = {
+		.devno = devno,
+		.cmd_size = size,
+		.data_type = data_type,
+		.cmd = (void *)data,
 	};
+	int ret = mipi_tx_set_cmd(&cmd_info);
 
-	for (int i = 0; i < ARRAY_SIZE(reads); i++) {
-		u8 buf[4] = {0};
-		struct get_cmd_info_s get_cmd_info = {
-			.devno = devno,
-			.data_type = 0x06,
-			.data_param = reads[i].cmd,
-			.get_data_size = reads[i].len,
-			.get_data = buf,
-		};
-		int ret = mipi_tx_get_cmd(&get_cmd_info);
+	printf("GC9503 panel BIST: send dtype=0x%02x size=%u ret=%d\n",
+	       data_type, size, ret);
 
-		if (ret < 0) {
-			printf("panel read %s failed: %d\n", reads[i].name, ret);
-			continue;
-		}
-
-		printf("panel read %s =", reads[i].name);
-		for (int j = 0; j < reads[i].len; j++)
-			printf(" %02x", buf[j]);
-		printf("\n");
-	}
+	return ret;
 }
 
-static void gc9503_prepare_panel(void)
+static void panel_gpio_dump(const char *name, struct gpio_desc *gpio)
 {
-	struct disp_ctrl_gpios ctrl_gpios;
-	union vip_sys_reset reset_mask;
+	if (!dm_gpio_is_valid(gpio)) {
+		printf("GC9503 gpio %-5s: invalid\n", name);
+		return;
+	}
 
-	get_disp_ctrl_gpios(&ctrl_gpios);
-	printf("GC9503 prepare: enter LP init mode\n");
-	mipi_tx_set_mode(0);
-	sclr_disp_tgen_enable(false);
+	printf("GC9503 gpio %-5s: offset=%u flags=0x%lx logical=%d\n",
+	       name, gpio->offset, gpio->flags, dm_gpio_get_value(gpio));
+}
+
+static void panel_gpio_set_active(const char *name, struct gpio_desc *gpio)
+{
+	int ret;
+
+	if (!dm_gpio_is_valid(gpio))
+		return;
+
+	ret = dm_gpio_set_value(gpio, 1);
+	printf("GC9503 gpio %-5s <- active ret=%d logical=%d\n",
+	       name, ret, dm_gpio_get_value(gpio));
+}
+
+static void panel_gpio_set_inactive(const char *name, struct gpio_desc *gpio)
+{
+	int ret;
+
+	if (!dm_gpio_is_valid(gpio))
+		return;
+
+	ret = dm_gpio_set_value(gpio, 0);
+	printf("GC9503 gpio %-5s <- inactive ret=%d logical=%d\n",
+	       name, ret, dm_gpio_get_value(gpio));
+}
+
+static void gc9503_reset_display_blocks(void)
+{
+	union vip_sys_reset reset_mask;
 
 	memset(&reset_mask, 0, sizeof(reset_mask));
 	reset_mask.b.disp = 1;
 	reset_mask.b.bt = 1;
 	reset_mask.b.dsi_mac = 1;
-	printf("GC9503 prepare: toggle VIP reset disp/bt/dsi_mac\n");
+	printf("GC9503 reset: toggle VIP disp/bt/dsi_mac before MIPI cfg\n");
 	vip_toggle_reset(reset_mask);
+}
+
+static void gc9503_prepare_panel(void)
+{
+	struct disp_ctrl_gpios ctrl_gpios;
+
+	get_disp_ctrl_gpios(&ctrl_gpios);
+	printf("GC9503 prepare: enter LP init mode\n");
+	panel_gpio_dump("power", &ctrl_gpios.disp_power_ct_gpio);
+	panel_gpio_dump("pwm", &ctrl_gpios.disp_pwm_gpio);
+	panel_gpio_dump("reset", &ctrl_gpios.disp_reset_gpio);
+	mipi_tx_set_mode(0);
+	sclr_disp_tgen_enable(false);
+
+	/*
+	 * Approximate the vendor sequence from GC9503SSD 1.c with the board
+	 * controls we actually have: main panel power via power-ct kept enabled,
+	 * BL via pwm kept disabled during init,
+	 * then LCD reset high -> low -> high with 200/100/200 ms delays.
+	 */
+	panel_gpio_set_active("power", &ctrl_gpios.disp_power_ct_gpio);
+	panel_gpio_set_inactive("pwm", &ctrl_gpios.disp_pwm_gpio);
+	mdelay(300);
 
 	if (!dm_gpio_is_valid(&ctrl_gpios.disp_reset_gpio)) {
 		printf("GC9503 prepare: reset GPIO invalid\n");
 		return;
 	}
 
-	/*
-	 * Vendor sequence from GC9503SSD 1.c:
-	 * LCD RESET high 200ms -> low 100ms -> high 200ms.
-	 * For an active-low reset line, logical 0/1/0 matches that sequence.
-	 */
-	dm_gpio_set_value(&ctrl_gpios.disp_reset_gpio, 0);
+	panel_gpio_set_inactive("reset", &ctrl_gpios.disp_reset_gpio);
 	mdelay(200);
-	dm_gpio_set_value(&ctrl_gpios.disp_reset_gpio, 1);
+	panel_gpio_set_active("reset", &ctrl_gpios.disp_reset_gpio);
 	mdelay(100);
-	dm_gpio_set_value(&ctrl_gpios.disp_reset_gpio, 0);
+	panel_gpio_set_inactive("reset", &ctrl_gpios.disp_reset_gpio);
 	mdelay(200);
 }
 
 static void gc9503_finish_panel(void)
 {
-	printf("GC9503 prepare: switch to HS video mode\n");
+	struct disp_ctrl_gpios ctrl_gpios;
+
+	get_disp_ctrl_gpios(&ctrl_gpios);
+	panel_gpio_set_active("pwm", &ctrl_gpios.disp_pwm_gpio);
+	printf("GC9503 finish: switch to HS video mode\n");
 	mipi_tx_set_mode(1);
 	sclr_disp_tgen_enable(true);
+	sclr_disp_set_pattern(SCL_PAT_TYPE_AUTO, SCL_PAT_COLOR_BAR, NULL);
+	sclr_disp_enable_window_bgcolor(false);
+	sclr_disp_reg_force_up();
+	printf("GC9503 finish: enable DISP color-bar pattern\n");
+}
+
+static void gc9503_enable_panel_bist(void)
+{
+	static const u8 page0[] = {0xF0, 0x55, 0xAA, 0x52, 0x08, 0x00};
+	static const u8 bist[] = {0xEE, 0x87, 0x78, 0xFF, 0xFF};
+
+	printf("GC9503 panel BIST: enable internal test pattern\n");
+	dsi_send_debug_cmd(0, 0x29, page0, sizeof(page0));
+	dsi_send_debug_cmd(0, 0x29, bist, sizeof(bist));
 }
 
 #if PANLE_ADAPTIVITY
@@ -242,17 +287,23 @@ static void dsi_panel_init(void)
 	u8 prepare = panel_desc.hs_timing_cfg->prepare;
 	u8 zero = panel_desc.hs_timing_cfg->zero;
 	u8 trail = panel_desc.hs_timing_cfg->trail;
-	bool is_gc9503 = !strcmp(panel_desc.panel_name, "GC9503-CXW034-480x800");
+	bool is_gc9503 = !strcmp(panel_desc.panel_name, "GC9503-CXW034-412x960");
 	printf("Init panel %s\n", panel_desc.panel_name);
+	if (is_gc9503)
+		gc9503_reset_display_blocks();
 	mipi_tx_set_combo_dev_cfg(panel_desc.dev_cfg);
 	if (is_gc9503)
 		gc9503_prepare_panel();
 	dsi_init(0, panel_desc.dsi_init_cmds, panel_desc.dsi_init_cmds_size);
+	if (is_gc9503 && GC9503_ENABLE_PANEL_BIST)
+		gc9503_enable_panel_bist();
+	else if (is_gc9503)
+		printf("GC9503 panel BIST: disabled for DISP color-bar test\n");
+	dphy_set_hs_settle(prepare, zero, trail);
 	if (is_gc9503) {
-		dsi_dump_panel_state(0);
+		printf("GC9503 debug: skip BTA panel reads before HS video\n");
 		gc9503_finish_panel();
 	}
-	dphy_set_hs_settle(prepare, zero, trail);
 }
 #endif
 
@@ -504,11 +555,11 @@ static int do_startvo(struct cmd_tbl *cmdtp, int flag, int argc, char * const ar
 			panel_desc.dsi_init_cmds = dsi_init_cmds_st7701_d310t9362v1_480x800;
 			panel_desc.dsi_init_cmds_size = ARRAY_SIZE(dsi_init_cmds_st7701_d310t9362v1_480x800);		// g
 		} else if (strcmp(panel_name,"gc9503_cxw034") == 0) {
-			panel_desc.panel_name = "GC9503-CXW034-480x800";
-			panel_desc.dev_cfg = &dev_cfg_gc9503_cxw034_480x800;
-			panel_desc.hs_timing_cfg = &hs_timing_cfg_gc9503_cxw034_480x800;
-			panel_desc.dsi_init_cmds = dsi_init_cmds_gc9503_cxw034_480x800;
-			panel_desc.dsi_init_cmds_size = ARRAY_SIZE(dsi_init_cmds_gc9503_cxw034_480x800);
+			panel_desc.panel_name = "GC9503-CXW034-412x960";
+			panel_desc.dev_cfg = &dev_cfg_gc9503_cxw034_412x960;
+			panel_desc.hs_timing_cfg = &hs_timing_cfg_gc9503_cxw034_412x960;
+			panel_desc.dsi_init_cmds = dsi_init_cmds_gc9503_cxw034_412x960;
+			panel_desc.dsi_init_cmds_size = ARRAY_SIZE(dsi_init_cmds_gc9503_cxw034_412x960);
 		} else {
 			printf("panel %s not found\n\r", panel_name);
 		}

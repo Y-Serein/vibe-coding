@@ -441,11 +441,11 @@ void SAMPLE_MIPI_SET_PANEL_DESC()
 			g_panel_desc.dsi_init_cmds_size = ARRAY_SIZE(dsi_init_cmds_zct2133v1_800x1280);
 			break;
 		case DSI_PANEL_GC9503_CXW034:
-			g_panel_desc.panel_name = "GC9503-CXW034-480x800";
-			g_panel_desc.dev_cfg = &dev_cfg_gc9503_cxw034_480x800;
-			g_panel_desc.hs_timing_cfg = &hs_timing_cfg_gc9503_cxw034_480x800;
-			g_panel_desc.dsi_init_cmds = dsi_init_cmds_gc9503_cxw034_480x800;
-			g_panel_desc.dsi_init_cmds_size = ARRAY_SIZE(dsi_init_cmds_gc9503_cxw034_480x800);
+			g_panel_desc.panel_name = "GC9503-CXW034-412x960";
+			g_panel_desc.dev_cfg = &dev_cfg_gc9503_cxw034_412x960;
+			g_panel_desc.hs_timing_cfg = &hs_timing_cfg_gc9503_cxw034_412x960;
+			g_panel_desc.dsi_init_cmds = dsi_init_cmds_gc9503_cxw034_412x960;
+			g_panel_desc.dsi_init_cmds_size = ARRAY_SIZE(dsi_init_cmds_gc9503_cxw034_412x960);
 			break;
 		case DSI_PANEL_HX8399_1080P:
 			g_panel_desc.panel_name = "HX8399_1080x1920";

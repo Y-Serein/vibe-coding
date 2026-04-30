@@ -20,7 +20,7 @@
 /* cmd_mode: cmd_mode
  * bit[0]: dcs cmd mode. 0(hw)/1(sw)
  */
-static int cmd_mode = 0;
+static int cmd_mode = 1;
 unsigned int pixel_clk;
 u8 lane_num;
 u8 bits;
@@ -89,6 +89,7 @@ int mipi_tx_set_combo_dev_cfg(const struct combo_dev_cfg_s *dev_cfg)
 	int ret, i;
 	bool data_en[LANE_MAX_NUM] = {false, false, false, false, false};
 	struct sclr_disp_timing timing;
+	struct sclr_top_cfg *top_cfg;
 	enum sclr_dsi_fmt dsi_fmt;
 	bool preamble_on = false;
 	struct combo_dev_cfg_s dev_cfg_t = *dev_cfg;
@@ -141,11 +142,36 @@ int mipi_tx_set_combo_dev_cfg(const struct combo_dev_cfg_s *dev_cfg)
 	}
 	_cal_htt_extra(&dev_cfg_t, lane_num, bits);
 	pixel_clk = dev_cfg_t.pixel_clk;
+	printf("mipi cfg: pixel_clk=%uKHz lane_num=%u bits=%u mode=%u video=%u fmt=%u\n",
+	       pixel_clk, lane_num, bits, dev_cfg_t.output_mode,
+	       dev_cfg_t.video_mode, dev_cfg_t.output_format);
+	printf("mipi cfg: lane_id={%d,%d,%d,%d,%d} pn_swap={%d,%d,%d,%d,%d}\n",
+	       dev_cfg_t.lane_id[0], dev_cfg_t.lane_id[1], dev_cfg_t.lane_id[2],
+	       dev_cfg_t.lane_id[3], dev_cfg_t.lane_id[4],
+	       dev_cfg_t.lane_pn_swap[0], dev_cfg_t.lane_pn_swap[1],
+	       dev_cfg_t.lane_pn_swap[2], dev_cfg_t.lane_pn_swap[3],
+	       dev_cfg_t.lane_pn_swap[4]);
+	printf("mipi cfg: hsa=%u hbp=%u hact=%u hfp=%u vsa=%u vbp=%u vact=%u vfp=%u\n",
+	       dev_cfg_t.sync_info.vid_hsa_pixels,
+	       dev_cfg_t.sync_info.vid_hbp_pixels,
+	       dev_cfg_t.sync_info.vid_hline_pixels,
+	       dev_cfg_t.sync_info.vid_hfp_pixels,
+	       dev_cfg_t.sync_info.vid_vsa_lines,
+	       dev_cfg_t.sync_info.vid_vbp_lines,
+	       dev_cfg_t.sync_info.vid_active_lines,
+	       dev_cfg_t.sync_info.vid_vfp_lines);
 	_fill_disp_timing(&timing, &dev_cfg_t.sync_info);
 	preamble_on = (dev_cfg_t.pixel_clk * bits / lane_num) > 1500000;
 	dphy_dsi_lane_en(true, data_en, preamble_on);
 	dphy_dsi_set_pll(dev_cfg_t.pixel_clk, lane_num, bits);
 	sclr_disp_set_intf(SCLR_VO_INTF_MIPI);
+
+	top_cfg = sclr_top_get_cfg();
+	top_cfg->disp_enable = true;
+	sclr_top_set_cfg(top_cfg);
+	printf("mipi cfg: top disp_enable=%u disp_from_sc=%u\n",
+	       top_cfg->disp_enable, top_cfg->disp_from_sc);
+
 	sclr_dsi_config(lane_num, dsi_fmt, dev_cfg_t.sync_info.vid_hline_pixels);
 	sclr_disp_set_timing(&timing);
 	sclr_disp_tgen_enable(true);
@@ -155,6 +181,21 @@ int mipi_tx_set_combo_dev_cfg(const struct combo_dev_cfg_s *dev_cfg)
 	       dm_gpio_is_valid(&ctrl_gpios.disp_power_ct_gpio),
 	       dm_gpio_is_valid(&ctrl_gpios.disp_pwm_gpio),
 	       dm_gpio_is_valid(&ctrl_gpios.disp_reset_gpio));
+	if (dm_gpio_is_valid(&ctrl_gpios.disp_power_ct_gpio))
+		printf("display gpio power: offset=%u flags=0x%lx logical=%d\n",
+		       ctrl_gpios.disp_power_ct_gpio.offset,
+		       ctrl_gpios.disp_power_ct_gpio.flags,
+		       dm_gpio_get_value(&ctrl_gpios.disp_power_ct_gpio));
+	if (dm_gpio_is_valid(&ctrl_gpios.disp_pwm_gpio))
+		printf("display gpio pwm: offset=%u flags=0x%lx logical=%d\n",
+		       ctrl_gpios.disp_pwm_gpio.offset,
+		       ctrl_gpios.disp_pwm_gpio.flags,
+		       dm_gpio_get_value(&ctrl_gpios.disp_pwm_gpio));
+	if (dm_gpio_is_valid(&ctrl_gpios.disp_reset_gpio))
+		printf("display gpio reset: offset=%u flags=0x%lx logical=%d\n",
+		       ctrl_gpios.disp_reset_gpio.offset,
+		       ctrl_gpios.disp_reset_gpio.flags,
+		       dm_gpio_get_value(&ctrl_gpios.disp_reset_gpio));
 
 	if (dm_gpio_is_valid(&ctrl_gpios.disp_power_ct_gpio)) {
 		ret = dm_gpio_set_value(&ctrl_gpios.disp_power_ct_gpio,

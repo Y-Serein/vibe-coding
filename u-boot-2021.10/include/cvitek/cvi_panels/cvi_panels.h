@@ -194,11 +194,11 @@ static struct panel_desc_s panel_desc = {
 };
 #elif defined(MIPI_PANEL_GC9503_CXW034)
 static struct panel_desc_s panel_desc = {
-	.panel_name = "GC9503-CXW034-480x800",
-	.dev_cfg = &dev_cfg_gc9503_cxw034_480x800,
-	.hs_timing_cfg = &hs_timing_cfg_gc9503_cxw034_480x800,
-	.dsi_init_cmds = dsi_init_cmds_gc9503_cxw034_480x800,
-	.dsi_init_cmds_size = ARRAY_SIZE(dsi_init_cmds_gc9503_cxw034_480x800)
+	.panel_name = "GC9503-CXW034-412x960",
+	.dev_cfg = &dev_cfg_gc9503_cxw034_412x960,
+	.hs_timing_cfg = &hs_timing_cfg_gc9503_cxw034_412x960,
+	.dsi_init_cmds = dsi_init_cmds_gc9503_cxw034_412x960,
+	.dsi_init_cmds_size = ARRAY_SIZE(dsi_init_cmds_gc9503_cxw034_412x960)
 };
 #elif defined(MIPI_PANEL_ZCT2133V1)
 static struct panel_desc_s panel_desc = {

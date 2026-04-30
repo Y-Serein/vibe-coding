@@ -81,4 +81,5 @@
  ../../component/panel/sg200x/dsi_lt9611.h \
  ../../component/panel/sg200x/dsi_st7785m.h \
  ../../component/panel/sg200x/dsi_zct2133v1.h \
+ ../../component/panel/sg200x/dsi_gc9503_cxw034.h \
  ../../component/panel/sg200x/dsi_d240si31.h

@@ -26,6 +26,18 @@ struct cvi_vo_priv {
 	struct disp_ctrl_gpios ctrl_gpios;
 };
 
+static void cvi_vo_dump_gpio(const char *name, struct gpio_desc *gpio)
+{
+	if (!dm_gpio_is_valid(gpio)) {
+		printf("display gpio %-5s: invalid\n", name);
+		return;
+	}
+
+	printf("display gpio %-5s: dev=%s offset=%u flags=0x%lx logical=%d\n",
+	       name, gpio->dev ? gpio->dev->name : "?", gpio->offset,
+	       gpio->flags, dm_gpio_get_value(gpio));
+}
+
 static int cvi_vo_bind(struct udevice *dev)
 {
 	//struct video_uc_plat *plat = dev_get_uclass_plat(dev);
@@ -106,6 +118,9 @@ static int cvi_vo_probe(struct udevice *dev)
 		       dm_gpio_is_valid(&priv->ctrl_gpios.disp_power_ct_gpio),
 		       priv->ctrl_gpios.disp_power_ct_gpio.flags);
 	}
+	cvi_vo_dump_gpio("reset", &priv->ctrl_gpios.disp_reset_gpio);
+	cvi_vo_dump_gpio("pwm", &priv->ctrl_gpios.disp_pwm_gpio);
+	cvi_vo_dump_gpio("power", &priv->ctrl_gpios.disp_power_ct_gpio);
 	set_disp_ctrl_gpios(&priv->ctrl_gpios);
 
 	video_set_flush_dcache(dev, 1);
