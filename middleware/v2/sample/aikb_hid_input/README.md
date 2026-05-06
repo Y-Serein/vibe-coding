@@ -27,14 +27,26 @@ byte2 = signed encoder delta, left = -1, right = +1
 byte3..63 = 0
 ```
 
-Output report ID `0x20` is parsed and acknowledged with input report ID `0x21`;
-the terminal text path is intentionally kept separate for the LCD UI to consume
-later.
+Output report ID `0x20` is parsed and acknowledged with input report ID `0x21`.
+When `--screen-out PATH` is set, screen commands are translated into VT100
+bytes and written to `PATH` for `aikb_lcd_ui --input PATH`:
+
+```text
+0x01 clear       -> ESC[2J ESC[H
+0x02 write text  -> UTF-8 payload bytes
+0x03 set cursor  -> ESC[row;colH from "row,col"
+0x04 newline     -> CR LF
+0x05 backspace   -> BS
+```
+
+The default boot script creates `/tmp/aikb_lcd_ui.in` as a FIFO, starts
+`aikb_lcd_ui` on that FIFO, and starts `aikb_hid_input` with
+`--screen-out /tmp/aikb_lcd_ui.in`.
 
 ## Board Test
 
 ```sh
-/mnt/system/usr/bin/aikb_hid_input --hid /dev/hidg0 --debug
+/mnt/system/usr/bin/aikb_hid_input --hid /dev/hidg0 --screen-out /tmp/aikb_lcd_ui.in --debug
 cat /tmp/aikb_hid_input.log
 ```
 

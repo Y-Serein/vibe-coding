@@ -34,9 +34,18 @@
 #define PINMUX_FUNC_GPIOA 0x3u
 
 #define HID_REPORT_LEN 64
+#define HID_OUTPUT_MAX_PAYLOAD 60
 #define REPORT_ID_INPUT 0x10
 #define REPORT_ID_OUTPUT 0x20
 #define REPORT_ID_ACK 0x21
+#define SCREEN_CMD_CLEAR 0x01
+#define SCREEN_CMD_WRITE 0x02
+#define SCREEN_CMD_SET_CURSOR 0x03
+#define SCREEN_CMD_NEWLINE 0x04
+#define SCREEN_CMD_BACKSPACE 0x05
+#define ACK_STATUS_OK 0x00
+#define ACK_STATUS_BUSY 0x01
+#define ACK_STATUS_ERR 0x02
 
 struct mmio_page {
 	uint32_t base;
@@ -59,6 +68,7 @@ struct debouncer {
 
 struct config {
 	const char *hid_path;
+	const char *screen_out_path;
 	unsigned poll_ms;
 	unsigned debounce_ms;
 	bool debug;
@@ -325,11 +335,192 @@ static int send_ack_report(int fd, uint8_t seq, uint8_t status, bool debug)
 	return rc;
 }
 
-static void drain_output_reports(int fd, bool debug)
+static int open_screen_out(const char *path, bool debug)
+{
+	struct stat st;
+	int flags = O_WRONLY | O_NONBLOCK | O_CLOEXEC;
+	int fd;
+
+	if (!path)
+		return -1;
+
+	if (stat(path, &st) < 0) {
+		if (errno == ENOENT) {
+			if (mkfifo(path, 0600) != 0 && errno != EEXIST) {
+				if (debug) {
+					fprintf(stderr,
+						"aikb_hid_input: mkfifo %s failed: %s\n",
+						path, strerror(errno));
+				}
+				return -1;
+			}
+		} else {
+			if (debug) {
+				fprintf(stderr,
+					"aikb_hid_input: stat %s failed: %s\n",
+					path, strerror(errno));
+			}
+			return -1;
+		}
+	}
+
+	if (stat(path, &st) == 0 && !S_ISFIFO(st.st_mode))
+		flags |= O_CREAT | O_APPEND;
+
+	fd = open(path, flags, 0600);
+	if (fd < 0 && debug) {
+		fprintf(stderr, "aikb_hid_input: waiting for screen output %s: %s\n",
+			path, strerror(errno));
+	}
+
+	return fd;
+}
+
+static int write_screen_bytes(int *screen_fd, const char *path,
+			      const uint8_t *data, size_t len, bool debug)
+{
+	size_t off = 0;
+
+	if (!path || len == 0)
+		return 0;
+
+	if (*screen_fd < 0) {
+		*screen_fd = open_screen_out(path, debug);
+		if (*screen_fd < 0)
+			return 1;
+	}
+
+	while (off < len) {
+		ssize_t n = write(*screen_fd, data + off, len - off);
+
+		if (n < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				return 1;
+			if (debug) {
+				fprintf(stderr,
+					"aikb_hid_input: screen output write failed: %s\n",
+					strerror(errno));
+			}
+			close(*screen_fd);
+			*screen_fd = -1;
+			return -1;
+		}
+		if (n == 0)
+			return 1;
+		off += (size_t)n;
+	}
+
+	return 0;
+}
+
+static int write_screen_cstr(int *screen_fd, const char *path, const char *s,
+			     bool debug)
+{
+	return write_screen_bytes(screen_fd, path, (const uint8_t *)s, strlen(s),
+				  debug);
+}
+
+static int handle_set_cursor(int *screen_fd, const char *path,
+			     const uint8_t *payload, size_t payload_len,
+			     bool debug)
+{
+	char text[32];
+	char *comma;
+	char *end = NULL;
+	unsigned long row;
+	unsigned long col;
+	char seq[32];
+
+	if (payload_len >= sizeof(text))
+		return -1;
+	memcpy(text, payload, payload_len);
+	text[payload_len] = '\0';
+
+	comma = strchr(text, ',');
+	if (!comma)
+		return -1;
+	*comma = '\0';
+
+	errno = 0;
+	row = strtoul(text, &end, 10);
+	if (errno || !end || *end)
+		return -1;
+	errno = 0;
+	col = strtoul(comma + 1, &end, 10);
+	if (errno || !end || *end)
+		return -1;
+
+	if (row == 0)
+		row = 1;
+	if (col == 0)
+		col = 1;
+	if (row > 999)
+		row = 999;
+	if (col > 999)
+		col = 999;
+
+	snprintf(seq, sizeof(seq), "\033[%lu;%luH", row, col);
+	return write_screen_cstr(screen_fd, path, seq, debug);
+}
+
+static uint8_t handle_screen_output_report(int *screen_fd,
+					   const struct config *cfg,
+					   const uint8_t report[HID_REPORT_LEN],
+					   ssize_t report_len)
+{
+	uint8_t cmd;
+	uint8_t payload_len;
+	int rc;
+
+	if (report_len < 4)
+		return ACK_STATUS_ERR;
+
+	cmd = report[1];
+	payload_len = report[3];
+	if (payload_len > HID_OUTPUT_MAX_PAYLOAD ||
+	    (size_t)payload_len > (size_t)report_len - 4u)
+		return ACK_STATUS_ERR;
+
+	switch (cmd) {
+	case SCREEN_CMD_CLEAR:
+		rc = write_screen_cstr(screen_fd, cfg->screen_out_path,
+				       "\033[2J\033[H", cfg->debug);
+		break;
+	case SCREEN_CMD_WRITE:
+		rc = write_screen_bytes(screen_fd, cfg->screen_out_path,
+					report + 4, payload_len, cfg->debug);
+		break;
+	case SCREEN_CMD_SET_CURSOR:
+		rc = handle_set_cursor(screen_fd, cfg->screen_out_path,
+				       report + 4, payload_len, cfg->debug);
+		break;
+	case SCREEN_CMD_NEWLINE:
+		rc = write_screen_cstr(screen_fd, cfg->screen_out_path,
+				       "\r\n", cfg->debug);
+		break;
+	case SCREEN_CMD_BACKSPACE:
+		rc = write_screen_cstr(screen_fd, cfg->screen_out_path,
+				       "\b", cfg->debug);
+		break;
+	default:
+		rc = -1;
+		break;
+	}
+
+	if (rc > 0)
+		return ACK_STATUS_BUSY;
+	if (rc < 0)
+		return ACK_STATUS_ERR;
+	return ACK_STATUS_OK;
+}
+
+static void drain_output_reports(int fd, int *screen_fd,
+				 const struct config *cfg)
 {
 	for (;;) {
 		uint8_t report[HID_REPORT_LEN];
 		ssize_t n = read(fd, report, sizeof(report));
+		uint8_t status;
 
 		if (n < 0) {
 			if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
@@ -341,26 +532,28 @@ static void drain_output_reports(int fd, bool debug)
 			return;
 
 		if (report[0] != REPORT_ID_OUTPUT) {
-			if (debug)
+			if (cfg->debug)
 				fprintf(stderr,
 					"aikb_hid_input: ignored output report id=0x%02x len=%zd\n",
 					report[0], n);
 			continue;
 		}
 
-		if (debug) {
+		if (cfg->debug) {
 			fprintf(stderr,
 				"aikb_hid_input: output 0x20 cmd=0x%02x seq=%u len=%u\n",
 				report[1], report[2], report[3]);
 		}
-		(void)send_ack_report(fd, report[2], 0x00, debug);
+		status = handle_screen_output_report(screen_fd, cfg, report, n);
+		(void)send_ack_report(fd, report[2], status, cfg->debug);
 	}
 }
 
 static void usage(FILE *out)
 {
 	fprintf(out,
-		"Usage: aikb_hid_input [--hid PATH] [--poll-ms N] [--debounce-ms N]\\n"
+		"Usage: aikb_hid_input [--hid PATH] [--screen-out PATH]\\n"
+		"                      [--poll-ms N] [--debounce-ms N]\\n"
 		"                      [--reverse] [--debug] [--no-hid]\\n");
 }
 
@@ -382,6 +575,7 @@ static int parse_args(int argc, char **argv, struct config *cfg)
 	int i;
 
 	cfg->hid_path = "/dev/hidg0";
+	cfg->screen_out_path = NULL;
 	cfg->poll_ms = 2;
 	cfg->debounce_ms = 12;
 	cfg->debug = false;
@@ -391,6 +585,8 @@ static int parse_args(int argc, char **argv, struct config *cfg)
 	for (i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--hid") == 0 && i + 1 < argc) {
 			cfg->hid_path = argv[++i];
+		} else if (strcmp(argv[i], "--screen-out") == 0 && i + 1 < argc) {
+			cfg->screen_out_path = argv[++i];
 		} else if (strcmp(argv[i], "--poll-ms") == 0 && i + 1 < argc) {
 			if (parse_uint(argv[++i], &cfg->poll_ms) != 0)
 				return -1;
@@ -440,6 +636,7 @@ int main(int argc, char **argv)
 	uint8_t key_bits;
 	int mem_fd = -1;
 	int hid_fd = -1;
+	int screen_fd = -1;
 	size_t i;
 
 	if (parse_args(argc, argv, &cfg) != 0)
@@ -447,6 +644,7 @@ int main(int argc, char **argv)
 
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
+	signal(SIGPIPE, SIG_IGN);
 
 	mem_fd = open("/dev/mem", O_RDWR | O_SYNC | O_CLOEXEC);
 	if (mem_fd < 0) {
@@ -538,7 +736,7 @@ int main(int argc, char **argv)
 			pending_report = true;
 
 		if (hid_fd >= 0)
-			drain_output_reports(hid_fd, cfg.debug);
+			drain_output_reports(hid_fd, &screen_fd, &cfg);
 
 		if (pending_report && (cfg.no_hid || hid_fd >= 0)) {
 			int rc = 0;
@@ -571,6 +769,8 @@ int main(int argc, char **argv)
 
 	if (hid_fd >= 0)
 		close(hid_fd);
+	if (screen_fd >= 0)
+		close(screen_fd);
 	mmio_unmap(&pinmux);
 	mmio_unmap(&gpio);
 	close(mem_fd);

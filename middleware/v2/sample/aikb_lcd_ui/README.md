@@ -2,7 +2,7 @@
 
 This sample renders a 960x412 landscape UI for the GC9503 412x960 LCD when the
 panel is mounted sideways. It writes directly to a Linux framebuffer. The
-default view is a VT100-compatible terminal surface fed by Type-C serial bytes;
+default view is a VT100-compatible terminal surface fed by raw input bytes;
 the previous JSON dashboard remains available with `--view dashboard`.
 
 ## Build
@@ -44,6 +44,11 @@ USB serial device.
 ```sh
 ./aikb_lcd_ui --fb /dev/fb0 --input /dev/ttyGS0 --rotate auto --view terminal
 ```
+
+The default AIKB boot path uses Vendor HID for screen writes instead: `auto.sh`
+creates `/tmp/aikb_lcd_ui.in`, starts this app with that FIFO as `--input`, and
+starts `aikb_hid_input --screen-out /tmp/aikb_lcd_ui.in` to translate HID
+output report `0x20` into terminal bytes.
 
 `--rotate auto` renders the UI as 960x412 and automatically rotates it clockwise
 when the framebuffer reports 412x960. Use `--rotate ccw` if the physical mount

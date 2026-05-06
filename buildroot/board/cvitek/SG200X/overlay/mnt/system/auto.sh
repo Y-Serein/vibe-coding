@@ -3,6 +3,18 @@ ${CVI_SHOPTS}
 
 export LD_LIBRARY_PATH="/lib:/lib/3rd:/lib/arm-linux-gnueabihf:/usr/lib:/usr/local/lib:/mnt/system/lib:/mnt/system/usr/lib:/mnt/system/usr/lib/3rd:/mnt/data/lib"
 export PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin:/mnt/system/usr/bin:/mnt/system/usr/sbin:/mnt/data/bin:/mnt/data/sbin"
+AIKB_LCD_INPUT="/tmp/aikb_lcd_ui.in"
+
+prepare_aikb_lcd_input()
+{
+   if [ -e "${AIKB_LCD_INPUT}" ] && [ ! -p "${AIKB_LCD_INPUT}" ]; then
+      rm -f "${AIKB_LCD_INPUT}"
+   fi
+   if [ ! -p "${AIKB_LCD_INPUT}" ]; then
+      mkfifo "${AIKB_LCD_INPUT}" 2>/dev/null || true
+      chmod 600 "${AIKB_LCD_INPUT}" 2>/dev/null || true
+   fi
+}
 
 start_aikb_hid_input()
 {
@@ -22,7 +34,9 @@ start_aikb_hid_input()
       return 0
    fi
 
-   "${HID_INPUT}" --hid /dev/hidg0 >> "${HID_LOG}" 2>&1 &
+   prepare_aikb_lcd_input
+
+   "${HID_INPUT}" --hid /dev/hidg0 --screen-out "${AIKB_LCD_INPUT}" >> "${HID_LOG}" 2>&1 &
    HID_PID=$!
    sleep 1
    if kill -0 "${HID_PID}" >/dev/null 2>&1; then
@@ -56,6 +70,8 @@ start_aikb_lcd_ui()
       return 0
    fi
 
+   prepare_aikb_lcd_input
+
    if [ ! -e "/dev/fb0" ] && [ -f "/mnt/system/ko/loadsystemko.sh" ]; then
       echo "$(date '+%H:%M:%S') /dev/fb0 missing; retry loadsystemko.sh" >> "${LCD_LOG}"
       sh /mnt/system/ko/loadsystemko.sh >> "${LCD_LOG}" 2>&1
@@ -77,7 +93,7 @@ start_aikb_lcd_ui()
    fi
 
    echo "$(date '+%H:%M:%S') start aikb_lcd_ui; fb=$(cat /proc/fb 2>/dev/null)" >> "${LCD_LOG}"
-   "${LCD_UI}" --fb /dev/fb0 --input /dev/ttyGS0 --rotate auto --view terminal >> "${LCD_LOG}" 2>&1 &
+   "${LCD_UI}" --fb /dev/fb0 --input "${AIKB_LCD_INPUT}" --rotate auto --view terminal >> "${LCD_LOG}" 2>&1 &
    LCD_PID=$!
    sleep 1
    if kill -0 "${LCD_PID}" >/dev/null 2>&1; then

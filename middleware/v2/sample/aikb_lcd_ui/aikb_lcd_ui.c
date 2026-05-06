@@ -1919,19 +1919,31 @@ static int configure_serial_fd(int fd)
 
 static int open_input(const char *path)
 {
+	struct stat st;
+	bool is_fifo = false;
+	bool is_char = false;
 	int fd;
 
 	if (!path)
 		return -1;
-	if (strcmp(path, "-") == 0)
+	if (strcmp(path, "-") == 0) {
 		fd = STDIN_FILENO;
-	else
-		fd = open(path, O_RDONLY | O_NOCTTY | O_NONBLOCK);
+		is_char = true;
+	} else {
+		if (stat(path, &st) == 0) {
+			is_fifo = S_ISFIFO(st.st_mode);
+			is_char = S_ISCHR(st.st_mode);
+		}
+		if (is_fifo)
+			fd = open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+		else
+			fd = open(path, O_RDONLY | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
+	}
 	if (fd < 0) {
 		warnf("open input %s failed: %s", path, strerror(errno));
 		return -1;
 	}
-	if (fd != STDIN_FILENO && configure_serial_fd(fd) < 0)
+	if (fd != STDIN_FILENO && is_char && configure_serial_fd(fd) < 0)
 		warnf("serial setup for %s failed: %s", path, strerror(errno));
 	return fd;
 }

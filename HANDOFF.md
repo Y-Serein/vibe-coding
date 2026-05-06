@@ -1,3 +1,83 @@
+## 2026-05-06 HID Output Report 接入 LCD UI
+
+用户当前状态：
+- 按键上行已经能到上位机。
+- `key1` / IOA24 可能因无外部上拉暂时不用处理。
+- `tools/Vibe_Bridge` 上位机能检测到按键数据。
+- 上位机执行
+  `cargo run -- test-screen --text "Hello Vibe Bridge!"` 后，屏幕无反应。
+
+原因确认：
+- `Vibe_Bridge` 的 `test-screen` 走 Vendor HID output report `0x20`。
+- 板端旧 `aikb_hid_input` 只解析 `0x20` 并 ACK `0x21`，没有把 payload
+  送给 `aikb_lcd_ui`。
+- `aikb_lcd_ui` terminal 视图消费的是 `--input PATH` 的原始 VT100/UTF-8
+  字节流。
+
+本轮已完成：
+- `middleware/v2/sample/aikb_hid_input/aikb_hid_input.c`
+  - 新增 `--screen-out PATH`。
+  - HID output report `0x20` 现在会翻译成 VT100 字节并写到 `PATH`：
+    - `0x01` clear -> `ESC[2J ESC[H`
+    - `0x02` write -> UTF-8 payload
+    - `0x03` set cursor -> `ESC[row;colH`
+    - `0x04` newline -> `CR LF`
+    - `0x05` backspace -> `BS`
+  - ACK `0x21` 的 status 现在反映 screen-out 写入结果：
+    `0x00 OK`、`0x01 busy/no reader yet`、`0x02 error`。
+- `middleware/v2/sample/aikb_lcd_ui/aikb_lcd_ui.c`
+  - `--input` 如果是 FIFO，会用 `O_RDWR | O_NONBLOCK` 打开，避免无 writer
+    时 FIFO EOF/POLLHUP 影响后续 HID 写入。
+  - 只有字符设备才做 termios serial 配置，FIFO 不再打印 serial setup warning。
+- `buildroot/board/cvitek/SG200X/overlay/mnt/system/auto.sh`
+  - 创建 `/tmp/aikb_lcd_ui.in` FIFO。
+  - 启动 `aikb_hid_input --hid /dev/hidg0 --screen-out /tmp/aikb_lcd_ui.in`。
+  - 启动 `aikb_lcd_ui --input /tmp/aikb_lcd_ui.in --view terminal`。
+- README 已更新 HID 下行到 LCD UI 的路径说明。
+
+已同步到生成目录：
+- `buildroot/board/cvitek/SG200X/overlay/mnt/system/usr/bin/aikb_hid_input`
+- `buildroot/output/target/mnt/system/usr/bin/aikb_hid_input`
+- `install/soc_sg2002_licheervnano_sd/rootfs/mnt/system/usr/bin/aikb_hid_input`
+- `buildroot/board/cvitek/SG200X/overlay/mnt/system/usr/bin/aikb_lcd_ui`
+- `buildroot/output/target/mnt/system/usr/bin/aikb_lcd_ui`
+- `install/soc_sg2002_licheervnano_sd/rootfs/mnt/system/usr/bin/aikb_lcd_ui`
+- `buildroot/output/target/mnt/system/auto.sh`
+- `install/soc_sg2002_licheervnano_sd/rootfs/mnt/system/auto.sh`
+
+当前二进制 SHA-256：
+- `aikb_hid_input`: `000fc2459663c717376c7f4117d8938fc774682e8286505d329d5c4d5bd89581`
+- `aikb_lcd_ui`: `b96aebb69cd93e94dd3e5ea995707536d0ba5e3a915244a4d43f98d5acac1a93`
+
+轻量验证：
+- `aikb_hid_input` RISC-V musl 交叉编译通过。
+- `aikb_lcd_ui` RISC-V musl + FreeType 交叉编译通过。
+- 两个二进制 `riscv64-unknown-linux-musl-strip --strip-all` 通过。
+- overlay/output/install 三处二进制 SHA 一致。
+- overlay/output/install 三处 `auto.sh` 的 `sh -n` 通过。
+- `git diff --check` 通过。
+
+下一次定向打包：
+```
+cd /home/rv_nano/AIKB/LicheeRV-Nano-Build
+apptainer exec --cleanenv host/ubuntu/licheervnano-build-ubuntu.sqfs bash -lc 'cd /home/rv_nano/AIKB/LicheeRV-Nano-Build && source build/cvisetup.sh && defconfig sg2002_licheervnano_sd && pack_rootfs && pack_burn_image'
+```
+
+板端验证：
+```
+pidof aikb_hid_input
+pidof aikb_lcd_ui
+ls -l /tmp/aikb_lcd_ui.in
+cat /tmp/aikb_hid_input.log
+cat /tmp/aikb_lcd_ui.log
+```
+
+上位机验证：
+```
+cd /home/rv_nano/Sipeed/rv_nano/tools/Vibe_Bridge
+cargo run -- test-screen --text "Hello Vibe Bridge!"
+```
+
 ## 2026-05-06 AIKB 按键/旋钮和 Vendor HID 接入
 
 用户要求：
