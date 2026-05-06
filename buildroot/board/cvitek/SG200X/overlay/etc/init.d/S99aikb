@@ -1,0 +1,25 @@
+#!/bin/sh
+
+case "$1" in
+  start)
+	. /etc/profile
+	if [ -x /mnt/system/auto.sh ]; then
+		sh /mnt/system/auto.sh &
+	else
+		echo "/mnt/system/auto.sh not executable" > /tmp/aikb_lcd_ui.log
+	fi
+	;;
+  stop)
+	killall aikb_lcd_ui >/dev/null 2>&1 || true
+	;;
+  restart)
+	"$0" stop
+	"$0" start
+	;;
+  *)
+	echo "Usage: $0 {start|stop|restart}"
+	exit 1
+	;;
+esac
+
+exit 0

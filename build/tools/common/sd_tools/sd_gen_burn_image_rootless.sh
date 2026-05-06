@@ -27,6 +27,7 @@ cp -fv ${output_dir}/fip.bin ${output_dir}/input/
 cp -fv ${output_dir}/rawimages/boot.sd ${output_dir}/input/rawimages/
 cp -fv ${output_dir}/rawimages/rootfs.sd ${output_dir}/input/
 touch ${output_dir}/input/usb.dev
+touch ${output_dir}/input/usb.aikb_hid
 touch ${output_dir}/input/usb.ncm
 touch ${output_dir}/input/usb.rndis
 touch ${output_dir}/input/wifi.sta

@@ -15,6 +15,7 @@ insmod /mnt/system/ko/soph_dwa.ko
 insmod /mnt/system/ko/soph_vo.ko
 insmod /mnt/system/ko/soph_mipi_tx.ko
 insmod /mnt/system/ko/soph_rgn.ko
+insmod /mnt/system/ko/soph_fb.ko option=1 opt_bpp=32
 
 #insmod /mnt/system/ko/soph_wdt.ko
 insmod /mnt/system/ko/soph_clock_cooling.ko

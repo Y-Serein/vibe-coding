@@ -22,10 +22,16 @@
 #include <asm/gpio.h>
 #include "part.h"
 #include "fs.h"
+#include <video_font_data.h>
 
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 
 #define PANLE_ADAPTIVITY 0
+#define GC9503_PANEL_W 412
+#define GC9503_PANEL_H 960
+#define GC9503_SPLASH_W 960
+#define GC9503_SPLASH_H 412
+#define GC9503_SPLASH_ADDR (CVIMMAP_BOOTLOGO_ADDR + 0x100000)
 
 enum sclr_vo_intf intf_type = SCLR_VO_INTF_MIPI;
 
@@ -191,10 +197,10 @@ static void gc9503_finish_panel(void)
 	printf("GC9503 finish: switch to HS video mode\n");
 	mipi_tx_set_mode(1);
 	sclr_disp_tgen_enable(true);
-	sclr_disp_set_pattern(SCL_PAT_TYPE_AUTO, SCL_PAT_COLOR_BAR, NULL);
+	sclr_disp_set_pattern(SCL_PAT_TYPE_OFF, SCL_PAT_COLOR_USR, NULL);
 	sclr_disp_enable_window_bgcolor(false);
 	sclr_disp_reg_force_up();
-	printf("GC9503 finish: enable DISP color-bar pattern\n");
+	printf("GC9503 finish: DISP pattern disabled\n");
 }
 
 static void gc9503_enable_panel_bist(void)
@@ -205,6 +211,211 @@ static void gc9503_enable_panel_bist(void)
 	printf("GC9503 panel BIST: enable internal test pattern\n");
 	dsi_send_debug_cmd(0, 0x29, page0, sizeof(page0));
 	dsi_send_debug_cmd(0, 0x29, bist, sizeof(bist));
+}
+
+static void gc9503_disable_panel_bist(void)
+{
+	static const u8 page0[] = {0xF0, 0x55, 0xAA, 0x52, 0x08, 0x00};
+	static const u8 bist_off[] = {0xEE, 0x00, 0x00, 0x00, 0x00};
+
+	printf("GC9503 panel BIST: force disable internal test pattern\n");
+	dsi_send_debug_cmd(0, 0x29, page0, sizeof(page0));
+	dsi_send_debug_cmd(0, 0x29, bist_off, sizeof(bist_off));
+}
+
+struct gc9503_yuv_color {
+	u8 y;
+	u8 u;
+	u8 v;
+};
+
+static u8 clamp_u8(int v)
+{
+	if (v < 0)
+		return 0;
+	if (v > 255)
+		return 255;
+	return (u8)v;
+}
+
+static struct gc9503_yuv_color gc9503_rgb_to_yuv(u8 r, u8 g, u8 b)
+{
+	struct gc9503_yuv_color c;
+
+	c.y = clamp_u8(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
+	c.u = clamp_u8(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
+	c.v = clamp_u8(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
+	return c;
+}
+
+static void gc9503_put_yuv_pixel(u8 *y_plane, u8 *u_plane, u8 *v_plane,
+				 int pitch_y, int pitch_c, int x, int y,
+				 struct gc9503_yuv_color c)
+{
+	int px;
+	int py;
+
+	if (x < 0 || x >= GC9503_SPLASH_W || y < 0 || y >= GC9503_SPLASH_H)
+		return;
+
+	px = GC9503_PANEL_W - 1 - y;
+	py = x;
+
+	y_plane[py * pitch_y + px] = c.y;
+	if (((px | py) & 1) == 0) {
+		u_plane[(py / 2) * pitch_c + (px / 2)] = c.u;
+		v_plane[(py / 2) * pitch_c + (px / 2)] = c.v;
+	}
+}
+
+static void gc9503_fill_rect(u8 *y_plane, u8 *u_plane, u8 *v_plane,
+			     int pitch_y, int pitch_c,
+			     int x, int y, int w, int h,
+			     struct gc9503_yuv_color c)
+{
+	for (int yy = y; yy < y + h; yy++) {
+		for (int xx = x; xx < x + w; xx++)
+			gc9503_put_yuv_pixel(y_plane, u_plane, v_plane,
+					     pitch_y, pitch_c, xx, yy, c);
+	}
+}
+
+static void gc9503_draw_char(u8 *y_plane, u8 *u_plane, u8 *v_plane,
+			     int pitch_y, int pitch_c,
+			     int x, int y, unsigned char ch, int scale,
+			     struct gc9503_yuv_color c)
+{
+	const unsigned char *glyph = &video_fontdata[ch * VIDEO_FONT_HEIGHT];
+
+	for (int row = 0; row < VIDEO_FONT_HEIGHT; row++) {
+		unsigned char bits = glyph[row];
+
+		for (int col = 0; col < VIDEO_FONT_WIDTH; col++) {
+			if (bits & (0x80 >> col))
+				gc9503_fill_rect(y_plane, u_plane, v_plane,
+						 pitch_y, pitch_c,
+						 x + col * scale,
+						 y + row * scale,
+						 scale, scale, c);
+		}
+	}
+}
+
+static void gc9503_draw_text(u8 *y_plane, u8 *u_plane, u8 *v_plane,
+			     int pitch_y, int pitch_c,
+			     int x, int y, const char *s, int scale,
+			     struct gc9503_yuv_color c)
+{
+	while (*s) {
+		gc9503_draw_char(y_plane, u_plane, v_plane, pitch_y, pitch_c,
+				 x, y, (unsigned char)*s, scale, c);
+		x += VIDEO_FONT_WIDTH * scale;
+		s++;
+	}
+}
+
+static int gc9503_text_width(const char *s, int scale)
+{
+	return strlen(s) * VIDEO_FONT_WIDTH * scale;
+}
+
+static void gc9503_draw_center_text(u8 *y_plane, u8 *u_plane, u8 *v_plane,
+				    int pitch_y, int pitch_c,
+				    int y, const char *s, int scale,
+				    struct gc9503_yuv_color c)
+{
+	int x = (GC9503_SPLASH_W - gc9503_text_width(s, scale)) / 2;
+
+	gc9503_draw_text(y_plane, u_plane, v_plane, pitch_y, pitch_c,
+			 x, y, s, scale, c);
+}
+
+static void gc9503_draw_vibe_icon(u8 *y_plane, u8 *u_plane, u8 *v_plane,
+				  int pitch_y, int pitch_c,
+				  struct gc9503_yuv_color amber,
+				  struct gc9503_yuv_color dim)
+{
+	int x = (GC9503_SPLASH_W - 164) / 2;
+	int y = 94;
+
+	gc9503_fill_rect(y_plane, u_plane, v_plane, pitch_y, pitch_c,
+			 x, y, 164, 164, dim);
+	gc9503_fill_rect(y_plane, u_plane, v_plane, pitch_y, pitch_c,
+			 x + 8, y + 8, 148, 148,
+			 gc9503_rgb_to_yuv(8, 8, 8));
+	gc9503_fill_rect(y_plane, u_plane, v_plane, pitch_y, pitch_c,
+			 x, y, 164, 8, amber);
+	gc9503_fill_rect(y_plane, u_plane, v_plane, pitch_y, pitch_c,
+			 x, y + 156, 164, 8, amber);
+	gc9503_fill_rect(y_plane, u_plane, v_plane, pitch_y, pitch_c,
+			 x, y, 8, 164, amber);
+	gc9503_fill_rect(y_plane, u_plane, v_plane, pitch_y, pitch_c,
+			 x + 156, y, 8, 164, amber);
+
+	gc9503_draw_text(y_plane, u_plane, v_plane, pitch_y, pitch_c,
+			 x + 24, y + 50, "<", 5, amber);
+	gc9503_draw_text(y_plane, u_plane, v_plane, pitch_y, pitch_c,
+			 x + 100, y + 50, ">", 5, amber);
+	gc9503_fill_rect(y_plane, u_plane, v_plane, pitch_y, pitch_c,
+			 x + 80, y + 44, 8, 76, amber);
+}
+
+static void gc9503_show_vibe_splash(void)
+{
+	struct sclr_rect rect = {
+		.x = 0,
+		.y = 0,
+		.w = GC9503_PANEL_W,
+		.h = GC9503_PANEL_H,
+	};
+	struct sclr_disp_cfg *cfg = sclr_disp_get_cfg();
+	struct gc9503_yuv_color bg = gc9503_rgb_to_yuv(0, 0, 0);
+	struct gc9503_yuv_color amber = gc9503_rgb_to_yuv(255, 179, 60);
+	struct gc9503_yuv_color text = gc9503_rgb_to_yuv(255, 238, 194);
+	struct gc9503_yuv_color dim = gc9503_rgb_to_yuv(54, 39, 17);
+	int pitch_y = ALIGN(GC9503_PANEL_W, 32);
+	int pitch_c = ALIGN(GC9503_PANEL_W / 2, 32);
+	int y_rows = ALIGN(((GC9503_PANEL_H + 1) & ~(BIT(0))), 16);
+	int c_rows = ALIGN(((GC9503_PANEL_H + 1) >> 1), 16);
+	u64 addr0 = GC9503_SPLASH_ADDR;
+	u64 addr1 = ALIGN(addr0 + pitch_y * y_rows, 0x1000);
+	u64 addr2 = ALIGN(addr1 + pitch_c * c_rows, 0x1000);
+	u64 end = addr2 + pitch_c * c_rows;
+	u8 *y_plane = (u8 *)(uintptr_t)addr0;
+	u8 *u_plane = (u8 *)(uintptr_t)addr1;
+	u8 *v_plane = (u8 *)(uintptr_t)addr2;
+
+	memset(y_plane, bg.y, pitch_y * y_rows);
+	memset(u_plane, bg.u, pitch_c * c_rows);
+	memset(v_plane, bg.v, pitch_c * c_rows);
+
+	gc9503_draw_vibe_icon(y_plane, u_plane, v_plane, pitch_y, pitch_c,
+			      amber, dim);
+	gc9503_draw_center_text(y_plane, u_plane, v_plane, pitch_y, pitch_c,
+				276, "Vibe Coding", 4, text);
+	gc9503_draw_center_text(y_plane, u_plane, v_plane, pitch_y, pitch_c,
+				344, "starting", 2, amber);
+
+	flush_cache(addr0, ALIGN(end - addr0, 0x1000));
+
+	sclr_disp_set_rect(rect);
+	cfg->fmt = SCL_FMT_YUV420;
+	cfg->in_csc = SCL_CSC_601_LIMIT_YUV2RGB;
+	cfg->mem.width = GC9503_PANEL_W;
+	cfg->mem.height = GC9503_PANEL_H;
+	cfg->mem.pitch_y = pitch_y;
+	cfg->mem.pitch_c = pitch_c;
+	cfg->mem.start_x = 0;
+	cfg->mem.start_y = 0;
+	cfg->mem.addr0 = addr0;
+	cfg->mem.addr1 = addr1;
+	cfg->mem.addr2 = addr2;
+	sclr_disp_set_pattern(SCL_PAT_TYPE_OFF, SCL_PAT_COLOR_USR, NULL);
+	sclr_disp_set_cfg(cfg);
+	sclr_disp_enable_window_bgcolor(false);
+	sclr_disp_reg_force_up();
+
+	printf("GC9503 splash: show landscape Vibe Coding boot page\n");
 }
 
 #if PANLE_ADAPTIVITY
@@ -297,12 +508,15 @@ static void dsi_panel_init(void)
 	dsi_init(0, panel_desc.dsi_init_cmds, panel_desc.dsi_init_cmds_size);
 	if (is_gc9503 && GC9503_ENABLE_PANEL_BIST)
 		gc9503_enable_panel_bist();
-	else if (is_gc9503)
-		printf("GC9503 panel BIST: disabled for DISP color-bar test\n");
+	else if (is_gc9503) {
+		printf("GC9503 panel BIST: disabled for Vibe Coding splash\n");
+		gc9503_disable_panel_bist();
+	}
 	dphy_set_hs_settle(prepare, zero, trail);
 	if (is_gc9503) {
 		printf("GC9503 debug: skip BTA panel reads before HS video\n");
 		gc9503_finish_panel();
+		gc9503_show_vibe_splash();
 	}
 }
 #endif
@@ -642,6 +856,12 @@ static int do_startvl(struct cmd_tbl *cmdtp, int flag, int argc, char * const ar
 
 	if (argc < 6)
 		return CMD_RET_USAGE;
+
+	if (panel_desc.panel_name &&
+	    !strcmp(panel_desc.panel_name, "GC9503-CXW034-412x960")) {
+		printf("GC9503 startvl: keep Vibe Coding splash\n");
+		return CMD_RET_SUCCESS;
+	}
 
 	layer = simple_strtoul(argv[1], &endp, 10);
 	if (*argv[1] == 0 || *endp != 0)

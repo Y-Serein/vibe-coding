@@ -144,6 +144,22 @@ then
 			ln -s functions/hid.GS0 configs/c.1
 		fi
 
+		# AIKB vendor terminal/control HID. This is intentionally not a
+		# keyboard-class HID, so the host should open it through hidraw.
+		if [ -e /boot/usb.aikb_hid ]
+		then
+			mkdir -p functions/hid.aikb
+			echo 0 > functions/hid.aikb/subclass
+			echo 0 > functions/hid.aikb/protocol
+			if [ -e functions/hid.aikb/wakeup_on_write ]; then
+				echo 1 > functions/hid.aikb/wakeup_on_write
+			fi
+			echo 64 > functions/hid.aikb/report_length
+			printf '\x06\x60\xff\x09\x01\xa1\x01\x85\x10\x15\x00\x25\x01\x75\x01\x95\x08\x09\x10\x81\x02\x15\x81\x25\x7f\x75\x08\x95\x01\x09\x11\x81\x02\x15\x00\x25\x00\x75\x08\x95\x3d\x81\x03\x85\x20\x15\x00\x26\xff\x00\x75\x08\x95\x3f\x09\x20\x91\x02\x85\x21\x15\x00\x26\xff\x00\x75\x08\x95\x02\x09\x21\x81\x02\x75\x08\x95\x3d\x81\x03\x85\x30\x15\x00\x26\xff\x00\x75\x08\x95\x3f\x09\x30\xb1\x02\xc0' > functions/hid.aikb/report_desc
+			rm -rf configs/c.1/hid.aikb
+			ln -s functions/hid.aikb configs/c.1/
+		fi
+
 		# mouse
 		if [ -e /boot/usb.mouse ]
 		then
@@ -241,4 +257,3 @@ then
         rmdir /sys/kernel/config/usb_gadget/g0/functions/ffs.adb
      fi
 fi
-

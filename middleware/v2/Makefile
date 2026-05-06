@@ -70,6 +70,8 @@ ifneq ($(FLASH_SIZE_SHRINK),y)
 	@cp -f sample/vdecvo/sample_vdecvo $(DESTDIR)/usr/bin
 	@cp -f sample/overlay/sample_overlay $(DESTDIR)/usr/bin
 	@cp -f sample/fisheye/sample_fisheye $(DESTDIR)/usr/bin
+	@cp -f sample/aikb_lcd_ui/aikb_lcd_ui $(DESTDIR)/usr/bin
+	@cp -f sample/aikb_hid_input/aikb_hid_input $(DESTDIR)/usr/bin
 endif
 
 ifneq ($(FLASH_SIZE_SHRINK),y)

@@ -17,7 +17,6 @@ case "$1" in
         if [ -f $USERDATAPATH/auto.sh ]; then
                 usleep 30000
                 . $USERDATAPATH/auto.sh &
-		exit 1
         fi
 	if [ -f $SYSTEMPATH/auto.sh ]; then
                 usleep 30000
@@ -34,4 +33,3 @@ case "$1" in
 esac
 
 exit $?
-
