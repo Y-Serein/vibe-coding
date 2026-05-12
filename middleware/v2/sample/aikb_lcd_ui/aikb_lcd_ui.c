@@ -86,6 +86,16 @@ enum pixel_format {
 enum app_view {
 	VIEW_TERMINAL,
 	VIEW_DASHBOARD,
+	VIEW_PET,
+};
+
+enum pet_mood {
+	PET_IDLE,
+	PET_ASKING,
+	PET_CODING,
+	PET_REVIEWING,
+	PET_ERROR,
+	PET_SLEEP,
 };
 
 enum term_state {
@@ -247,6 +257,17 @@ struct ui_model {
 	char window[48];
 };
 
+struct pet_state {
+	enum pet_mood mood;
+	uint32_t frame_index;
+	uint64_t start_time_ms;
+	uint64_t last_interaction_ms;
+	char message[128];
+	int energy;
+	int affection;
+	int focus;
+};
+
 struct fb_target {
 	int fd;
 	uint8_t *mem;
@@ -289,6 +310,16 @@ static void warnf(const char *fmt, ...)
 	vfprintf(stderr, fmt, ap);
 	fprintf(stderr, "\n");
 	va_end(ap);
+}
+
+static uint64_t monotonic_now_ms(void)
+{
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+		return 0;
+	return ((uint64_t)ts.tv_sec * 1000u) +
+	       ((uint64_t)ts.tv_nsec / 1000000u);
 }
 
 static void safe_copy(char *dst, size_t dst_sz, const char *src)
@@ -1417,6 +1448,400 @@ static void render_terminal(struct canvas *c, const struct terminal *term,
 			      0x8aa1b1);
 }
 
+static const char *pet_mood_name(enum pet_mood mood)
+{
+	switch (mood) {
+	case PET_IDLE:
+		return "IDLE";
+	case PET_ASKING:
+		return "ASKING";
+	case PET_CODING:
+		return "CODING";
+	case PET_REVIEWING:
+		return "REVIEWING";
+	case PET_ERROR:
+		return "ERROR";
+	case PET_SLEEP:
+		return "SLEEP";
+	default:
+		return "IDLE";
+	}
+}
+
+static bool parse_pet_mood(const char *s, enum pet_mood *out)
+{
+	if (streq_ci(s, "IDLE")) {
+		*out = PET_IDLE;
+		return true;
+	}
+	if (streq_ci(s, "ASKING")) {
+		*out = PET_ASKING;
+		return true;
+	}
+	if (streq_ci(s, "CODING")) {
+		*out = PET_CODING;
+		return true;
+	}
+	if (streq_ci(s, "REVIEWING")) {
+		*out = PET_REVIEWING;
+		return true;
+	}
+	if (streq_ci(s, "ERROR")) {
+		*out = PET_ERROR;
+		return true;
+	}
+	if (streq_ci(s, "SLEEP")) {
+		*out = PET_SLEEP;
+		return true;
+	}
+	return false;
+}
+
+static void pet_set_message(struct pet_state *p, const char *msg)
+{
+	safe_copy(p->message, sizeof(p->message), msg);
+}
+
+static void pet_set_mood(struct pet_state *p, enum pet_mood mood,
+			 const char *msg)
+{
+	p->mood = mood;
+	if (msg)
+		pet_set_message(p, msg);
+}
+
+static int pet_clamp_pct(int v)
+{
+	if (v < 0)
+		return 0;
+	if (v > 100)
+		return 100;
+	return v;
+}
+
+static void pet_init(struct pet_state *p)
+{
+	memset(p, 0, sizeof(*p));
+	p->mood = PET_IDLE;
+	p->start_time_ms = monotonic_now_ms();
+	p->last_interaction_ms = p->start_time_ms;
+	p->energy = 72;
+	p->affection = 54;
+	p->focus = 66;
+	pet_set_message(p, "standing by on the board");
+}
+
+static void pet_touch(struct pet_state *p)
+{
+	p->last_interaction_ms = monotonic_now_ms();
+	if (p->affection < 100)
+		p->affection += 5;
+	if (p->energy > 2)
+		p->energy -= 2;
+	p->energy = pet_clamp_pct(p->energy);
+	p->affection = pet_clamp_pct(p->affection);
+	pet_set_mood(p, PET_IDLE, "touch received");
+}
+
+static void pet_feed(struct pet_state *p)
+{
+	p->last_interaction_ms = monotonic_now_ms();
+	if (p->energy < 100)
+		p->energy += 10;
+	if (p->affection < 100)
+		p->affection += 2;
+	p->energy = pet_clamp_pct(p->energy);
+	p->affection = pet_clamp_pct(p->affection);
+	pet_set_mood(p, PET_IDLE, "energy restored");
+}
+
+static void pet_cycle_mood(struct pet_state *p, int delta)
+{
+	int mood = (int)p->mood + (delta >= 0 ? 1 : -1);
+
+	if (mood < 0)
+		mood = PET_SLEEP;
+	if (mood > PET_SLEEP)
+		mood = PET_IDLE;
+	pet_set_mood(p, (enum pet_mood)mood, "local state changed");
+	p->last_interaction_ms = monotonic_now_ms();
+}
+
+static void pet_apply_command(struct pet_state *p, const char *line)
+{
+	enum pet_mood mood;
+	char arg[32];
+	const char *msg;
+
+	if (strncmp(line, "PET ", 4) != 0)
+		return;
+	line += 4;
+	while (*line == ' ')
+		line++;
+
+	if (sscanf(line, "MOOD %31s", arg) == 1) {
+		if (parse_pet_mood(arg, &mood))
+			pet_set_mood(p, mood, "mood updated from input");
+		return;
+	}
+	if (strncmp(line, "MESSAGE ", 8) == 0) {
+		msg = line + 8;
+		while (*msg == ' ')
+			msg++;
+		pet_set_message(p, msg);
+		return;
+	}
+	if (streq_ci(line, "TOUCH")) {
+		pet_touch(p);
+		return;
+	}
+	if (streq_ci(line, "FEED")) {
+		pet_feed(p);
+		return;
+	}
+	if (streq_ci(line, "WORK_START")) {
+		if (p->focus < 100)
+			p->focus += 8;
+		p->focus = pet_clamp_pct(p->focus);
+		pet_set_mood(p, PET_CODING, "work started");
+		return;
+	}
+	if (streq_ci(line, "WORK_DONE")) {
+		if (p->energy > 5)
+			p->energy -= 5;
+		p->energy = pet_clamp_pct(p->energy);
+		pet_set_mood(p, PET_IDLE, "work done");
+		return;
+	}
+	if (streq_ci(line, "TEST_FAIL")) {
+		pet_set_mood(p, PET_ERROR, "test failed");
+		return;
+	}
+}
+
+static void pet_apply_event_line(struct pet_state *p, const char *line)
+{
+	if (streq_ci(line, "KEY 0 DOWN")) {
+		pet_touch(p);
+		return;
+	}
+	if (streq_ci(line, "KEY 1 DOWN")) {
+		pet_feed(p);
+		return;
+	}
+	if (streq_ci(line, "KEY 2 DOWN")) {
+		pet_cycle_mood(p, 1);
+		return;
+	}
+	if (streq_ci(line, "ENC +1")) {
+		pet_cycle_mood(p, 1);
+		return;
+	}
+	if (streq_ci(line, "ENC -1")) {
+		pet_cycle_mood(p, -1);
+		return;
+	}
+	if (streq_ci(line, "ENC_BTN DOWN")) {
+		if (p->affection < 100)
+			p->affection += 4;
+		p->affection = pet_clamp_pct(p->affection);
+		pet_set_mood(p, PET_ASKING, "menu ready");
+		p->last_interaction_ms = monotonic_now_ms();
+	}
+}
+
+static void draw_px_block(struct canvas *c, int ox, int oy, int scale,
+			  int px, int py, int w, int h, uint32_t color)
+{
+	fill_rect(c, ox + px * scale, oy + py * scale, w * scale,
+		  h * scale, color);
+}
+
+static void draw_pet_bar(struct canvas *c, int x, int y, int w, const char *label,
+			 int value, uint32_t color)
+{
+	int fill;
+
+	if (value < 0)
+		value = 0;
+	if (value > 100)
+		value = 100;
+	draw_text(c, x, y, label, 1, C_MUTED);
+	stroke_rect(c, x + 58, y - 2, w, 12, C_LINE);
+	fill = (w - 4) * value / 100;
+	fill_rect(c, x + 60, y, fill, 8, color);
+}
+
+static void draw_pet_background(struct canvas *c, uint32_t frame)
+{
+	canvas_clear(c, 0x11110f);
+	fill_rect(c, 0, 0, UI_W, UI_H, 0x161310);
+	for (int y = 0; y < UI_H; y += 4)
+		fill_rect(c, 0, y, UI_W, 1, 0x0b0b0a);
+	for (int y = 0; y < UI_H; y += 6) {
+		for (int x = (y * 13 + (int)frame) & 31; x < UI_W; x += 64) {
+			uint32_t n = ((uint32_t)x * 1103515245u) ^
+				     ((uint32_t)y * 2654435761u) ^ frame;
+			if ((n & 7u) == 0)
+				put_px(c, x, y, 0x28241f);
+		}
+	}
+	for (int i = 0; i < 44; i++) {
+		uint32_t shade = i < 24 ? 0x0d0c0b : 0x11100e;
+
+		hline(c, i, i, UI_W - i * 2, shade);
+		hline(c, i, UI_H - 1 - i, UI_W - i * 2, shade);
+		vline(c, i, i, UI_H - i * 2, shade);
+		vline(c, UI_W - 1 - i, i, UI_H - i * 2, shade);
+	}
+}
+
+static void draw_pet_sprite(struct canvas *c, const struct pet_state *p,
+			    uint32_t frame)
+{
+	int scale = 6;
+	int ox = 384;
+	int oy = 88;
+	int bob = 0;
+	int arm = 0;
+	bool blink = false;
+	uint32_t outline = 0x1d2021;
+	uint32_t skin = 0x98971a;
+	uint32_t skin_hi = 0xb8bb26;
+	uint32_t belly = 0xd79921;
+	uint32_t cheek = 0xd65d0e;
+	uint32_t eye = 0xfbf1c7;
+
+	if (p->mood == PET_IDLE)
+		bob = (frame / 8) & 1;
+	else if (p->mood == PET_CODING)
+		arm = (frame / 5) & 1;
+	else if (p->mood == PET_REVIEWING)
+		bob = (frame / 6) & 1;
+	else if (p->mood == PET_ERROR && ((frame / 4) & 1))
+		skin_hi = 0xfb4934;
+	if (p->mood == PET_SLEEP)
+		bob = 2;
+	blink = (p->mood == PET_SLEEP) || (p->mood == PET_IDLE &&
+		(frame % 54u) > 49u);
+	oy += bob;
+
+	draw_px_block(c, ox, oy, scale, 10, 20, 13, 4, outline);
+	draw_px_block(c, ox, oy, scale, 8, 17, 17, 4, skin);
+	draw_px_block(c, ox, oy, scale, 11, 14, 11, 5, skin_hi);
+	draw_px_block(c, ox, oy, scale, 14, 18, 7, 9, belly);
+	draw_px_block(c, ox, oy, scale, 12, 9, 15, 8, skin_hi);
+	draw_px_block(c, ox, oy, scale, 14, 7, 10, 3, skin_hi);
+	draw_px_block(c, ox, oy, scale, 25, 10, 3, 5, skin_hi);
+	draw_px_block(c, ox, oy, scale, 9, 11, 3, 4, outline);
+	draw_px_block(c, ox, oy, scale, 11, 8, 2, 2, outline);
+	draw_px_block(c, ox, oy, scale, 22, 9, 3, 1, 0xfabd2f);
+	draw_px_block(c, ox, oy, scale, 22, 10, 4, 1, 0xfabd2f);
+	draw_px_block(c, ox, oy, scale, 22, 11, 5, 1, 0xfabd2f);
+	draw_px_block(c, ox, oy, scale, 8, 23, 4, 3, skin);
+	draw_px_block(c, ox, oy, scale, 21, 23, 4, 3, skin);
+	draw_px_block(c, ox, oy, scale, 5, 20, 5, 2, skin);
+	draw_px_block(c, ox, oy, scale, 2, 19, 4, 1, skin_hi);
+	draw_px_block(c, ox, oy, scale, 1, 18, 2, 1, skin_hi);
+	draw_px_block(c, ox, oy, scale, 7, 12, 2, 1, 0xfabd2f);
+	draw_px_block(c, ox, oy, scale, 6, 14, 2, 1, 0xfabd2f);
+	draw_px_block(c, ox, oy, scale, 7, 16, 2, 1, 0xfabd2f);
+	draw_px_block(c, ox, oy, scale, 13, 12, 2, 1, cheek);
+
+	if (blink) {
+		draw_px_block(c, ox, oy, scale, 15, 11, 3, 1, outline);
+	} else {
+		draw_px_block(c, ox, oy, scale, 15, 10, 2, 2, outline);
+		draw_px_block(c, ox, oy, scale, 16, 10, 1, 1, eye);
+	}
+	draw_px_block(c, ox, oy, scale, 21, 13, 5, 1, outline);
+
+	if (p->mood == PET_CODING) {
+		draw_px_block(c, ox, oy, scale, 7, 18 + arm, 5, 2, skin_hi);
+		draw_px_block(c, ox, oy, scale, 24, 18 - arm, 4, 2, skin_hi);
+		fill_rect(c, ox + 70, oy + 176, 160, 34, 0x3c3836);
+		stroke_rect(c, ox + 70, oy + 176, 160, 34, 0x928374);
+		draw_text(c, ox + 92, oy + 186, "0101", 1, 0xb8bb26);
+	} else {
+		draw_px_block(c, ox, oy, scale, 7, 18, 5, 2, skin_hi);
+		draw_px_block(c, ox, oy, scale, 24, 17, 4, 4, skin_hi);
+	}
+}
+
+static void render_pet(struct canvas *c, struct pet_state *p)
+{
+	uint64_t now_ms = monotonic_now_ms();
+	uint32_t elapsed = (uint32_t)(now_ms - p->start_time_ms);
+	uint32_t frame = elapsed / 83u;
+	char buf[96];
+	int seconds = (int)(elapsed / 1000u);
+	int qy;
+	uint32_t mood_color = C_YELLOW;
+
+	p->frame_index = frame;
+	if (now_ms > p->last_interaction_ms + 120000u && p->mood == PET_IDLE)
+		p->mood = PET_SLEEP;
+	if (p->mood == PET_ERROR)
+		mood_color = ((frame / 4u) & 1u) ? C_RED : C_YELLOW;
+	else if (p->mood == PET_CODING)
+		mood_color = 0xb8bb26;
+	else if (p->mood == PET_REVIEWING)
+		mood_color = 0x8ec07c;
+	else if (p->mood == PET_SLEEP)
+		mood_color = 0x928374;
+
+	draw_pet_background(c, frame);
+	draw_text(c, 22, 26, "AIKB PET", 2, C_YELLOW);
+	draw_text_right(c, 648, 26, pet_mood_name(p->mood), 2, mood_color);
+	draw_text(c, 672, 30, "*", 1, C_YELLOW);
+	snprintf(buf, sizeof(buf), "%02d:%02d:%02d", seconds / 3600,
+		 (seconds / 60) % 60, seconds % 60);
+	draw_text(c, 712, 26, buf, 2, C_YELLOW);
+	draw_text(c, 828, 30, "*", 1, C_YELLOW);
+	snprintf(buf, sizeof(buf), "E%03d F%03d", p->energy, p->focus);
+	draw_text_right(c, 938, 26, buf, 1, 0x83a598);
+	hline(c, 22, 54, UI_W - 44, 0xebdbb2);
+
+	draw_pet_sprite(c, p, frame);
+	if (p->mood == PET_ASKING) {
+		qy = 118 + (int)((frame / 6u) % 4u) * 3;
+		draw_text(c, 614, qy, "?", 7, C_YELLOW);
+		draw_text(c, 680, qy + 22, "?", 3, C_AMBER);
+	} else if (p->mood == PET_REVIEWING) {
+		int sx = 312 + (int)((frame * 9u) % 340u);
+		fill_rect(c, sx, 94, 4, 170, 0x8ec07c);
+		fill_rect(c, sx + 5, 94, 2, 170, 0x427b58);
+	} else if (p->mood == PET_ERROR) {
+		draw_text(c, 602, 132, "!", 7, mood_color);
+	} else if (p->mood == PET_SLEEP) {
+		draw_text(c, 610, 118, "Z", 3, 0x928374);
+		draw_text(c, 650, 96, "z", 2, 0x928374);
+		draw_text(c, 684, 80, "z", 1, 0x928374);
+	}
+
+	snprintf(buf, sizeof(buf), "[ %s ]", pet_mood_name(p->mood));
+	draw_text(c, 364, 274, buf, 3, mood_color);
+	draw_text(c, 282, 312, "*", 1, C_YELLOW);
+	draw_text_fit(c, 304, 310, 360, p->message, 1, C_TEXT);
+	draw_text(c, 676, 312, "*", 1, C_YELLOW);
+	draw_pet_bar(c, 32, 82, 120, "ENERGY", p->energy, C_YELLOW);
+	draw_pet_bar(c, 32, 106, 120, "AFF", p->affection, 0xd3869b);
+	draw_pet_bar(c, 32, 130, 120, "FOCUS", p->focus, 0x8ec07c);
+
+	hline(c, 22, 344, UI_W - 44, 0xebdbb2);
+	draw_text(c, 42, 370, "<", 3, C_YELLOW);
+	draw_text(c, 88, 374, "touch", 1, C_TEXT);
+	draw_text(c, 210, 374, "|", 1, C_MUTED);
+	draw_text(c, 248, 374, "+", 2, C_YELLOW);
+	draw_text(c, 286, 374, "feed", 1, C_TEXT);
+	draw_text(c, 392, 374, "|", 1, C_MUTED);
+	draw_text(c, 430, 374, "KEY2 mood", 1, C_TEXT);
+	draw_text(c, 566, 374, "|", 1, C_MUTED);
+	draw_text(c, 604, 374, "ENC state", 1, C_TEXT);
+	draw_text(c, 744, 374, "|", 1, C_MUTED);
+	draw_text(c, 782, 374, "PUSH menu", 1, C_TEXT);
+}
+
 static uint32_t state_color(const char *state)
 {
 	if (streq_ci(state, "WAIT") || streq_ci(state, "permission_needed"))
@@ -2446,17 +2871,40 @@ static struct kitty_graphics_metrics kitty_metrics_for_term(
 	return m;
 }
 
+static bool pet_input_is_command(const char *buf, ssize_t len)
+{
+	ssize_t i = 0;
+
+	while (i < len && (buf[i] == '\r' || buf[i] == '\n' || buf[i] == ' '))
+		i++;
+	return i + 4 <= len && !memcmp(buf + i, "PET ", 4);
+}
+
+static void feed_terminal_bytes(struct terminal *term, struct kitty_graphics *kitty,
+				const char *buf, ssize_t len)
+{
+	struct terminal_emit_ctx emit_ctx = {
+		.term = term,
+		.kitty = kitty,
+	};
+
+	for (ssize_t i = 0; i < len; i++) {
+		struct kitty_graphics_metrics metrics = kitty_metrics_for_term(term);
+
+		kitty_graphics_feed_byte(kitty, (uint8_t)buf[i],
+					 terminal_emit_byte, &emit_ctx,
+					 &metrics);
+	}
+}
+
 static void process_input_fd(int fd, struct ui_model *m, struct terminal *term,
-			     struct kitty_graphics *kitty, enum app_view view)
+			     struct kitty_graphics *kitty, struct pet_state *pet,
+			     enum app_view *view)
 {
 	static char buf[LINE_BUF];
 	static size_t len;
 	char tmp[256];
 	ssize_t rd;
-	struct terminal_emit_ctx emit_ctx = {
-		.term = term,
-		.kitty = kitty,
-	};
 
 	for (;;) {
 		rd = read(fd, tmp, sizeof(tmp));
@@ -2474,24 +2922,67 @@ static void process_input_fd(int fd, struct ui_model *m, struct terminal *term,
 			anim_release(&g_wait_anim);
 		if (g_show_splash)
 			g_show_splash = false;
+		if (*view == VIEW_PET && !pet_input_is_command(tmp, rd)) {
+			*view = VIEW_TERMINAL;
+			len = 0;
+			terminal_reset(term);
+			kitty_graphics_clear(kitty);
+			feed_terminal_bytes(term, kitty, tmp, rd);
+			continue;
+		}
 		for (ssize_t i = 0; i < rd; i++) {
 			char ch = tmp[i];
 
-			if (view == VIEW_TERMINAL) {
-				struct kitty_graphics_metrics metrics =
-					kitty_metrics_for_term(term);
-
-				kitty_graphics_feed_byte(kitty, (uint8_t)ch,
-							 terminal_emit_byte,
-							 &emit_ctx, &metrics);
+			if (*view == VIEW_TERMINAL) {
+				feed_terminal_bytes(term, kitty, &ch, 1);
 				continue;
 			}
 			if (ch == '\r')
 				continue;
 			if (ch == '\n') {
 				buf[len] = '\0';
+				if (len > 0) {
+					if (*view == VIEW_PET)
+						pet_apply_command(pet, buf);
+					else
+						apply_json_line(m, buf);
+				}
+				len = 0;
+			} else if (len + 1 < sizeof(buf)) {
+				buf[len++] = ch;
+			} else {
+				len = 0;
+			}
+		}
+	}
+}
+
+static void process_event_fd(int fd, struct pet_state *pet)
+{
+	static char buf[LINE_BUF];
+	static size_t len;
+	char tmp[128];
+	ssize_t rd;
+
+	for (;;) {
+		rd = read(fd, tmp, sizeof(tmp));
+		if (rd < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				return;
+			warnf("event input read failed: %s", strerror(errno));
+			return;
+		}
+		if (rd == 0)
+			return;
+		for (ssize_t i = 0; i < rd; i++) {
+			char ch = tmp[i];
+
+			if (ch == '\r')
+				continue;
+			if (ch == '\n') {
+				buf[len] = '\0';
 				if (len > 0)
-					apply_json_line(m, buf);
+					pet_apply_event_line(pet, buf);
 				len = 0;
 			} else if (len + 1 < sizeof(buf)) {
 				buf[len++] = ch;
@@ -2534,6 +3025,10 @@ static int parse_view(const char *s, enum app_view *out)
 	if (streq_ci(s, "dashboard") || streq_ci(s, "panel") ||
 	    streq_ci(s, "json")) {
 		*out = VIEW_DASHBOARD;
+		return 0;
+	}
+	if (streq_ci(s, "pet") || streq_ci(s, "desktop-pet")) {
+		*out = VIEW_PET;
 		return 0;
 	}
 	return -1;
@@ -2620,18 +3115,22 @@ static void process_ctrl_fd(int fd, struct font_ctx *font, struct terminal *t)
 
 static void render_app(struct canvas *c, enum app_view view,
 		       const struct ui_model *model, const struct terminal *term,
-		       struct font_ctx *font, const struct kitty_graphics *kitty)
+		       struct font_ctx *font, const struct kitty_graphics *kitty,
+		       struct pet_state *pet)
 {
 	if (view == VIEW_TERMINAL)
 		render_terminal(c, term, font, kitty);
-	else
+	else if (view == VIEW_DASHBOARD)
 		render_dashboard(c, model);
+	else
+		render_pet(c, pet);
 }
 
 static void render_frame(struct canvas *c, enum app_view view,
 			 const struct ui_model *model,
 			 const struct terminal *term, struct font_ctx *font,
-			 const struct kitty_graphics *kitty)
+			 const struct kitty_graphics *kitty,
+			 struct pet_state *pet)
 {
 	if (g_boot_anim.active && g_boot_anim.base) {
 		anim_blit(&g_boot_anim, c);
@@ -2645,7 +3144,7 @@ static void render_frame(struct canvas *c, enum app_view view,
 		memcpy(c->px, g_splash, SPLASH_BYTES);
 		return;
 	}
-	render_app(c, view, model, term, font, kitty);
+	render_app(c, view, model, term, font, kitty, pet);
 }
 
 static void usage(const char *argv0)
@@ -2653,7 +3152,8 @@ static void usage(const char *argv0)
 	printf("Usage: %s [options]\n", argv0);
 	printf("  --fb PATH          framebuffer path (default /dev/fb0)\n");
 	printf("  --input PATH       terminal bytes or newline JSON input, '-' for stdin\n");
-	printf("  --view MODE        terminal/vt100 or dashboard/json (default terminal)\n");
+	printf("  --view MODE        terminal/vt100, dashboard/json, or pet (default terminal)\n");
+	printf("  --event-input PATH local button/encoder event FIFO for pet view\n");
 	printf("  --font PATH        preferred TrueType/OpenType font path\n");
 	printf("  --cell WxH         initial terminal cell size; one of 8x16, 10x20, 12x24, 16x32\n");
 	printf("  --ctrl PATH        runtime control FIFO; lines like \"cell 12 24\" change font size\n");
@@ -2677,6 +3177,7 @@ int main(int argc, char **argv)
 	const char *dump_path = NULL;
 	const char *font_path = NULL;
 	const char *ctrl_path = NULL;
+	const char *event_input_path = NULL;
 	const char *splash_path = NULL;
 	const char *boot_anim_path = NULL;
 	const char *wait_anim_path = NULL;
@@ -2696,14 +3197,17 @@ int main(int argc, char **argv)
 	};
 	struct ui_model model;
 	struct terminal term;
+	struct pet_state pet;
 	struct font_ctx font;
 	struct fb_target fb;
 	struct kitty_graphics *kitty = NULL;
 	int input_fd = -1;
 	int ctrl_fd = -1;
+	int event_fd = -1;
 	int ret = 0;
 	time_t next_input_retry = 0;
 	time_t next_ctrl_retry = 0;
+	time_t next_event_retry = 0;
 
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--fb") && i + 1 < argc) {
@@ -2725,6 +3229,8 @@ int main(int argc, char **argv)
 			}
 		} else if (!strcmp(argv[i], "--ctrl") && i + 1 < argc) {
 			ctrl_path = argv[++i];
+		} else if (!strcmp(argv[i], "--event-input") && i + 1 < argc) {
+			event_input_path = argv[++i];
 		} else if (!strcmp(argv[i], "--splash") && i + 1 < argc) {
 			splash_path = argv[++i];
 		} else if (!strcmp(argv[i], "--boot-anim") && i + 1 < argc) {
@@ -2793,6 +3299,7 @@ int main(int argc, char **argv)
 		terminal_seed_mock(&term);
 	else
 		terminal_reset(&term);
+	pet_init(&pet);
 	if (!font_init(&font, font_path))
 		warnf("freetype font unavailable; falling back to built-in 8x16 glyphs");
 
@@ -2801,7 +3308,7 @@ int main(int argc, char **argv)
 		term.clear_graphics = false;
 	}
 
-	render_app(&c, view, &model, &term, &font, kitty);
+	render_app(&c, view, &model, &term, &font, kitty, &pet);
 	if (dump_path) {
 		ret = write_ppm(dump_path, &c);
 		kitty_graphics_destroy(kitty);
@@ -2826,6 +3333,11 @@ int main(int argc, char **argv)
 		if (ctrl_fd < 0)
 			next_ctrl_retry = time(NULL) + 5;
 	}
+	if (event_input_path) {
+		event_fd = open_input(event_input_path);
+		if (event_fd < 0)
+			next_event_retry = time(NULL) + 5;
+	}
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
 
@@ -2835,10 +3347,11 @@ int main(int argc, char **argv)
 		clock_gettime(CLOCK_MONOTONIC, &g_wait_anim.started_at);
 
 	while (!g_stop) {
-		struct pollfd pfds[2];
+		struct pollfd pfds[3];
 		nfds_t nfds = 0;
 		int input_idx = -1;
 		int ctrl_idx = -1;
+		int event_idx = -1;
 		int timeout = 1000;
 		time_t now;
 
@@ -2856,7 +3369,10 @@ int main(int argc, char **argv)
 				timeout = (int)ms;
 		}
 
-		render_frame(&c, view, &model, &term, &font, kitty);
+		if (view == VIEW_PET && timeout > 83)
+			timeout = 83;
+
+		render_frame(&c, view, &model, &term, &font, kitty, &pet);
 		fb_blit(&fb, &c);
 		if (once) {
 			if (once_hold_ms > 0)
@@ -2873,6 +3389,10 @@ int main(int argc, char **argv)
 			ctrl_fd = open_input(ctrl_path);
 			next_ctrl_retry = now + 5;
 		}
+		if (event_fd < 0 && event_input_path && now >= next_event_retry) {
+			event_fd = open_input(event_input_path);
+			next_event_retry = now + 5;
+		}
 
 		if (input_fd >= 0) {
 			input_idx = (int)nfds;
@@ -2888,6 +3408,13 @@ int main(int argc, char **argv)
 			pfds[nfds].revents = 0;
 			nfds++;
 		}
+		if (event_fd >= 0) {
+			event_idx = (int)nfds;
+			pfds[nfds].fd = event_fd;
+			pfds[nfds].events = POLLIN;
+			pfds[nfds].revents = 0;
+			nfds++;
+		}
 
 		if (nfds == 0) {
 			usleep((useconds_t)timeout * 1000);
@@ -2897,9 +3424,13 @@ int main(int argc, char **argv)
 		if (poll(pfds, nfds, timeout) <= 0)
 			continue;
 		if (input_idx >= 0 && (pfds[input_idx].revents & POLLIN))
-			process_input_fd(input_fd, &model, &term, kitty, view);
+			process_input_fd(input_fd, &model, &term, kitty, &pet,
+					 &view);
 		if (ctrl_idx >= 0 && (pfds[ctrl_idx].revents & POLLIN))
 			process_ctrl_fd(ctrl_fd, &font, &term);
+		if (event_idx >= 0 && (pfds[event_idx].revents & POLLIN) &&
+		    view == VIEW_PET)
+			process_event_fd(event_fd, &pet);
 		if (term.clear_graphics) {
 			kitty_graphics_clear(kitty);
 			term.clear_graphics = false;
@@ -2910,6 +3441,8 @@ int main(int argc, char **argv)
 		close(input_fd);
 	if (ctrl_fd >= 0 && ctrl_fd != STDIN_FILENO)
 		close(ctrl_fd);
+	if (event_fd >= 0 && event_fd != STDIN_FILENO)
+		close(event_fd);
 	fb_close_target(&fb);
 	kitty_graphics_destroy(kitty);
 	font_destroy(&font);

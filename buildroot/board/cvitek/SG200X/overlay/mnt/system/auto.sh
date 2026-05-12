@@ -5,13 +5,14 @@ export LD_LIBRARY_PATH="/lib:/lib/3rd:/lib/arm-linux-gnueabihf:/usr/lib:/usr/loc
 export PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin:/mnt/system/usr/bin:/mnt/system/usr/sbin:/mnt/data/bin:/mnt/data/sbin"
 AIKB_LCD_INPUT="/tmp/aikb_lcd_ui.in"
 AIKB_LCD_CTRL="/tmp/aikb_lcd_ui.ctrl"
+AIKB_PET_EVENTS="/tmp/aikb_pet_events.in"
 AIKB_LCD_SPLASH="/mnt/system/usr/share/aikb/splash.argb"
 AIKB_LCD_BOOT_ANIM="/mnt/system/usr/share/aikb/boot_anim.bin"
 AIKB_LCD_WAIT_ANIM="/mnt/system/usr/share/aikb/wait_cycle.bin"
 
 prepare_aikb_lcd_input()
 {
-   for f in "${AIKB_LCD_INPUT}" "${AIKB_LCD_CTRL}"; do
+   for f in "${AIKB_LCD_INPUT}" "${AIKB_LCD_CTRL}" "${AIKB_PET_EVENTS}"; do
       if [ -e "$f" ] && [ ! -p "$f" ]; then
          rm -f "$f"
       fi
@@ -42,7 +43,7 @@ start_aikb_hid_input()
 
    prepare_aikb_lcd_input
 
-   "${HID_INPUT}" --hid /dev/hidg0 --screen-out "${AIKB_LCD_INPUT}" --ctrl-out "${AIKB_LCD_CTRL}" >> "${HID_LOG}" 2>&1 &
+   "${HID_INPUT}" --hid /dev/hidg0 --screen-out "${AIKB_LCD_INPUT}" --ctrl-out "${AIKB_LCD_CTRL}" --event-out "${AIKB_PET_EVENTS}" >> "${HID_LOG}" 2>&1 &
    HID_PID=$!
    sleep 1
    if kill -0 "${HID_PID}" >/dev/null 2>&1; then
@@ -111,7 +112,19 @@ start_aikb_lcd_ui()
    if [ -f "${AIKB_LCD_WAIT_ANIM}" ]; then
       LCD_WAIT_ANIM_ARG="--wait-anim ${AIKB_LCD_WAIT_ANIM}"
    fi
-   "${LCD_UI}" --fb /dev/fb0 --input "${AIKB_LCD_INPUT}" --ctrl "${AIKB_LCD_CTRL}" ${LCD_BOOT_ANIM_ARG} ${LCD_WAIT_ANIM_ARG} ${LCD_SPLASH_ARG} --rotate auto --view terminal >> "${LCD_LOG}" 2>&1 &
+   LCD_VIEW="pet"
+   LCD_EVENT_ARG="--event-input ${AIKB_PET_EVENTS}"
+   if [ "${AIKB_VIEW}" = "terminal" ] || [ "${AIKB_VIEW}" = "dashboard" ]; then
+      LCD_VIEW="${AIKB_VIEW}"
+      LCD_EVENT_ARG=""
+   else
+      LCD_VIEW="pet"
+      LCD_EVENT_ARG="--event-input ${AIKB_PET_EVENTS}"
+      LCD_BOOT_ANIM_ARG=""
+      LCD_WAIT_ANIM_ARG=""
+      LCD_SPLASH_ARG=""
+   fi
+   "${LCD_UI}" --fb /dev/fb0 --input "${AIKB_LCD_INPUT}" --ctrl "${AIKB_LCD_CTRL}" ${LCD_EVENT_ARG} ${LCD_BOOT_ANIM_ARG} ${LCD_WAIT_ANIM_ARG} ${LCD_SPLASH_ARG} --rotate auto --view "${LCD_VIEW}" >> "${LCD_LOG}" 2>&1 &
    LCD_PID=$!
    sleep 1
    if kill -0 "${LCD_PID}" >/dev/null 2>&1; then

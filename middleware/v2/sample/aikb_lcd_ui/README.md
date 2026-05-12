@@ -3,7 +3,10 @@
 This sample renders a 960x412 landscape UI for the GC9503 412x960 LCD when the
 panel is mounted sideways. It writes directly to a Linux framebuffer. The
 default view is a VT100-compatible terminal surface fed by raw input bytes;
-the previous JSON dashboard remains available with `--view dashboard`.
+the previous JSON dashboard remains available with `--view dashboard`. A local
+desktop pet mode is available with `--view pet`; it runs a board-side state
+machine and animation loop and draws directly into the same canvas/framebuffer
+path. It is not a Host-pushed Kitty frame stream.
 
 ## Build
 
@@ -21,6 +24,7 @@ Render once to an image for local inspection:
 
 ```sh
 ./aikb_lcd_ui --dump-ppm /tmp/aikb-lcd-ui.ppm
+./aikb_lcd_ui --view pet --dump-ppm /tmp/pet.ppm --once
 ```
 
 Run on the board framebuffer with the VT100 terminal view and mock data:
@@ -43,6 +47,12 @@ USB serial device.
 
 ```sh
 ./aikb_lcd_ui --fb /dev/fb0 --input /dev/ttyGS0 --rotate auto --view terminal
+```
+
+Run the local pet directly on the board:
+
+```sh
+/mnt/system/usr/bin/aikb_lcd_ui --fb /dev/fb0 --rotate auto --view pet
 ```
 
 The default AIKB boot path uses Vendor HID for screen writes instead: `auto.sh`
@@ -126,6 +136,59 @@ Useful font paths checked automatically:
 - `/mnt/system/fonts/SorasaGothic-Regular.ttf`
 - `/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc`
 - `/usr/share/fonts/dejavu/DejaVuSansMono.ttf`
+
+## Pet view
+
+`--view pet` is a local board-side desktop pet. It reuses the 960x412 logical
+canvas and framebuffer blitter, including `--rotate auto`, `--pixel-format`,
+`--alpha`, and `--dump-ppm`. The first version draws the pixel pet in C code,
+so it has no external PNG dependency. The board startup script now uses pet as
+the default view; set `AIKB_VIEW=terminal` or `AIKB_VIEW=dashboard` to force the
+older views.
+
+When pet view receives normal host VT100 bytes on `--input` instead of a
+`PET ...` command line, it switches to terminal view, clears the terminal state,
+and feeds that same byte chunk into the existing VT100/Kitty renderer. This
+keeps boot idle local to the board while allowing Codex/Claude output from
+vibe-bridge to take over the LCD as soon as the host sends data.
+
+The pet state includes `mood`, `frame_index`, `start_time_ms`,
+`last_interaction_ms`, `message[128]`, `energy`, `affection`, and `focus`.
+Supported moods are:
+
+- `IDLE`
+- `ASKING`
+- `CODING`
+- `REVIEWING`
+- `ERROR`
+- `SLEEP`
+
+`--input` accepts newline-delimited pet commands:
+
+```text
+PET MOOD IDLE|ASKING|CODING|REVIEWING|ERROR|SLEEP
+PET MESSAGE <text>
+PET TOUCH
+PET FEED
+PET WORK_START
+PET WORK_DONE
+PET TEST_FAIL
+```
+
+Command test through the normal boot FIFO:
+
+```sh
+echo "PET MOOD ASKING" > /tmp/aikb_lcd_ui.in
+```
+
+`--event-input PATH` reads local button/encoder events from a FIFO. In pet view
+the mappings are:
+
+- `KEY 0 DOWN` -> touch
+- `KEY 1 DOWN` -> feed
+- `KEY 2 DOWN` -> cycle mood
+- `ENC +1` / `ENC -1` -> cycle state/prompt
+- `ENC_BTN DOWN` -> menu/asking mood
 
 ## Dashboard input protocol
 

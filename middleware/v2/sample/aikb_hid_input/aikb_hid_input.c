@@ -107,6 +107,7 @@ struct config {
 	const char *hid_path;
 	const char *screen_out_path;
 	const char *ctrl_out_path;
+	const char *event_out_path;
 	unsigned poll_ms;
 	unsigned debounce_ms;
 	bool debug;
@@ -545,6 +546,61 @@ static int send_encoder_event(int hid_fd, int delta, bool debug)
 			       SESSION_BROADCAST, &payload, 1, debug);
 }
 
+static int write_event_line(int *event_fd, const char *path, const char *line,
+			    bool debug)
+{
+	size_t len;
+
+	if (!path || !line)
+		return 0;
+	len = strlen(line);
+	return write_screen_bytes(event_fd, path, (const uint8_t *)line, len,
+				  debug);
+}
+
+static void emit_key_down_events(int *event_fd, const struct config *cfg,
+				 uint8_t old_bits, uint8_t new_bits)
+{
+	static const char *key_lines[3] = {
+		"KEY 0 DOWN\n",
+		"KEY 1 DOWN\n",
+		"KEY 2 DOWN\n",
+	};
+
+	if (!cfg->event_out_path)
+		return;
+	for (size_t i = 0; i < 3; i++) {
+		uint8_t bit = (uint8_t)(1u << i);
+
+		if ((new_bits & bit) && !(old_bits & bit))
+			(void)write_event_line(event_fd, cfg->event_out_path,
+					       key_lines[i], cfg->debug);
+	}
+	if ((new_bits & 0x80u) && !(old_bits & 0x80u))
+		(void)write_event_line(event_fd, cfg->event_out_path,
+				       "ENC_BTN DOWN\n", cfg->debug);
+}
+
+static void emit_encoder_events(int *event_fd, const struct config *cfg,
+				int delta)
+{
+	const char *line;
+
+	if (!cfg->event_out_path || delta == 0)
+		return;
+	line = delta > 0 ? "ENC +1\n" : "ENC -1\n";
+	while (delta > 0) {
+		(void)write_event_line(event_fd, cfg->event_out_path, line,
+				       cfg->debug);
+		delta--;
+	}
+	while (delta < 0) {
+		(void)write_event_line(event_fd, cfg->event_out_path, line,
+				       cfg->debug);
+		delta++;
+	}
+}
+
 /* ---------------------------------------------------------- packet handler */
 
 static int write_ctrl_line(int *ctrl_fd, const char *path, const char *line,
@@ -738,7 +794,7 @@ static void usage(FILE *out)
 {
 	fprintf(out,
 		"Usage: aikb_hid_input [--hid PATH] [--screen-out PATH]\n"
-		"                      [--ctrl-out PATH]\n"
+		"                      [--ctrl-out PATH] [--event-out PATH]\n"
 		"                      [--poll-ms N] [--debounce-ms N]\n"
 		"                      [--reverse] [--debug] [--no-hid]\n");
 }
@@ -763,6 +819,7 @@ static int parse_args(int argc, char **argv, struct config *cfg)
 	cfg->hid_path = "/dev/hidg0";
 	cfg->screen_out_path = NULL;
 	cfg->ctrl_out_path = NULL;
+	cfg->event_out_path = NULL;
 	cfg->poll_ms = 2;
 	cfg->debounce_ms = 12;
 	cfg->debug = false;
@@ -776,6 +833,8 @@ static int parse_args(int argc, char **argv, struct config *cfg)
 			cfg->screen_out_path = argv[++i];
 		} else if (strcmp(argv[i], "--ctrl-out") == 0 && i + 1 < argc) {
 			cfg->ctrl_out_path = argv[++i];
+		} else if (strcmp(argv[i], "--event-out") == 0 && i + 1 < argc) {
+			cfg->event_out_path = argv[++i];
 		} else if (strcmp(argv[i], "--poll-ms") == 0 && i + 1 < argc) {
 			if (parse_uint(argv[++i], &cfg->poll_ms) != 0)
 				return -1;
@@ -823,12 +882,15 @@ int main(int argc, char **argv)
 	unsigned enc_state;
 	int enc_acc = 0;
 	int pending_delta = 0;
+	int event_delta_pending = 0;
 	bool keys_dirty = true;
 	uint8_t key_bits;
+	uint8_t event_prev_key_bits = 0;
 	int mem_fd = -1;
 	int hid_fd = -1;
 	int screen_fd = -1;
 	int ctrl_fd = -1;
+	int event_fd = -1;
 	size_t i;
 
 	if (parse_args(argc, argv, &cfg) != 0)
@@ -867,6 +929,7 @@ int main(int argc, char **argv)
 		      now_ms());
 	enc_state = (gpio_level(ext_port, g_enc_a.gpio_bit) ? 2u : 0u) |
 		    (gpio_level(ext_port, g_enc_b.gpio_bit) ? 1u : 0u);
+	event_prev_key_bits = build_key_bits(keys, &enc_sw);
 
 	while (!g_stop) {
 		uint64_t now = now_ms();
@@ -912,10 +975,12 @@ int main(int argc, char **argv)
 
 			while (enc_acc >= 4) {
 				pending_delta++;
+				event_delta_pending++;
 				enc_acc -= 4;
 			}
 			while (enc_acc <= -4) {
 				pending_delta--;
+				event_delta_pending--;
 				enc_acc += 4;
 			}
 		}
@@ -924,6 +989,22 @@ int main(int argc, char **argv)
 			pending_delta = 127;
 		if (pending_delta < -127)
 			pending_delta = -127;
+
+		if (event_delta_pending > 127)
+			event_delta_pending = 127;
+		if (event_delta_pending < -127)
+			event_delta_pending = -127;
+
+		if (keys_dirty) {
+			key_bits = build_key_bits(keys, &enc_sw);
+			emit_key_down_events(&event_fd, &cfg, event_prev_key_bits,
+					     key_bits);
+			event_prev_key_bits = key_bits;
+		}
+		if (event_delta_pending) {
+			emit_encoder_events(&event_fd, &cfg, event_delta_pending);
+			event_delta_pending = 0;
+		}
 
 		if (hid_fd >= 0)
 			drain_packets(hid_fd, &screen_fd, &ctrl_fd, &cfg);
@@ -974,6 +1055,8 @@ int main(int argc, char **argv)
 		close(screen_fd);
 	if (ctrl_fd >= 0)
 		close(ctrl_fd);
+	if (event_fd >= 0)
+		close(event_fd);
 	mmio_unmap(&pinmux);
 	mmio_unmap(&gpio);
 	close(mem_fd);

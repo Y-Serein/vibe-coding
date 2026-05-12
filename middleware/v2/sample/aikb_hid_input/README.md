@@ -78,11 +78,28 @@ translation layer any more.
 The default boot script creates `/tmp/aikb_lcd_ui.in` as a FIFO, starts
 `aikb_lcd_ui` on it, and runs `aikb_hid_input --screen-out /tmp/aikb_lcd_ui.in`.
 
+## Local pet event FIFO
+
+`--event-out PATH` is optional. It mirrors local button and encoder activity to
+a board-local FIFO for `aikb_lcd_ui --view pet --event-input PATH` while keeping
+the existing HID reports to the Host unchanged.
+
+The event lines are:
+
+```text
+KEY 0 DOWN
+KEY 1 DOWN
+KEY 2 DOWN
+ENC +1
+ENC -1
+ENC_BTN DOWN
+```
+
 ## Board test
 
 ```sh
 /mnt/system/usr/bin/aikb_hid_input --hid /dev/hidg0 \
-    --screen-out /tmp/aikb_lcd_ui.in --debug
+    --screen-out /tmp/aikb_lcd_ui.in --event-out /tmp/aikb_pet_events.in --debug
 cat /tmp/aikb_hid_input.log
 ```
 
