@@ -1,0 +1,3 @@
+buildroot/board/cvitek/SG200X/overlay/mnt/system/usr/share/aikb/*.bin binary
+buildroot/board/cvitek/SG200X/overlay/mnt/system/usr/share/aikb/*.argb binary
+build/tools/common/sd_tools/*.jpeg binary

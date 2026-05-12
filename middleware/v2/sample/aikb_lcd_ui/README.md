@@ -82,6 +82,23 @@ handles the common VT100/ANSI controls used by CLIs:
 
 Powerline private-use glyphs `U+E0B0`..`U+E0B3` are drawn internally so status
 bars render even if the active font lacks those symbols.
+Box drawing glyphs used by Codex/Claude prompt frames (`U+2500`, `U+2502`,
+`U+256D`, `U+256E`, `U+2570`, `U+256F`) are also drawn internally against the
+terminal cell geometry, avoiding font-side side bearings that make frame lines
+look broken on the small LCD.
+
+The terminal view also recognizes a minimal Kitty graphics subset for inline
+PNG display:
+
+```text
+ESC _ G a=T,f=100,t=d,m=0,q=2,c=COLS,r=ROWS,i=IMAGE,p=PLACEMENT;BASE64_PNG ESC \
+```
+
+Only direct PNG payloads are decoded. `m=1`/`m=0` chunks are joined before
+decode; unsupported parameters are ignored. Images are rendered into the
+terminal canvas at the current cursor position, sized by `c`/`r` terminal
+cells, then the existing framebuffer blitter converts to the actual LCD pixel
+format. `ESC c`, `CSI 2J`, and `CSI 3J` clear active image placements.
 
 For text rendering the app prefers Sarasa/Sorasa-style mono CJK fonts when they
 are present, then falls back to the image's WQY/DejaVu fonts and finally to the

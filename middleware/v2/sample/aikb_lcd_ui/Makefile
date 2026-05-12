@@ -1,7 +1,7 @@
 SHELL = /bin/bash
 
 TARGET := aikb_lcd_ui
-SRCS := aikb_lcd_ui.c
+SRCS := aikb_lcd_ui.c kitty_graphics.c
 OBJS := $(SRCS:.c=.o)
 
 ifeq ($(BUILD_PATH),)
@@ -13,7 +13,7 @@ PARAM_FILE ?= ../../Makefile.param
 include $(PARAM_FILE)
 endif
 
-EXTRA_CFLAGS := -std=c99 -Wall -Wextra -Wno-unused-parameter
+EXTRA_CFLAGS := -std=c99 -Wall -Wextra -Wno-unused-parameter -I../../3rdparty/stb
 EXTRA_LDLIBS :=
 FT_SYSROOT ?= ../../../../buildroot/output/host/riscv64-buildroot-linux-musl/sysroot
 

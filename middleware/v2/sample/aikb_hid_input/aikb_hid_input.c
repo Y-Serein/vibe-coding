@@ -15,6 +15,21 @@
 #include <time.h>
 #include <unistd.h>
 
+/*
+ * aikb_hid_input
+ *
+ * Bridge between the board GPIO/encoder hardware and the USB HID gadget
+ * exposed at /dev/hidg0. Emits the new vibe-bridge protocol — every report
+ * carries a 6-byte header [report_id][cmd][sid_lo][sid_hi][plen_lo][plen_hi]
+ * and a session id is allocated by this firmware in response to
+ * CMD_REQUEST_SESSION. CMD_VT100_STREAM payloads are forwarded verbatim to
+ * the screen FIFO that aikb_lcd_ui consumes; multi-window routing stays in
+ * the host daemon for now.
+ *
+ * See tools/vibe-bridge/docs/hid_protocol.md for the wire format and
+ * tools/vibe-bridge/request.md for the architectural contract.
+ */
+
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define BIT_U32(n) (1u << (n))
 
@@ -33,19 +48,41 @@
 #define PINMUX_FUNC_MASK 0x7u
 #define PINMUX_FUNC_GPIOA 0x3u
 
+/* HID transport parameters — must match the gadget descriptor in
+ * buildroot/board/cvitek/SG200X/overlay/etc/init.d/S08usbdev. */
 #define HID_REPORT_LEN 64
-#define HID_OUTPUT_MAX_PAYLOAD 60
-#define REPORT_ID_INPUT 0x10
-#define REPORT_ID_OUTPUT 0x20
-#define REPORT_ID_ACK 0x21
-#define SCREEN_CMD_CLEAR 0x01
-#define SCREEN_CMD_WRITE 0x02
-#define SCREEN_CMD_SET_CURSOR 0x03
-#define SCREEN_CMD_NEWLINE 0x04
-#define SCREEN_CMD_BACKSPACE 0x05
-#define ACK_STATUS_OK 0x00
-#define ACK_STATUS_BUSY 0x01
-#define ACK_STATUS_ERR 0x02
+#define HID_HEADER_SIZE 6
+#define HID_MAX_PAYLOAD (HID_REPORT_LEN - HID_HEADER_SIZE)
+
+#define REPORT_ID_HOST_BOUND 0x10
+#define REPORT_ID_DEVICE_BOUND 0x20
+#define REPORT_ID_FEATURE 0x30
+
+/* Command bytes. Matches src/vibe_bridge/hid_protocol.py::Cmd. */
+#define CMD_REQUEST_SESSION 0x01
+#define CMD_SESSION_RESPONSE 0x02
+#define CMD_SESSION_INVALID 0x03
+#define CMD_KEY_EVENT 0x10
+#define CMD_ENCODER_EVENT 0x11
+#define CMD_WINDOW_SWITCH 0x20
+#define CMD_WINDOW_ACTIVATE 0x21
+#define CMD_VT100_STREAM 0x30
+#define CMD_UI_SCALE_CHANGE 0x40
+#define CMD_STATUS_UPDATE 0x50
+#define CMD_FEEDBACK_EVENT 0x60
+#define CMD_ERROR 0xFF
+
+/* Status bytes for CMD_SESSION_RESPONSE / CMD_SESSION_INVALID payloads. */
+#define SESSION_OK 0x00
+#define SESSION_CREATED 0x01
+#define SESSION_INVALID_S 0x02
+#define SESSION_EXPIRED 0x03
+#define SESSION_POOL_FULL 0x04
+#define SESSION_RECLAIMED 0x05
+
+#define SESSION_BROADCAST 0u
+#define MAX_SESSIONS 256
+#define PLUGIN_HINT_MAX 24
 
 struct mmio_page {
 	uint32_t base;
@@ -69,11 +106,18 @@ struct debouncer {
 struct config {
 	const char *hid_path;
 	const char *screen_out_path;
+	const char *ctrl_out_path;
 	unsigned poll_ms;
 	unsigned debounce_ms;
 	bool debug;
 	bool reverse;
 	bool no_hid;
+};
+
+struct session_entry {
+	bool used;
+	uint64_t last_active_ms;
+	char plugin_hint[PLUGIN_HINT_MAX];
 };
 
 static const struct pin_def g_keys[] = {
@@ -95,6 +139,11 @@ static const struct pin_def g_enc_e = {
 };
 
 static volatile sig_atomic_t g_stop;
+
+/* Session table. Index 0 is reserved as the broadcast sid; valid sids occupy
+ * 1..MAX_SESSIONS so the C array indexes the wire sid directly. */
+static struct session_entry g_sessions[MAX_SESSIONS + 1];
+static uint16_t g_next_sid = 1;
 
 static void on_signal(int sig)
 {
@@ -291,49 +340,111 @@ static int write_hid_report(int fd, const uint8_t report[HID_REPORT_LEN])
 	return 0;
 }
 
-static int send_input_report(int fd, uint8_t key_bits, int encoder_delta,
-			     bool debug)
+/* Builds a HID frame with the new 6-byte header and writes it. plen is
+ * truncated to HID_MAX_PAYLOAD; trailing bytes are zero-padded so the report
+ * is always exactly HID_REPORT_LEN. */
+static int send_hid_packet(int hid_fd, uint8_t report_id, uint8_t cmd,
+			   uint16_t sid, const uint8_t *payload, uint16_t plen,
+			   bool debug)
 {
 	uint8_t report[HID_REPORT_LEN];
 	int rc;
 
-	if (encoder_delta > 127)
-		encoder_delta = 127;
-	if (encoder_delta < -127)
-		encoder_delta = -127;
+	if (plen > HID_MAX_PAYLOAD)
+		plen = HID_MAX_PAYLOAD;
 
 	memset(report, 0, sizeof(report));
-	report[0] = REPORT_ID_INPUT;
-	report[1] = key_bits;
-	report[2] = (uint8_t)(int8_t)encoder_delta;
+	report[0] = report_id;
+	report[1] = cmd;
+	report[2] = (uint8_t)(sid & 0xffu);
+	report[3] = (uint8_t)((sid >> 8) & 0xffu);
+	report[4] = (uint8_t)(plen & 0xffu);
+	report[5] = (uint8_t)((plen >> 8) & 0xffu);
+	if (plen && payload)
+		memcpy(&report[HID_HEADER_SIZE], payload, plen);
 
-	rc = write_hid_report(fd, report);
+	rc = write_hid_report(hid_fd, report);
 	if (debug && rc == 0) {
-		fprintf(stderr, "aikb_hid_input: report 0x10 keys=0x%02x delta=%d\n",
-			key_bits, encoder_delta);
+		fprintf(stderr,
+			"aikb_hid_input: tx id=0x%02x cmd=0x%02x sid=%u plen=%u\n",
+			report_id, cmd, sid, plen);
 	}
-
 	return rc;
 }
 
-static int send_ack_report(int fd, uint8_t seq, uint8_t status, bool debug)
+/* ------------------------------------------------------------- session API */
+
+static bool session_alive(uint16_t sid)
 {
-	uint8_t report[HID_REPORT_LEN];
-	int rc;
+	return sid >= 1 && sid <= MAX_SESSIONS && g_sessions[sid].used;
+}
 
-	memset(report, 0, sizeof(report));
-	report[0] = REPORT_ID_ACK;
-	report[1] = seq;
-	report[2] = status;
+static void touch_session(uint16_t sid, uint64_t now)
+{
+	if (session_alive(sid))
+		g_sessions[sid].last_active_ms = now;
+}
 
-	rc = write_hid_report(fd, report);
-	if (debug && rc == 0) {
-		fprintf(stderr, "aikb_hid_input: ack 0x21 seq=%u status=%u\n",
-			seq, status);
+static void copy_hint(struct session_entry *e, const uint8_t *hint, uint16_t hint_len)
+{
+	uint16_t copy = hint_len;
+	if (copy > PLUGIN_HINT_MAX - 1)
+		copy = PLUGIN_HINT_MAX - 1;
+	if (copy && hint)
+		memcpy(e->plugin_hint, hint, copy);
+	e->plugin_hint[copy] = '\0';
+}
+
+static uint16_t pick_lru(void)
+{
+	uint16_t lru = 0;
+	uint64_t oldest = UINT64_MAX;
+	uint16_t s;
+
+	for (s = 1; s <= MAX_SESSIONS; s++) {
+		if (g_sessions[s].used && g_sessions[s].last_active_ms < oldest) {
+			lru = s;
+			oldest = g_sessions[s].last_active_ms;
+		}
+	}
+	return lru;
+}
+
+/* Allocate a fresh sid. On pool-full, evicts the LRU entry and returns its
+ * sid in *evicted_out so the caller can notify the old owner with
+ * CMD_SESSION_INVALID(RECLAIMED) before announcing the new ownership. */
+static uint16_t alloc_session(const uint8_t *hint, uint16_t hint_len,
+			      uint64_t now, uint16_t *evicted_out)
+{
+	int probe;
+	uint16_t lru;
+
+	*evicted_out = 0;
+
+	for (probe = 0; probe < MAX_SESSIONS; probe++) {
+		uint16_t sid = g_next_sid;
+		g_next_sid++;
+		if (g_next_sid > MAX_SESSIONS)
+			g_next_sid = 1;
+		if (!g_sessions[sid].used) {
+			g_sessions[sid].used = true;
+			g_sessions[sid].last_active_ms = now;
+			copy_hint(&g_sessions[sid], hint, hint_len);
+			return sid;
+		}
 	}
 
-	return rc;
+	lru = pick_lru();
+	if (lru == 0)
+		return 0;
+
+	*evicted_out = lru;
+	g_sessions[lru].last_active_ms = now;
+	copy_hint(&g_sessions[lru], hint, hint_len);
+	return lru;
 }
+
+/* ----------------------------------------------------------- screen output */
 
 static int open_screen_out(const char *path, bool debug)
 {
@@ -413,114 +524,200 @@ static int write_screen_bytes(int *screen_fd, const char *path,
 	return 0;
 }
 
-static int write_screen_cstr(int *screen_fd, const char *path, const char *s,
-			     bool debug)
+/* ----------------------------------------------------------- input reports */
+
+static int send_key_event(int hid_fd, uint8_t key_bits, bool debug)
 {
-	return write_screen_bytes(screen_fd, path, (const uint8_t *)s, strlen(s),
-				  debug);
+	return send_hid_packet(hid_fd, REPORT_ID_HOST_BOUND, CMD_KEY_EVENT,
+			       SESSION_BROADCAST, &key_bits, 1, debug);
 }
 
-static int handle_set_cursor(int *screen_fd, const char *path,
-			     const uint8_t *payload, size_t payload_len,
-			     bool debug)
+static int send_encoder_event(int hid_fd, int delta, bool debug)
 {
-	char text[32];
-	char *comma;
-	char *end = NULL;
-	unsigned long row;
-	unsigned long col;
-	char seq[32];
+	uint8_t payload;
 
-	if (payload_len >= sizeof(text))
-		return -1;
-	memcpy(text, payload, payload_len);
-	text[payload_len] = '\0';
-
-	comma = strchr(text, ',');
-	if (!comma)
-		return -1;
-	*comma = '\0';
-
-	errno = 0;
-	row = strtoul(text, &end, 10);
-	if (errno || !end || *end)
-		return -1;
-	errno = 0;
-	col = strtoul(comma + 1, &end, 10);
-	if (errno || !end || *end)
-		return -1;
-
-	if (row == 0)
-		row = 1;
-	if (col == 0)
-		col = 1;
-	if (row > 999)
-		row = 999;
-	if (col > 999)
-		col = 999;
-
-	snprintf(seq, sizeof(seq), "\033[%lu;%luH", row, col);
-	return write_screen_cstr(screen_fd, path, seq, debug);
+	if (delta > 127)
+		delta = 127;
+	if (delta < -127)
+		delta = -127;
+	payload = (uint8_t)(int8_t)delta;
+	return send_hid_packet(hid_fd, REPORT_ID_HOST_BOUND, CMD_ENCODER_EVENT,
+			       SESSION_BROADCAST, &payload, 1, debug);
 }
 
-static uint8_t handle_screen_output_report(int *screen_fd,
-					   const struct config *cfg,
-					   const uint8_t report[HID_REPORT_LEN],
-					   ssize_t report_len)
+/* ---------------------------------------------------------- packet handler */
+
+static int write_ctrl_line(int *ctrl_fd, const char *path, const char *line,
+			   bool debug)
+{
+	size_t len = strlen(line);
+	size_t off = 0;
+
+	if (!path || len == 0)
+		return 0;
+	if (*ctrl_fd < 0) {
+		*ctrl_fd = open_screen_out(path, debug);
+		if (*ctrl_fd < 0)
+			return 1;
+	}
+	while (off < len) {
+		ssize_t n = write(*ctrl_fd, line + off, len - off);
+
+		if (n < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				return 1;
+			if (debug) {
+				fprintf(stderr,
+					"aikb_hid_input: ctrl write failed: %s\n",
+					strerror(errno));
+			}
+			close(*ctrl_fd);
+			*ctrl_fd = -1;
+			return -1;
+		}
+		if (n == 0)
+			return 1;
+		off += (size_t)n;
+	}
+	return 0;
+}
+
+static void handle_packet(int hid_fd, int *screen_fd, int *ctrl_fd,
+			  const struct config *cfg,
+			  const uint8_t *report, ssize_t report_len)
 {
 	uint8_t cmd;
-	uint8_t payload_len;
-	int rc;
+	uint16_t sid;
+	uint16_t plen;
+	const uint8_t *payload;
+	uint64_t now;
 
-	if (report_len < 4)
-		return ACK_STATUS_ERR;
+	if (report_len < (ssize_t)HID_HEADER_SIZE) {
+		if (cfg->debug)
+			fprintf(stderr,
+				"aikb_hid_input: short packet len=%zd\n", report_len);
+		return;
+	}
+	if (report[0] != REPORT_ID_DEVICE_BOUND) {
+		if (cfg->debug)
+			fprintf(stderr,
+				"aikb_hid_input: ignored report id=0x%02x\n", report[0]);
+		return;
+	}
 
 	cmd = report[1];
-	payload_len = report[3];
-	if (payload_len > HID_OUTPUT_MAX_PAYLOAD ||
-	    (size_t)payload_len > (size_t)report_len - 4u)
-		return ACK_STATUS_ERR;
+	sid = (uint16_t)report[2] | ((uint16_t)report[3] << 8);
+	plen = (uint16_t)report[4] | ((uint16_t)report[5] << 8);
+	if (plen > HID_MAX_PAYLOAD ||
+	    (size_t)plen + HID_HEADER_SIZE > (size_t)report_len) {
+		if (cfg->debug)
+			fprintf(stderr,
+				"aikb_hid_input: truncated payload plen=%u rlen=%zd\n",
+				plen, report_len);
+		return;
+	}
+	payload = report + HID_HEADER_SIZE;
+	now = now_ms();
 
 	switch (cmd) {
-	case SCREEN_CMD_CLEAR:
-		rc = write_screen_cstr(screen_fd, cfg->screen_out_path,
-				       "\033[2J\033[H", cfg->debug);
-		break;
-	case SCREEN_CMD_WRITE:
-		rc = write_screen_bytes(screen_fd, cfg->screen_out_path,
-					report + 4, payload_len, cfg->debug);
-		break;
-	case SCREEN_CMD_SET_CURSOR:
-		rc = handle_set_cursor(screen_fd, cfg->screen_out_path,
-				       report + 4, payload_len, cfg->debug);
-		break;
-	case SCREEN_CMD_NEWLINE:
-		rc = write_screen_cstr(screen_fd, cfg->screen_out_path,
-				       "\r\n", cfg->debug);
-		break;
-	case SCREEN_CMD_BACKSPACE:
-		rc = write_screen_cstr(screen_fd, cfg->screen_out_path,
-				       "\b", cfg->debug);
-		break;
-	default:
-		rc = -1;
+	case CMD_REQUEST_SESSION: {
+		uint16_t evicted = 0;
+		uint16_t new_sid = alloc_session(payload, plen, now, &evicted);
+
+		if (evicted) {
+			uint8_t st = SESSION_RECLAIMED;
+			(void)send_hid_packet(hid_fd, REPORT_ID_HOST_BOUND,
+					      CMD_SESSION_INVALID, evicted,
+					      &st, 1, cfg->debug);
+		}
+		if (new_sid != 0) {
+			uint8_t st = SESSION_CREATED;
+			(void)send_hid_packet(hid_fd, REPORT_ID_HOST_BOUND,
+					      CMD_SESSION_RESPONSE, new_sid,
+					      &st, 1, cfg->debug);
+		} else {
+			uint8_t st = SESSION_POOL_FULL;
+			(void)send_hid_packet(hid_fd, REPORT_ID_HOST_BOUND,
+					      CMD_SESSION_INVALID,
+					      SESSION_BROADCAST, &st, 1,
+					      cfg->debug);
+		}
 		break;
 	}
 
-	if (rc > 0)
-		return ACK_STATUS_BUSY;
-	if (rc < 0)
-		return ACK_STATUS_ERR;
-	return ACK_STATUS_OK;
+	case CMD_VT100_STREAM:
+		if (!session_alive(sid)) {
+			uint8_t st = SESSION_INVALID_S;
+			(void)send_hid_packet(hid_fd, REPORT_ID_HOST_BOUND,
+					      CMD_SESSION_INVALID, sid, &st, 1,
+					      cfg->debug);
+			break;
+		}
+		touch_session(sid, now);
+		if (cfg->screen_out_path && plen > 0) {
+			(void)write_screen_bytes(screen_fd, cfg->screen_out_path,
+						 payload, plen, cfg->debug);
+		}
+		break;
+
+	case CMD_STATUS_UPDATE:
+		if (session_alive(sid))
+			touch_session(sid, now);
+		/* Status payload is opaque to firmware; the host owns its meaning. */
+		break;
+
+	case CMD_UI_SCALE_CHANGE:
+		/*
+		 * payload[0] = cell_w, payload[1] = cell_h. Forwarded as a
+		 * single ASCII line ("cell W H\n") to aikb_lcd_ui's --ctrl
+		 * FIFO so the renderer can resize at runtime. Sid is ignored
+		 * because cell geometry is global to the panel.
+		 */
+		if (cfg->ctrl_out_path && plen >= 2) {
+			char line[32];
+			int n = snprintf(line, sizeof(line), "cell %u %u\n",
+					 (unsigned)payload[0],
+					 (unsigned)payload[1]);
+			if (n > 0 && n < (int)sizeof(line)) {
+				(void)write_ctrl_line(ctrl_fd,
+						      cfg->ctrl_out_path,
+						      line, cfg->debug);
+			}
+		} else if (cfg->debug) {
+			fprintf(stderr,
+				"aikb_hid_input: ui_scale dropped sid=%u plen=%u (no --ctrl-out)\n",
+				sid, plen);
+		}
+		break;
+
+	case CMD_WINDOW_SWITCH:
+	case CMD_WINDOW_ACTIVATE:
+		/* Multi-window routing lives in the host daemon for now. The
+		 * firmware will gain real handlers once aikb_lcd_ui learns to
+		 * keep multiple buffers. */
+		if (cfg->debug) {
+			fprintf(stderr,
+				"aikb_hid_input: cmd 0x%02x sid=%u (no-op in firmware)\n",
+				cmd, sid);
+		}
+		break;
+
+	default:
+		if (cfg->debug) {
+			fprintf(stderr,
+				"aikb_hid_input: unknown cmd 0x%02x sid=%u\n",
+				cmd, sid);
+		}
+		break;
+	}
 }
 
-static void drain_output_reports(int fd, int *screen_fd,
-				 const struct config *cfg)
+static void drain_packets(int hid_fd, int *screen_fd, int *ctrl_fd,
+			  const struct config *cfg)
 {
 	for (;;) {
 		uint8_t report[HID_REPORT_LEN];
-		ssize_t n = read(fd, report, sizeof(report));
-		uint8_t status;
+		ssize_t n = read(hid_fd, report, sizeof(report));
 
 		if (n < 0) {
 			if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
@@ -531,30 +728,19 @@ static void drain_output_reports(int fd, int *screen_fd,
 		if (n == 0)
 			return;
 
-		if (report[0] != REPORT_ID_OUTPUT) {
-			if (cfg->debug)
-				fprintf(stderr,
-					"aikb_hid_input: ignored output report id=0x%02x len=%zd\n",
-					report[0], n);
-			continue;
-		}
-
-		if (cfg->debug) {
-			fprintf(stderr,
-				"aikb_hid_input: output 0x20 cmd=0x%02x seq=%u len=%u\n",
-				report[1], report[2], report[3]);
-		}
-		status = handle_screen_output_report(screen_fd, cfg, report, n);
-		(void)send_ack_report(fd, report[2], status, cfg->debug);
+		handle_packet(hid_fd, screen_fd, ctrl_fd, cfg, report, n);
 	}
 }
+
+/* -------------------------------------------------------------- arg parser */
 
 static void usage(FILE *out)
 {
 	fprintf(out,
-		"Usage: aikb_hid_input [--hid PATH] [--screen-out PATH]\\n"
-		"                      [--poll-ms N] [--debounce-ms N]\\n"
-		"                      [--reverse] [--debug] [--no-hid]\\n");
+		"Usage: aikb_hid_input [--hid PATH] [--screen-out PATH]\n"
+		"                      [--ctrl-out PATH]\n"
+		"                      [--poll-ms N] [--debounce-ms N]\n"
+		"                      [--reverse] [--debug] [--no-hid]\n");
 }
 
 static int parse_uint(const char *s, unsigned *out)
@@ -576,6 +762,7 @@ static int parse_args(int argc, char **argv, struct config *cfg)
 
 	cfg->hid_path = "/dev/hidg0";
 	cfg->screen_out_path = NULL;
+	cfg->ctrl_out_path = NULL;
 	cfg->poll_ms = 2;
 	cfg->debounce_ms = 12;
 	cfg->debug = false;
@@ -587,6 +774,8 @@ static int parse_args(int argc, char **argv, struct config *cfg)
 			cfg->hid_path = argv[++i];
 		} else if (strcmp(argv[i], "--screen-out") == 0 && i + 1 < argc) {
 			cfg->screen_out_path = argv[++i];
+		} else if (strcmp(argv[i], "--ctrl-out") == 0 && i + 1 < argc) {
+			cfg->ctrl_out_path = argv[++i];
 		} else if (strcmp(argv[i], "--poll-ms") == 0 && i + 1 < argc) {
 			if (parse_uint(argv[++i], &cfg->poll_ms) != 0)
 				return -1;
@@ -614,6 +803,8 @@ static int parse_args(int argc, char **argv, struct config *cfg)
 	return 0;
 }
 
+/* ------------------------------------------------------------------- main */
+
 int main(int argc, char **argv)
 {
 	static const int8_t qdec[16] = {
@@ -632,11 +823,12 @@ int main(int argc, char **argv)
 	unsigned enc_state;
 	int enc_acc = 0;
 	int pending_delta = 0;
-	bool pending_report = true;
+	bool keys_dirty = true;
 	uint8_t key_bits;
 	int mem_fd = -1;
 	int hid_fd = -1;
 	int screen_fd = -1;
+	int ctrl_fd = -1;
 	size_t i;
 
 	if (parse_args(argc, argv, &cfg) != 0)
@@ -690,7 +882,7 @@ int main(int argc, char **argv)
 				}
 				next_hid_try_ms = now + 1000u;
 			} else {
-				pending_report = true;
+				keys_dirty = true;
 				if (cfg.debug)
 					fprintf(stderr, "aikb_hid_input: opened %s\n",
 						cfg.hid_path);
@@ -701,12 +893,12 @@ int main(int argc, char **argv)
 		for (i = 0; i < ARRAY_SIZE(g_keys); i++) {
 			bool raw = active_low_pressed(ext_port, g_keys[i].gpio_bit);
 			if (debounce_update(&keys[i], raw, now, cfg.debounce_ms))
-				pending_report = true;
+				keys_dirty = true;
 		}
 		if (debounce_update(&enc_sw,
 				    active_low_pressed(ext_port, g_enc_e.gpio_bit),
 				    now, cfg.debounce_ms)) {
-			pending_report = true;
+			keys_dirty = true;
 		}
 
 		new_enc_state = (gpio_level(ext_port, g_enc_a.gpio_bit) ? 2u : 0u) |
@@ -732,22 +924,34 @@ int main(int argc, char **argv)
 			pending_delta = 127;
 		if (pending_delta < -127)
 			pending_delta = -127;
-		if (pending_delta)
-			pending_report = true;
 
 		if (hid_fd >= 0)
-			drain_output_reports(hid_fd, &screen_fd, &cfg);
+			drain_packets(hid_fd, &screen_fd, &ctrl_fd, &cfg);
 
-		if (pending_report && (cfg.no_hid || hid_fd >= 0)) {
-			int rc = 0;
-			key_bits = build_key_bits(keys, &enc_sw);
-			if (!cfg.no_hid)
-				rc = send_input_report(hid_fd, key_bits, pending_delta,
-						       cfg.debug);
-			else if (cfg.debug)
+		if (cfg.no_hid) {
+			if (cfg.debug && (keys_dirty || pending_delta)) {
+				key_bits = build_key_bits(keys, &enc_sw);
 				fprintf(stderr,
 					"aikb_hid_input: no-hid keys=0x%02x delta=%d\n",
 					key_bits, pending_delta);
+			}
+			keys_dirty = false;
+			pending_delta = 0;
+		} else if (hid_fd >= 0) {
+			int rc = 0;
+
+			if (keys_dirty) {
+				key_bits = build_key_bits(keys, &enc_sw);
+				rc = send_key_event(hid_fd, key_bits, cfg.debug);
+				if (rc == 0)
+					keys_dirty = false;
+			}
+
+			if (rc == 0 && pending_delta) {
+				rc = send_encoder_event(hid_fd, pending_delta, cfg.debug);
+				if (rc == 0)
+					pending_delta = 0;
+			}
 
 			if (rc < 0) {
 				if (cfg.debug) {
@@ -758,9 +962,6 @@ int main(int argc, char **argv)
 				close(hid_fd);
 				hid_fd = -1;
 				next_hid_try_ms = now + 1000u;
-			} else if (rc == 0) {
-				pending_delta = 0;
-				pending_report = false;
 			}
 		}
 
@@ -771,6 +972,8 @@ int main(int argc, char **argv)
 		close(hid_fd);
 	if (screen_fd >= 0)
 		close(screen_fd);
+	if (ctrl_fd >= 0)
+		close(ctrl_fd);
 	mmio_unmap(&pinmux);
 	mmio_unmap(&gpio);
 	close(mem_fd);

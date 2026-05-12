@@ -30,6 +30,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "kitty_graphics.h"
+
 #ifndef __maybe_unused
 #define __maybe_unused
 #endif
@@ -46,15 +48,22 @@
 
 #define UI_W 960
 #define UI_H 412
+#define UI_PIXELS ((size_t)UI_W * (size_t)UI_H)
+#define SPLASH_BYTES (UI_PIXELS * sizeof(uint32_t))
 #define MAX_SESSIONS 8
 #define LINE_BUF 1024
 #define TERM_PAD_X 8
 #define TERM_PAD_Y 8
 #define TERM_STATUS_H 28
-#define TERM_CELL_W VIDEO_FONT_WIDTH
-#define TERM_CELL_H VIDEO_FONT_HEIGHT
-#define TERM_COLS ((UI_W - TERM_PAD_X * 2) / TERM_CELL_W)
-#define TERM_ROWS ((UI_H - TERM_STATUS_H - TERM_PAD_Y) / TERM_CELL_H)
+/*
+ * Cell geometry is runtime-tunable. Static cell[][] is sized for the smallest
+ * preset; the active preset narrows g_cols/g_rows so out-of-band rows/cols stay
+ * untouched. host CMD_UI_SCALE_CHANGE drives apply_cell_size().
+ */
+#define TERM_CELL_W_MIN 8
+#define TERM_CELL_H_MIN 16
+#define TERM_COLS_MAX ((UI_W - TERM_PAD_X * 2) / TERM_CELL_W_MIN)
+#define TERM_ROWS_MAX ((UI_H - TERM_STATUS_H - TERM_PAD_Y) / TERM_CELL_H_MIN)
 #define TERM_MAX_ARGS 8
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
@@ -99,8 +108,78 @@ struct term_cell {
 	uint8_t flags;
 };
 
+struct cell_preset {
+	int w;
+	int h;
+};
+
+static const struct cell_preset CELL_PRESETS[] = {
+	{  8, 16 },
+	{ 10, 20 },
+	{ 12, 24 },
+	{ 16, 32 },
+};
+#define CELL_PRESET_COUNT ((int)(sizeof(CELL_PRESETS) / sizeof(CELL_PRESETS[0])))
+
+static int g_cell_w = 12;
+static int g_cell_h = 24;
+static int g_cols;
+static int g_rows;
+
+/*
+ * Boot splash: when --splash points at a UI_W*UI_H raw 0x00RRGGBB buffer
+ * (canvas-native uint32 layout), the render loop blits it instead of the
+ * terminal/dashboard until the first byte arrives on the input FIFO. Lets the
+ * panel show vibe-promo art while waiting for a wrapper to attach.
+ */
+static uint32_t *g_splash;
+static bool g_show_splash;
+
+/*
+ * Animations: --boot-anim and --wait-anim each take an "AKIM" container
+ * (see scripts/make_boot_anim.py). flags bit 0 (ANIM_FLAG_LOOP) makes the
+ * sequence repeat forever; otherwise it plays once and the slot is released.
+ *
+ * Render priority: g_boot_anim (one-shot, plays first) > g_wait_anim (loops,
+ * picks up after boot anim ends) > splash fallback > terminal/dashboard.
+ * The first byte on the input FIFO releases both anim slots and the splash.
+ */
+#define ANIM_MAGIC_STR  "AKIM"
+#define ANIM_FLAG_LOOP  0x1u
+struct anim_header {
+	char     magic[4];
+	uint32_t version;
+	uint32_t frame_count;
+	uint32_t frame_delay_ms;
+	uint32_t width;
+	uint32_t height;
+	uint32_t flags;
+};
+struct anim_state {
+	const uint8_t   *base;
+	size_t           size;
+	uint32_t         frame_count;
+	uint32_t         frame_delay_ms;
+	uint32_t         frame_idx;
+	struct timespec  started_at;
+	bool             active;
+	bool             loop;
+	const char      *label; /* for warnf */
+};
+static struct anim_state g_boot_anim = { .label = "boot-anim" };
+static struct anim_state g_wait_anim = { .label = "wait-anim" };
+
+static int find_cell_preset(int w, int h)
+{
+	for (int i = 0; i < CELL_PRESET_COUNT; i++) {
+		if (CELL_PRESETS[i].w == w && CELL_PRESETS[i].h == h)
+			return i;
+	}
+	return -1;
+}
+
 struct terminal {
-	struct term_cell cell[TERM_ROWS][TERM_COLS];
+	struct term_cell cell[TERM_ROWS_MAX][TERM_COLS_MAX];
 	int row;
 	int col;
 	int saved_row;
@@ -120,6 +199,7 @@ struct terminal {
 	uint32_t utf8_cp;
 	int utf8_need;
 	int utf8_seen;
+	bool clear_graphics;
 };
 
 #if AIKB_USE_FREETYPE
@@ -131,6 +211,7 @@ struct font_ctx {
 	int cell_h;
 	int ascent;
 	int descent;
+	int face_index;
 	char path[256];
 };
 #else
@@ -461,11 +542,18 @@ static bool is_powerline_cp(uint32_t cp)
 	return cp == 0xe0b0 || cp == 0xe0b1 || cp == 0xe0b2 || cp == 0xe0b3;
 }
 
+static bool is_box_drawing_cp(uint32_t cp)
+{
+	return cp == 0x2500 || cp == 0x2502 ||
+	       cp == 0x256d || cp == 0x256e ||
+	       cp == 0x2570 || cp == 0x256f;
+}
+
 static int term_cp_width(uint32_t cp)
 {
 	if (cp == 0)
 		return 0;
-	if (is_powerline_cp(cp))
+	if (is_powerline_cp(cp) || is_box_drawing_cp(cp))
 		return 1;
 	if ((cp >= 0x1100 && cp <= 0x115f) ||
 	    (cp >= 0x2e80 && cp <= 0xa4cf) ||
@@ -496,10 +584,10 @@ static void terminal_clear_rows(struct terminal *t, int start, int end)
 
 	if (start < 0)
 		start = 0;
-	if (end >= TERM_ROWS)
-		end = TERM_ROWS - 1;
+	if (end >= g_rows)
+		end = g_rows - 1;
 	for (int y = start; y <= end; y++)
-		for (int x = 0; x < TERM_COLS; x++)
+		for (int x = 0; x < g_cols; x++)
 			t->cell[y][x] = blank;
 }
 
@@ -509,9 +597,10 @@ static void terminal_reset(struct terminal *t)
 	t->fg = TERM_DEFAULT_FG;
 	t->bg = TERM_DEFAULT_BG;
 	t->scroll_top = 0;
-	t->scroll_bottom = TERM_ROWS - 1;
+	t->scroll_bottom = g_rows - 1;
 	t->state = TERM_GROUND;
-	terminal_clear_rows(t, 0, TERM_ROWS - 1);
+	t->clear_graphics = true;
+	terminal_clear_rows(t, 0, g_rows - 1);
 }
 
 static void terminal_scroll_up(struct terminal *t, int top, int bottom, int n)
@@ -522,8 +611,8 @@ static void terminal_scroll_up(struct terminal *t, int top, int bottom, int n)
 		return;
 	if (top < 0)
 		top = 0;
-	if (bottom >= TERM_ROWS)
-		bottom = TERM_ROWS - 1;
+	if (bottom >= g_rows)
+		bottom = g_rows - 1;
 	if (top > bottom)
 		return;
 	if (n > bottom - top + 1)
@@ -531,7 +620,7 @@ static void terminal_scroll_up(struct terminal *t, int top, int bottom, int n)
 	for (int y = top; y <= bottom - n; y++)
 		memcpy(t->cell[y], t->cell[y + n], sizeof(t->cell[y]));
 	for (int y = bottom - n + 1; y <= bottom; y++)
-		for (int x = 0; x < TERM_COLS; x++)
+		for (int x = 0; x < g_cols; x++)
 			t->cell[y][x] = blank;
 }
 
@@ -543,8 +632,8 @@ static void terminal_scroll_down(struct terminal *t, int top, int bottom, int n)
 		return;
 	if (top < 0)
 		top = 0;
-	if (bottom >= TERM_ROWS)
-		bottom = TERM_ROWS - 1;
+	if (bottom >= g_rows)
+		bottom = g_rows - 1;
 	if (top > bottom)
 		return;
 	if (n > bottom - top + 1)
@@ -552,7 +641,7 @@ static void terminal_scroll_down(struct terminal *t, int top, int bottom, int n)
 	for (int y = bottom; y >= top + n; y--)
 		memcpy(t->cell[y], t->cell[y - n], sizeof(t->cell[y]));
 	for (int y = top; y < top + n; y++)
-		for (int x = 0; x < TERM_COLS; x++)
+		for (int x = 0; x < g_cols; x++)
 			t->cell[y][x] = blank;
 }
 
@@ -560,7 +649,7 @@ static void terminal_newline(struct terminal *t)
 {
 	if (t->row == t->scroll_bottom)
 		terminal_scroll_up(t, t->scroll_top, t->scroll_bottom, 1);
-	else if (t->row < TERM_ROWS - 1)
+	else if (t->row < g_rows - 1)
 		t->row++;
 }
 
@@ -596,7 +685,7 @@ static void terminal_put_cp(struct terminal *t, uint32_t cp)
 	width = term_cp_width(cp);
 	if (width <= 0)
 		return;
-	if (t->col + width > TERM_COLS) {
+	if (t->col + width > g_cols) {
 		t->col = 0;
 		terminal_newline(t);
 	}
@@ -607,7 +696,7 @@ static void terminal_put_cp(struct terminal *t, uint32_t cp)
 	cell.flags = (t->bold ? TC_BOLD : 0) | (t->inverse ? TC_INVERSE : 0) |
 		     (width == 2 ? TC_WIDE : 0);
 	t->cell[t->row][t->col] = cell;
-	if (width == 2 && t->col + 1 < TERM_COLS) {
+	if (width == 2 && t->col + 1 < g_cols) {
 		struct term_cell trail = cell;
 
 		trail.ch = ' ';
@@ -615,7 +704,7 @@ static void terminal_put_cp(struct terminal *t, uint32_t cp)
 		t->cell[t->row][t->col + 1] = trail;
 	}
 	t->col += width;
-	if (t->col >= TERM_COLS) {
+	if (t->col >= g_cols) {
 		t->col = 0;
 		terminal_newline(t);
 	}
@@ -692,13 +781,13 @@ static void terminal_csi_dispatch(struct terminal *t, uint8_t final)
 		break;
 	case 'B':
 		t->row += terminal_arg(t, 0, 1);
-		if (t->row >= TERM_ROWS)
-			t->row = TERM_ROWS - 1;
+		if (t->row >= g_rows)
+			t->row = g_rows - 1;
 		break;
 	case 'C':
 		t->col += terminal_arg(t, 0, 1);
-		if (t->col >= TERM_COLS)
-			t->col = TERM_COLS - 1;
+		if (t->col >= g_cols)
+			t->col = g_cols - 1;
 		break;
 	case 'D':
 		t->col -= terminal_arg(t, 0, 1);
@@ -711,30 +800,31 @@ static void terminal_csi_dispatch(struct terminal *t, uint8_t final)
 		t->col = terminal_arg(t, 1, 1) - 1;
 		if (t->row < 0)
 			t->row = 0;
-		if (t->row >= TERM_ROWS)
-			t->row = TERM_ROWS - 1;
+		if (t->row >= g_rows)
+			t->row = g_rows - 1;
 		if (t->col < 0)
 			t->col = 0;
-		if (t->col >= TERM_COLS)
-			t->col = TERM_COLS - 1;
+		if (t->col >= g_cols)
+			t->col = g_cols - 1;
 		break;
 	case 'J':
 		n = terminal_arg(t, 0, 0);
 		if (n == 2 || n == 3) {
-			terminal_clear_rows(t, 0, TERM_ROWS - 1);
+			terminal_clear_rows(t, 0, g_rows - 1);
 			t->row = 0;
 			t->col = 0;
+			t->clear_graphics = true;
 		} else if (n == 0) {
 			struct term_cell blank = term_blank_cell(t);
 
-			for (int x = t->col; x < TERM_COLS; x++)
+			for (int x = t->col; x < g_cols; x++)
 				t->cell[t->row][x] = blank;
-			terminal_clear_rows(t, t->row + 1, TERM_ROWS - 1);
+			terminal_clear_rows(t, t->row + 1, g_rows - 1);
 		} else if (n == 1) {
 			struct term_cell blank = term_blank_cell(t);
 
 			terminal_clear_rows(t, 0, t->row - 1);
-			for (int x = 0; x <= t->col && x < TERM_COLS; x++)
+			for (int x = 0; x <= t->col && x < g_cols; x++)
 				t->cell[t->row][x] = blank;
 		}
 		break;
@@ -743,13 +833,13 @@ static void terminal_csi_dispatch(struct terminal *t, uint8_t final)
 
 		n = terminal_arg(t, 0, 0);
 		if (n == 2) {
-			for (int x = 0; x < TERM_COLS; x++)
+			for (int x = 0; x < g_cols; x++)
 				t->cell[t->row][x] = blank;
 		} else if (n == 1) {
-			for (int x = 0; x <= t->col && x < TERM_COLS; x++)
+			for (int x = 0; x <= t->col && x < g_cols; x++)
 				t->cell[t->row][x] = blank;
 		} else {
-			for (int x = t->col; x < TERM_COLS; x++)
+			for (int x = t->col; x < g_cols; x++)
 				t->cell[t->row][x] = blank;
 		}
 		break;
@@ -768,14 +858,14 @@ static void terminal_csi_dispatch(struct terminal *t, uint8_t final)
 	case 'r':
 		if (t->arg_count >= 2 && t->args[0] < t->args[1]) {
 			t->scroll_top = terminal_arg(t, 0, 1) - 1;
-			t->scroll_bottom = terminal_arg(t, 1, TERM_ROWS) - 1;
+			t->scroll_bottom = terminal_arg(t, 1, g_rows) - 1;
 			if (t->scroll_top < 0)
 				t->scroll_top = 0;
-			if (t->scroll_bottom >= TERM_ROWS)
-				t->scroll_bottom = TERM_ROWS - 1;
+			if (t->scroll_bottom >= g_rows)
+				t->scroll_bottom = g_rows - 1;
 		} else {
 			t->scroll_top = 0;
-			t->scroll_bottom = TERM_ROWS - 1;
+			t->scroll_bottom = g_rows - 1;
 		}
 		t->row = t->scroll_top;
 		t->col = 0;
@@ -941,8 +1031,28 @@ static void terminal_seed_mock(struct terminal *t)
 }
 
 #if AIKB_USE_FREETYPE
+static int font_face_index_for_path(const char *path)
+{
+	const char *name;
+
+	if (!path)
+		return 0;
+	name = strrchr(path, '/');
+	name = name ? name + 1 : path;
+	/*
+	 * wqy-zenhei.ttc contains a proportional face at index 0 and a mono face
+	 * at index 1. Terminal cells need the mono face so wide ASCII glyphs such
+	 * as m/w/% do not crowd a fixed cell.
+	 */
+	if (strstr(name, "wqy-zenhei.ttc"))
+		return 1;
+	return 0;
+}
+
 static bool font_load_face(struct font_ctx *font, const char *path)
 {
+	int face_index;
+
 	if (!path || !path[0])
 		return false;
 	if (access(path, R_OK) < 0)
@@ -952,16 +1062,26 @@ static bool font_load_face(struct font_ctx *font, const char *path)
 	if (font->face)
 		FT_Done_Face(font->face);
 	font->face = NULL;
-	if (FT_New_Face(font->lib, path, 0, &font->face))
-		return false;
-	if (FT_Set_Pixel_Sizes(font->face, 0, TERM_CELL_H))
+	face_index = font_face_index_for_path(path);
+	if (FT_New_Face(font->lib, path, face_index, &font->face)) {
+		if (face_index == 0 ||
+		    FT_New_Face(font->lib, path, 0, &font->face))
+			return false;
+		face_index = 0;
+	}
+	if (FT_Set_Pixel_Sizes(font->face, 0, g_cell_h))
 		return false;
 	font->ready = true;
-	font->cell_w = TERM_CELL_W;
-	font->cell_h = TERM_CELL_H;
+	font->cell_w = g_cell_w;
+	font->cell_h = g_cell_h;
 	font->ascent = (int)(font->face->size->metrics.ascender >> 6);
 	font->descent = (int)(font->face->size->metrics.descender >> 6);
-	safe_copy(font->path, sizeof(font->path), path);
+	font->face_index = face_index;
+	if (face_index > 0)
+		snprintf(font->path, sizeof(font->path), "%s#%d", path,
+			 face_index);
+	else
+		safe_copy(font->path, sizeof(font->path), path);
 	return true;
 }
 
@@ -1017,7 +1137,7 @@ static bool font_draw_cp(struct canvas *c, struct font_ctx *font, int x, int y,
 	if (FT_Load_Char(font->face, cp, FT_LOAD_RENDER))
 		return false;
 	slot = font->face->glyph;
-	baseline = y + (TERM_CELL_H - (font->ascent - font->descent)) / 2 +
+	baseline = y + (g_cell_h - (font->ascent - font->descent)) / 2 +
 		   font->ascent;
 	pen_x = x + (cell_w - (int)(slot->advance.x >> 6)) / 2 +
 		slot->bitmap_left;
@@ -1031,7 +1151,7 @@ static bool font_draw_cp(struct canvas *c, struct font_ctx *font, int x, int y,
 			uint32_t dst;
 
 			if (dx < x || dx >= x + cell_w || dy < y ||
-			    dy >= y + TERM_CELL_H)
+			    dy >= y + g_cell_h)
 				continue;
 			a = slot->bitmap.buffer[row * slot->bitmap.pitch + col];
 			dst = c->px[dy * c->w + dx];
@@ -1062,37 +1182,140 @@ static bool font_draw_cp(struct canvas *c, struct font_ctx *font, int x, int y,
 }
 #endif
 
+static void recompute_term_geom(void)
+{
+	g_cols = (UI_W - TERM_PAD_X * 2) / g_cell_w;
+	g_rows = (UI_H - TERM_STATUS_H - TERM_PAD_Y) / g_cell_h;
+	if (g_cols > TERM_COLS_MAX)
+		g_cols = TERM_COLS_MAX;
+	if (g_rows > TERM_ROWS_MAX)
+		g_rows = TERM_ROWS_MAX;
+	if (g_cols < 1)
+		g_cols = 1;
+	if (g_rows < 1)
+		g_rows = 1;
+}
+
+/*
+ * Switch to a runtime cell preset. Re-anchors g_cell_w/h, g_cols/rows, FreeType
+ * pixel size and ascent/descent, then clears the visible terminal cells so
+ * stale glyphs do not bleed through after the geometry shrinks.
+ */
+static void apply_cell_size(struct font_ctx *font, struct terminal *t,
+			    int new_w, int new_h)
+{
+	if (find_cell_preset(new_w, new_h) < 0) {
+		warnf("ignoring unsupported cell size %dx%d", new_w, new_h);
+		return;
+	}
+	g_cell_w = new_w;
+	g_cell_h = new_h;
+	recompute_term_geom();
+
+#if AIKB_USE_FREETYPE
+	if (font && font->face &&
+	    FT_Set_Pixel_Sizes(font->face, 0, (FT_UInt)g_cell_h) == 0) {
+		font->cell_w = g_cell_w;
+		font->cell_h = g_cell_h;
+		font->ascent = (int)(font->face->size->metrics.ascender >> 6);
+		font->descent = (int)(font->face->size->metrics.descender >> 6);
+	}
+#else
+	(void)font;
+#endif
+
+	if (t->row >= g_rows)
+		t->row = g_rows - 1;
+	if (t->col >= g_cols)
+		t->col = g_cols - 1;
+	t->scroll_top = 0;
+	t->scroll_bottom = g_rows - 1;
+	terminal_clear_rows(t, 0, g_rows - 1);
+	t->clear_graphics = true;
+}
+
 static void draw_powerline_cp(struct canvas *c, int x, int y, uint32_t cp,
 			      uint32_t fg, uint32_t bg)
 {
-	fill_rect(c, x, y, TERM_CELL_W, TERM_CELL_H, bg);
+	fill_rect(c, x, y, g_cell_w, g_cell_h, bg);
 	if (cp == 0xe0b0) {
-		for (int yy = 0; yy < TERM_CELL_H; yy++) {
-			int w = yy < TERM_CELL_H / 2 ? yy + 1 : TERM_CELL_H - yy;
+		for (int yy = 0; yy < g_cell_h; yy++) {
+			int w = yy < g_cell_h / 2 ? yy + 1 : g_cell_h - yy;
 
-			fill_rect(c, x, y + yy, w * TERM_CELL_W / (TERM_CELL_H / 2),
+			fill_rect(c, x, y + yy, w * g_cell_w / (g_cell_h / 2),
 				  1, fg);
 		}
 	} else if (cp == 0xe0b2) {
-		for (int yy = 0; yy < TERM_CELL_H; yy++) {
-			int w = yy < TERM_CELL_H / 2 ? yy + 1 : TERM_CELL_H - yy;
-			int px = w * TERM_CELL_W / (TERM_CELL_H / 2);
+		for (int yy = 0; yy < g_cell_h; yy++) {
+			int w = yy < g_cell_h / 2 ? yy + 1 : g_cell_h - yy;
+			int px = w * g_cell_w / (g_cell_h / 2);
 
-			fill_rect(c, x + TERM_CELL_W - px, y + yy, px, 1, fg);
+			fill_rect(c, x + g_cell_w - px, y + yy, px, 1, fg);
 		}
 	} else if (cp == 0xe0b1) {
-		vline(c, x + TERM_CELL_W / 2, y + 2, TERM_CELL_H - 4, fg);
+		vline(c, x + g_cell_w / 2, y + 2, g_cell_h - 4, fg);
 	} else if (cp == 0xe0b3) {
-		vline(c, x + TERM_CELL_W / 2, y + 2, TERM_CELL_H - 4, fg);
+		vline(c, x + g_cell_w / 2, y + 2, g_cell_h - 4, fg);
+	}
+}
+
+static void draw_box_line_h(struct canvas *c, int x, int y, int w,
+			    int cy, int thick, uint32_t fg)
+{
+	fill_rect(c, x, y + cy - thick / 2, w, thick, fg);
+}
+
+static void draw_box_line_v(struct canvas *c, int x, int y, int cx,
+			    int h, int thick, uint32_t fg)
+{
+	fill_rect(c, x + cx - thick / 2, y, thick, h, fg);
+}
+
+static void draw_box_corner(struct canvas *c, int x, int y, uint32_t cp,
+			    int cx, int cy, int thick, uint32_t fg)
+{
+	int px = x + cx - thick / 2;
+	int py = y + cy - thick / 2;
+
+	fill_rect(c, px, py, thick, thick, fg);
+	if (cp == 0x256d) { /* ╭ */
+		draw_box_line_h(c, x + cx, y, g_cell_w - cx, cy, thick, fg);
+		draw_box_line_v(c, x, y + cy, cx, g_cell_h - cy, thick, fg);
+	} else if (cp == 0x256e) { /* ╮ */
+		draw_box_line_h(c, x, y, cx + 1, cy, thick, fg);
+		draw_box_line_v(c, x, y + cy, cx, g_cell_h - cy, thick, fg);
+	} else if (cp == 0x2570) { /* ╰ */
+		draw_box_line_v(c, x, y, cx, cy + 1, thick, fg);
+		draw_box_line_h(c, x + cx, y, g_cell_w - cx, cy, thick, fg);
+	} else if (cp == 0x256f) { /* ╯ */
+		draw_box_line_v(c, x, y, cx, cy + 1, thick, fg);
+		draw_box_line_h(c, x, y, cx + 1, cy, thick, fg);
+	}
+}
+
+static void draw_box_drawing_cp(struct canvas *c, int x, int y, uint32_t cp,
+				uint32_t fg, uint32_t bg)
+{
+	int thick = g_cell_h >= 24 ? 2 : 1;
+	int cx = g_cell_w / 2;
+	int cy = g_cell_h / 2;
+
+	fill_rect(c, x, y, g_cell_w, g_cell_h, bg);
+	if (cp == 0x2500) { /* ─ */
+		draw_box_line_h(c, x, y, g_cell_w, cy, thick, fg);
+	} else if (cp == 0x2502) { /* │ */
+		draw_box_line_v(c, x, y, cx, g_cell_h, thick, fg);
+	} else {
+		draw_box_corner(c, x, y, cp, cx, cy, thick, fg);
 	}
 }
 
 static void draw_unknown_cp(struct canvas *c, int x, int y, int w,
 			    uint32_t fg, uint32_t bg)
 {
-	fill_rect(c, x, y, w, TERM_CELL_H, bg);
-	stroke_rect(c, x + 1, y + 2, w - 2, TERM_CELL_H - 4, fg);
-	hline(c, x + 3, y + TERM_CELL_H / 2, w - 6, fg);
+	fill_rect(c, x, y, w, g_cell_h, bg);
+	stroke_rect(c, x + 1, y + 2, w - 2, g_cell_h - 4, fg);
+	hline(c, x + 3, y + g_cell_h / 2, w - 6, fg);
 }
 
 static void draw_terminal_cell(struct canvas *c, struct font_ctx *font,
@@ -1100,7 +1323,7 @@ static void draw_terminal_cell(struct canvas *c, struct font_ctx *font,
 {
 	uint32_t fg = cell->fg;
 	uint32_t bg = cell->bg;
-	int cell_w = (cell->flags & TC_WIDE) ? TERM_CELL_W * 2 : TERM_CELL_W;
+	int cell_w = (cell->flags & TC_WIDE) ? g_cell_w * 2 : g_cell_w;
 
 	if (cell->flags & TC_TRAIL)
 		return;
@@ -1116,7 +1339,11 @@ static void draw_terminal_cell(struct canvas *c, struct font_ctx *font,
 		draw_powerline_cp(c, x, y, cell->ch, fg, bg);
 		return;
 	}
-	fill_rect(c, x, y, cell_w, TERM_CELL_H, bg);
+	if (is_box_drawing_cp(cell->ch)) {
+		draw_box_drawing_cp(c, x, y, cell->ch, fg, bg);
+		return;
+	}
+	fill_rect(c, x, y, cell_w, g_cell_h, bg);
 	if (cell->ch == ' ')
 		return;
 	if (font_draw_cp(c, font, x, y, cell_w, cell->ch, fg, bg))
@@ -1148,7 +1375,8 @@ static void draw_powerline_segment(struct canvas *c, int *x, int y, int h,
 }
 
 static void render_terminal(struct canvas *c, const struct terminal *term,
-			    struct font_ctx *font)
+			    struct font_ctx *font,
+			    const struct kitty_graphics *kitty)
 {
 	char time_buf[16];
 	int status_y = UI_H - TERM_STATUS_H;
@@ -1157,18 +1385,19 @@ static void render_terminal(struct canvas *c, const struct terminal *term,
 	struct tm tm_now;
 
 	canvas_clear(c, TERM_DEFAULT_BG);
-	for (int row = 0; row < TERM_ROWS; row++) {
-		for (int col = 0; col < TERM_COLS; col++) {
+	for (int row = 0; row < g_rows; row++) {
+		for (int col = 0; col < g_cols; col++) {
 			draw_terminal_cell(c, font, &term->cell[row][col],
-					   TERM_PAD_X + col * TERM_CELL_W,
-					   TERM_PAD_Y + row * TERM_CELL_H);
+					   TERM_PAD_X + col * g_cell_w,
+					   TERM_PAD_Y + row * g_cell_h);
 		}
 	}
+	kitty_graphics_render(kitty, c->w, c->h, c->px);
 	if ((now & 1) == 0) {
-		int cx = TERM_PAD_X + term->col * TERM_CELL_W;
-		int cy = TERM_PAD_Y + term->row * TERM_CELL_H;
+		int cx = TERM_PAD_X + term->col * g_cell_w;
+		int cy = TERM_PAD_Y + term->row * g_cell_h;
 
-		fill_rect(c, cx, cy + TERM_CELL_H - 3, TERM_CELL_W, 2,
+		fill_rect(c, cx, cy + g_cell_h - 3, g_cell_w, 2,
 			  0x9cdcfe);
 	}
 
@@ -1794,13 +2023,59 @@ static void fb_refresh(struct fb_target *fb)
 	}
 }
 
+/*
+ * Specialized hot path for the only configuration this product actually ships:
+ * 32-bpp ARGB8888 framebuffer rotated 90deg CW from the 960x412 landscape
+ * canvas. Skips per-pixel sample_canvas() / pack_fb_pixel() (which together do
+ * a multiply, two divisions, four bounds checks, and a switch per pixel) and
+ * collapses the inner loop to load-OR-store. Drops fb_blit from ~hundreds of
+ * ms per frame to a few ms, which is what the user sees as "instant" frame
+ * transitions instead of "缓缓刷出".
+ */
+static bool fb_blit_fast_argb_cw(struct fb_target *fb, const struct canvas *c)
+{
+	uint32_t a_const;
+
+	if (fb->var.bits_per_pixel != 32)
+		return false;
+	if (resolve_pixel_format(fb->pixel_format, fb) != PIXEL_FMT_ARGB8888)
+		return false;
+	if (resolve_rotation(fb->rotate, fb->var.xres, fb->var.yres) != ROT_CW)
+		return false;
+	if ((int)fb->var.xres != c->h || (int)fb->var.yres != c->w)
+		return false;
+
+	a_const = (uint32_t)fb->alpha << 24;
+	for (int cy = 0; cy < c->h; cy++) {
+		const uint32_t *src = c->px + (size_t)cy * c->w;
+		size_t fb_x_off = (size_t)(c->h - 1 - cy) * 4u;
+		for (int cx = 0; cx < c->w; cx++) {
+			uint32_t rgb = src[cx];
+			uint8_t *dst = fb->mem + (size_t)cx * fb->fix.line_length
+				       + fb_x_off;
+			*(uint32_t *)dst = a_const | (rgb & 0x00ffffffu);
+		}
+	}
+	fb_refresh(fb);
+	return true;
+}
+
 static void fb_blit(struct fb_target *fb, const struct canvas *c)
 {
-	int width = (int)fb->var.xres;
-	int height = (int)fb->var.yres;
-	int bpp = (int)fb->var.bits_per_pixel;
-	int bytes = (bpp + 7) / 8;
-	enum rotation rot = resolve_rotation(fb->rotate, width, height);
+	int width;
+	int height;
+	int bpp;
+	int bytes;
+	enum rotation rot;
+
+	if (fb_blit_fast_argb_cw(fb, c))
+		return;
+
+	width = (int)fb->var.xres;
+	height = (int)fb->var.yres;
+	bpp = (int)fb->var.bits_per_pixel;
+	bytes = (bpp + 7) / 8;
+	rot = resolve_rotation(fb->rotate, width, height);
 
 	for (int y = 0; y < height; y++) {
 		uint8_t *row = fb->mem + (size_t)y * fb->fix.line_length;
@@ -1917,6 +2192,197 @@ static int configure_serial_fd(int fd)
 	return tcsetattr(fd, TCSANOW, &tio);
 }
 
+static int load_splash(const char *path)
+{
+	struct stat st;
+	uint32_t *buf;
+	size_t got = 0;
+	int fd;
+
+	if (!path)
+		return -1;
+	if (stat(path, &st) < 0) {
+		warnf("splash %s: stat failed: %s", path, strerror(errno));
+		return -1;
+	}
+	if ((size_t)st.st_size != SPLASH_BYTES) {
+		warnf("splash %s: size %lld != %zu (expect %dx%d 0x00RRGGBB)",
+		      path, (long long)st.st_size, SPLASH_BYTES, UI_W, UI_H);
+		return -1;
+	}
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0) {
+		warnf("splash %s: open failed: %s", path, strerror(errno));
+		return -1;
+	}
+	buf = malloc(SPLASH_BYTES);
+	if (!buf) {
+		warnf("splash %s: malloc %zu failed", path, SPLASH_BYTES);
+		close(fd);
+		return -1;
+	}
+	while (got < SPLASH_BYTES) {
+		ssize_t n = read(fd, (uint8_t *)buf + got, SPLASH_BYTES - got);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			warnf("splash %s: read failed: %s", path, strerror(errno));
+			free(buf);
+			close(fd);
+			return -1;
+		}
+		if (n == 0)
+			break;
+		got += (size_t)n;
+	}
+	close(fd);
+	if (got != SPLASH_BYTES) {
+		warnf("splash %s: short read %zu/%zu", path, got, SPLASH_BYTES);
+		free(buf);
+		return -1;
+	}
+	g_splash = buf;
+	g_show_splash = true;
+	warnf("splash %s loaded (%dx%d, %zu bytes)", path, UI_W, UI_H,
+	      SPLASH_BYTES);
+	return 0;
+}
+
+static long monotonic_elapsed_ms(const struct timespec *since)
+{
+	struct timespec now;
+	long sec;
+	long ms;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	sec = (long)(now.tv_sec - since->tv_sec);
+	ms = (long)((now.tv_nsec - since->tv_nsec) / 1000000L);
+	return sec * 1000L + ms;
+}
+
+static void anim_release(struct anim_state *a)
+{
+	if (a->base) {
+		munmap((void *)a->base, a->size);
+		a->base = NULL;
+	}
+	a->size = 0;
+	a->frame_count = 0;
+	a->frame_idx = 0;
+	a->active = false;
+	a->loop = false;
+}
+
+static int anim_load(struct anim_state *a, const char *path)
+{
+	struct stat st;
+	void *map;
+	struct anim_header hdr;
+	size_t expected;
+	int fd;
+
+	if (!path)
+		return -1;
+	if (stat(path, &st) < 0) {
+		warnf("%s %s: stat failed: %s", a->label, path, strerror(errno));
+		return -1;
+	}
+	if ((size_t)st.st_size < sizeof(hdr)) {
+		warnf("%s %s: file too small (%lld < %zu)", a->label, path,
+		      (long long)st.st_size, sizeof(hdr));
+		return -1;
+	}
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0) {
+		warnf("%s %s: open failed: %s", a->label, path, strerror(errno));
+		return -1;
+	}
+	map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+	close(fd);
+	if (map == MAP_FAILED) {
+		warnf("%s %s: mmap failed: %s", a->label, path, strerror(errno));
+		return -1;
+	}
+	memcpy(&hdr, map, sizeof(hdr));
+	if (memcmp(hdr.magic, ANIM_MAGIC_STR, 4) != 0) {
+		warnf("%s %s: bad magic %02x %02x %02x %02x", a->label, path,
+		      (uint8_t)hdr.magic[0], (uint8_t)hdr.magic[1],
+		      (uint8_t)hdr.magic[2], (uint8_t)hdr.magic[3]);
+		munmap(map, (size_t)st.st_size);
+		return -1;
+	}
+	if (hdr.version != 1 || (hdr.flags & ~ANIM_FLAG_LOOP) != 0) {
+		warnf("%s %s: version=%u flags=0x%x not supported", a->label,
+		      path, hdr.version, hdr.flags);
+		munmap(map, (size_t)st.st_size);
+		return -1;
+	}
+	if (hdr.width != (uint32_t)UI_W || hdr.height != (uint32_t)UI_H) {
+		warnf("%s %s: %ux%u != canvas %dx%d", a->label, path, hdr.width,
+		      hdr.height, UI_W, UI_H);
+		munmap(map, (size_t)st.st_size);
+		return -1;
+	}
+	if (hdr.frame_count == 0 || hdr.frame_delay_ms == 0) {
+		warnf("%s %s: empty (count=%u delay=%u)", a->label, path,
+		      hdr.frame_count, hdr.frame_delay_ms);
+		munmap(map, (size_t)st.st_size);
+		return -1;
+	}
+	expected = sizeof(hdr) + (size_t)hdr.frame_count * SPLASH_BYTES;
+	if ((size_t)st.st_size != expected) {
+		warnf("%s %s: size %lld != expected %zu", a->label, path,
+		      (long long)st.st_size, expected);
+		munmap(map, (size_t)st.st_size);
+		return -1;
+	}
+	a->base = (const uint8_t *)map;
+	a->size = (size_t)st.st_size;
+	a->frame_count = hdr.frame_count;
+	a->frame_delay_ms = hdr.frame_delay_ms;
+	a->frame_idx = 0;
+	a->loop = (hdr.flags & ANIM_FLAG_LOOP) != 0;
+	a->active = true;
+	clock_gettime(CLOCK_MONOTONIC, &a->started_at);
+	warnf("%s %s loaded (%u frames * %u ms%s, %zu bytes)", a->label, path,
+	      a->frame_count, a->frame_delay_ms, a->loop ? ", looping" : "",
+	      a->size);
+	return 0;
+}
+
+static void anim_blit(const struct anim_state *a, struct canvas *c)
+{
+	const uint8_t *frame = a->base + sizeof(struct anim_header) +
+			       (size_t)a->frame_idx * SPLASH_BYTES;
+	memcpy(c->px, frame, SPLASH_BYTES);
+}
+
+/*
+ * Advance frame_idx based on monotonic time since started_at. Returns ms-to-
+ * next-frame so the caller can shrink the poll timeout. Releases the slot when
+ * a non-looping animation reaches the end; returns -1 in that case.
+ */
+static long anim_advance(struct anim_state *a)
+{
+	long elapsed;
+	uint32_t step;
+
+	elapsed = monotonic_elapsed_ms(&a->started_at);
+	if (elapsed < 0)
+		elapsed = 0;
+	step = (uint32_t)(elapsed / a->frame_delay_ms);
+	if (a->loop) {
+		a->frame_idx = step % a->frame_count;
+	} else if (step >= a->frame_count) {
+		anim_release(a);
+		return -1;
+	} else {
+		a->frame_idx = step;
+	}
+	return (long)a->frame_delay_ms -
+	       (elapsed % a->frame_delay_ms);
+}
+
 static int open_input(const char *path)
 {
 	struct stat st;
@@ -1948,13 +2414,49 @@ static int open_input(const char *path)
 	return fd;
 }
 
+struct terminal_emit_ctx {
+	struct terminal *term;
+	struct kitty_graphics *kitty;
+};
+
+static void terminal_emit_byte(void *ctx, uint8_t byte)
+{
+	struct terminal_emit_ctx *emit = ctx;
+
+	terminal_process_byte(emit->term, byte);
+	if (emit->term->clear_graphics) {
+		kitty_graphics_clear(emit->kitty);
+		emit->term->clear_graphics = false;
+	}
+}
+
+static struct kitty_graphics_metrics kitty_metrics_for_term(
+	const struct terminal *term)
+{
+	struct kitty_graphics_metrics m;
+
+	m.pad_x = TERM_PAD_X;
+	m.pad_y = TERM_PAD_Y;
+	m.cell_w = g_cell_w;
+	m.cell_h = g_cell_h;
+	m.cols = g_cols;
+	m.rows = g_rows;
+	m.cursor_col = term->col;
+	m.cursor_row = term->row;
+	return m;
+}
+
 static void process_input_fd(int fd, struct ui_model *m, struct terminal *term,
-			     enum app_view view)
+			     struct kitty_graphics *kitty, enum app_view view)
 {
 	static char buf[LINE_BUF];
 	static size_t len;
 	char tmp[256];
 	ssize_t rd;
+	struct terminal_emit_ctx emit_ctx = {
+		.term = term,
+		.kitty = kitty,
+	};
 
 	for (;;) {
 		rd = read(fd, tmp, sizeof(tmp));
@@ -1966,11 +2468,22 @@ static void process_input_fd(int fd, struct ui_model *m, struct terminal *term,
 		}
 		if (rd == 0)
 			return;
+		if (g_boot_anim.active)
+			anim_release(&g_boot_anim);
+		if (g_wait_anim.active)
+			anim_release(&g_wait_anim);
+		if (g_show_splash)
+			g_show_splash = false;
 		for (ssize_t i = 0; i < rd; i++) {
 			char ch = tmp[i];
 
 			if (view == VIEW_TERMINAL) {
-				terminal_process_byte(term, (uint8_t)ch);
+				struct kitty_graphics_metrics metrics =
+					kitty_metrics_for_term(term);
+
+				kitty_graphics_feed_byte(kitty, (uint8_t)ch,
+							 terminal_emit_byte,
+							 &emit_ctx, &metrics);
 				continue;
 			}
 			if (ch == '\r')
@@ -2039,14 +2552,100 @@ static int parse_int_arg(const char *s, int min, int max, int *out)
 	return 0;
 }
 
+static int parse_cell_size(const char *s, int *out_w, int *out_h)
+{
+	const char *sep = strchr(s, 'x');
+	long w;
+	long h;
+	char *end = NULL;
+
+	if (!sep || sep == s)
+		sep = strchr(s, 'X');
+	if (!sep || sep == s)
+		return -1;
+	errno = 0;
+	w = strtol(s, &end, 10);
+	if (errno || end != sep)
+		return -1;
+	errno = 0;
+	h = strtol(sep + 1, &end, 10);
+	if (errno || !end || *end || w <= 0 || h <= 0 || w > 255 || h > 255)
+		return -1;
+	if (find_cell_preset((int)w, (int)h) < 0)
+		return -1;
+	*out_w = (int)w;
+	*out_h = (int)h;
+	return 0;
+}
+
+static void process_ctrl_fd(int fd, struct font_ctx *font, struct terminal *t)
+{
+	static char buf[64];
+	static size_t len;
+	char tmp[64];
+	ssize_t rd;
+
+	for (;;) {
+		rd = read(fd, tmp, sizeof(tmp));
+		if (rd < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				return;
+			warnf("ctrl read failed: %s", strerror(errno));
+			return;
+		}
+		if (rd == 0)
+			return;
+		for (ssize_t i = 0; i < rd; i++) {
+			char ch = tmp[i];
+
+			if (ch == '\r')
+				continue;
+			if (ch == '\n') {
+				int w;
+				int h;
+
+				buf[len] = '\0';
+				if (len > 0 &&
+				    sscanf(buf, "cell %d %d", &w, &h) == 2)
+					apply_cell_size(font, t, w, h);
+				len = 0;
+			} else if (len + 1 < sizeof(buf)) {
+				buf[len++] = ch;
+			} else {
+				len = 0;
+			}
+		}
+	}
+}
+
 static void render_app(struct canvas *c, enum app_view view,
 		       const struct ui_model *model, const struct terminal *term,
-		       struct font_ctx *font)
+		       struct font_ctx *font, const struct kitty_graphics *kitty)
 {
 	if (view == VIEW_TERMINAL)
-		render_terminal(c, term, font);
+		render_terminal(c, term, font, kitty);
 	else
 		render_dashboard(c, model);
+}
+
+static void render_frame(struct canvas *c, enum app_view view,
+			 const struct ui_model *model,
+			 const struct terminal *term, struct font_ctx *font,
+			 const struct kitty_graphics *kitty)
+{
+	if (g_boot_anim.active && g_boot_anim.base) {
+		anim_blit(&g_boot_anim, c);
+		return;
+	}
+	if (g_wait_anim.active && g_wait_anim.base) {
+		anim_blit(&g_wait_anim, c);
+		return;
+	}
+	if (g_show_splash && g_splash) {
+		memcpy(c->px, g_splash, SPLASH_BYTES);
+		return;
+	}
+	render_app(c, view, model, term, font, kitty);
 }
 
 static void usage(const char *argv0)
@@ -2056,6 +2655,11 @@ static void usage(const char *argv0)
 	printf("  --input PATH       terminal bytes or newline JSON input, '-' for stdin\n");
 	printf("  --view MODE        terminal/vt100 or dashboard/json (default terminal)\n");
 	printf("  --font PATH        preferred TrueType/OpenType font path\n");
+	printf("  --cell WxH         initial terminal cell size; one of 8x16, 10x20, 12x24, 16x32\n");
+	printf("  --ctrl PATH        runtime control FIFO; lines like \"cell 12 24\" change font size\n");
+	printf("  --splash PATH      raw 960x412 0x00RRGGBB splash shown until first input byte\n");
+	printf("  --boot-anim PATH   AKIM container (scripts/make_boot_anim.py) played once before splash\n");
+	printf("  --wait-anim PATH   AKIM container with LOOP flag, replays until first input byte\n");
 	printf("  --rotate MODE      auto, none, cw, ccw (default auto)\n");
 	printf("  --pixel-format FMT auto, fb, argb8888, abgr8888 (default auto)\n");
 	printf("  --alpha N          framebuffer alpha byte, 0..255 (default 255)\n");
@@ -2072,6 +2676,10 @@ int main(int argc, char **argv)
 	const char *input_path = NULL;
 	const char *dump_path = NULL;
 	const char *font_path = NULL;
+	const char *ctrl_path = NULL;
+	const char *splash_path = NULL;
+	const char *boot_anim_path = NULL;
+	const char *wait_anim_path = NULL;
 	enum rotation rotate = ROT_AUTO;
 	enum pixel_format pixel_format = PIXEL_FMT_AUTO;
 	enum app_view view = VIEW_TERMINAL;
@@ -2079,6 +2687,8 @@ int main(int argc, char **argv)
 	bool mock = true;
 	int alpha = 255;
 	int once_hold_ms = 3000;
+	int initial_cell_w = g_cell_w;
+	int initial_cell_h = g_cell_h;
 	struct canvas c = {
 		.w = UI_W,
 		.h = UI_H,
@@ -2088,9 +2698,12 @@ int main(int argc, char **argv)
 	struct terminal term;
 	struct font_ctx font;
 	struct fb_target fb;
+	struct kitty_graphics *kitty = NULL;
 	int input_fd = -1;
+	int ctrl_fd = -1;
 	int ret = 0;
 	time_t next_input_retry = 0;
+	time_t next_ctrl_retry = 0;
 
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--fb") && i + 1 < argc) {
@@ -2104,6 +2717,20 @@ int main(int argc, char **argv)
 			}
 		} else if (!strcmp(argv[i], "--font") && i + 1 < argc) {
 			font_path = argv[++i];
+		} else if (!strcmp(argv[i], "--cell") && i + 1 < argc) {
+			if (parse_cell_size(argv[++i], &initial_cell_w,
+					    &initial_cell_h) < 0) {
+				usage(argv[0]);
+				return 2;
+			}
+		} else if (!strcmp(argv[i], "--ctrl") && i + 1 < argc) {
+			ctrl_path = argv[++i];
+		} else if (!strcmp(argv[i], "--splash") && i + 1 < argc) {
+			splash_path = argv[++i];
+		} else if (!strcmp(argv[i], "--boot-anim") && i + 1 < argc) {
+			boot_anim_path = argv[++i];
+		} else if (!strcmp(argv[i], "--wait-anim") && i + 1 < argc) {
+			wait_anim_path = argv[++i];
 		} else if (!strcmp(argv[i], "--rotate") && i + 1 < argc) {
 			rotate = parse_rotation(argv[++i]);
 		} else if (!strcmp(argv[i], "--pixel-format") && i + 1 < argc) {
@@ -2138,6 +2765,23 @@ int main(int argc, char **argv)
 		warnf("canvas allocation failed");
 		return 1;
 	}
+	kitty = kitty_graphics_create();
+	if (!kitty) {
+		warnf("kitty graphics allocation failed");
+		free(c.px);
+		return 1;
+	}
+
+	if (splash_path)
+		load_splash(splash_path);
+	if (boot_anim_path)
+		anim_load(&g_boot_anim, boot_anim_path);
+	if (wait_anim_path)
+		anim_load(&g_wait_anim, wait_anim_path);
+
+	g_cell_w = initial_cell_w;
+	g_cell_h = initial_cell_h;
+	recompute_term_geom();
 
 	if (mock)
 		model_set_mock(&model);
@@ -2152,9 +2796,15 @@ int main(int argc, char **argv)
 	if (!font_init(&font, font_path))
 		warnf("freetype font unavailable; falling back to built-in 8x16 glyphs");
 
-	render_app(&c, view, &model, &term, &font);
+	if (term.clear_graphics) {
+		kitty_graphics_clear(kitty);
+		term.clear_graphics = false;
+	}
+
+	render_app(&c, view, &model, &term, &font, kitty);
 	if (dump_path) {
 		ret = write_ppm(dump_path, &c);
+		kitty_graphics_destroy(kitty);
 		font_destroy(&font);
 		free(c.px);
 		return ret ? 1 : 0;
@@ -2162,6 +2812,7 @@ int main(int argc, char **argv)
 
 	if (fb_open_target(&fb, fb_path, rotate, pixel_format,
 			   (uint8_t)alpha) < 0) {
+		kitty_graphics_destroy(kitty);
 		font_destroy(&font);
 		free(c.px);
 		return 1;
@@ -2170,14 +2821,42 @@ int main(int argc, char **argv)
 	input_fd = open_input(input_path);
 	if (input_fd < 0 && input_path)
 		next_input_retry = time(NULL) + 5;
+	if (ctrl_path) {
+		ctrl_fd = open_input(ctrl_path);
+		if (ctrl_fd < 0)
+			next_ctrl_retry = time(NULL) + 5;
+	}
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
 
-	while (!g_stop) {
-		struct pollfd pfd;
-		int timeout = 1000;
+	if (g_boot_anim.active)
+		clock_gettime(CLOCK_MONOTONIC, &g_boot_anim.started_at);
+	if (g_wait_anim.active)
+		clock_gettime(CLOCK_MONOTONIC, &g_wait_anim.started_at);
 
-		render_app(&c, view, &model, &term, &font);
+	while (!g_stop) {
+		struct pollfd pfds[2];
+		nfds_t nfds = 0;
+		int input_idx = -1;
+		int ctrl_idx = -1;
+		int timeout = 1000;
+		time_t now;
+
+		if (g_boot_anim.active) {
+			long ms = anim_advance(&g_boot_anim);
+			if (!g_boot_anim.active && g_wait_anim.active)
+				clock_gettime(CLOCK_MONOTONIC,
+					      &g_wait_anim.started_at);
+			if (ms > 0 && ms < timeout)
+				timeout = (int)ms;
+		}
+		if (g_wait_anim.active) {
+			long ms = anim_advance(&g_wait_anim);
+			if (ms > 0 && ms < timeout)
+				timeout = (int)ms;
+		}
+
+		render_frame(&c, view, &model, &term, &font, kitty);
 		fb_blit(&fb, &c);
 		if (once) {
 			if (once_hold_ms > 0)
@@ -2185,28 +2864,60 @@ int main(int argc, char **argv)
 			break;
 		}
 
-		if (input_fd < 0) {
-			time_t now = time(NULL);
+		now = time(NULL);
+		if (input_fd < 0 && input_path && now >= next_input_retry) {
+			input_fd = open_input(input_path);
+			next_input_retry = now + 5;
+		}
+		if (ctrl_fd < 0 && ctrl_path && now >= next_ctrl_retry) {
+			ctrl_fd = open_input(ctrl_path);
+			next_ctrl_retry = now + 5;
+		}
 
-			if (input_path && now >= next_input_retry) {
-				input_fd = open_input(input_path);
-				next_input_retry = now + 5;
-				if (input_fd >= 0)
-					continue;
-			}
+		if (input_fd >= 0) {
+			input_idx = (int)nfds;
+			pfds[nfds].fd = input_fd;
+			pfds[nfds].events = POLLIN;
+			pfds[nfds].revents = 0;
+			nfds++;
+		}
+		if (ctrl_fd >= 0) {
+			ctrl_idx = (int)nfds;
+			pfds[nfds].fd = ctrl_fd;
+			pfds[nfds].events = POLLIN;
+			pfds[nfds].revents = 0;
+			nfds++;
+		}
+
+		if (nfds == 0) {
 			usleep((useconds_t)timeout * 1000);
 			continue;
 		}
-		pfd.fd = input_fd;
-		pfd.events = POLLIN;
-		if (poll(&pfd, 1, timeout) > 0 && (pfd.revents & POLLIN))
-			process_input_fd(input_fd, &model, &term, view);
+
+		if (poll(pfds, nfds, timeout) <= 0)
+			continue;
+		if (input_idx >= 0 && (pfds[input_idx].revents & POLLIN))
+			process_input_fd(input_fd, &model, &term, kitty, view);
+		if (ctrl_idx >= 0 && (pfds[ctrl_idx].revents & POLLIN))
+			process_ctrl_fd(ctrl_fd, &font, &term);
+		if (term.clear_graphics) {
+			kitty_graphics_clear(kitty);
+			term.clear_graphics = false;
+		}
 	}
 
 	if (input_fd >= 0 && input_fd != STDIN_FILENO)
 		close(input_fd);
+	if (ctrl_fd >= 0 && ctrl_fd != STDIN_FILENO)
+		close(ctrl_fd);
 	fb_close_target(&fb);
+	kitty_graphics_destroy(kitty);
 	font_destroy(&font);
 	free(c.px);
+	free(g_splash);
+	g_splash = NULL;
+	g_show_splash = false;
+	anim_release(&g_boot_anim);
+	anim_release(&g_wait_anim);
 	return ret;
 }

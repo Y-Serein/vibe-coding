@@ -4,16 +4,22 @@ ${CVI_SHOPTS}
 export LD_LIBRARY_PATH="/lib:/lib/3rd:/lib/arm-linux-gnueabihf:/usr/lib:/usr/local/lib:/mnt/system/lib:/mnt/system/usr/lib:/mnt/system/usr/lib/3rd:/mnt/data/lib"
 export PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin:/mnt/system/usr/bin:/mnt/system/usr/sbin:/mnt/data/bin:/mnt/data/sbin"
 AIKB_LCD_INPUT="/tmp/aikb_lcd_ui.in"
+AIKB_LCD_CTRL="/tmp/aikb_lcd_ui.ctrl"
+AIKB_LCD_SPLASH="/mnt/system/usr/share/aikb/splash.argb"
+AIKB_LCD_BOOT_ANIM="/mnt/system/usr/share/aikb/boot_anim.bin"
+AIKB_LCD_WAIT_ANIM="/mnt/system/usr/share/aikb/wait_cycle.bin"
 
 prepare_aikb_lcd_input()
 {
-   if [ -e "${AIKB_LCD_INPUT}" ] && [ ! -p "${AIKB_LCD_INPUT}" ]; then
-      rm -f "${AIKB_LCD_INPUT}"
-   fi
-   if [ ! -p "${AIKB_LCD_INPUT}" ]; then
-      mkfifo "${AIKB_LCD_INPUT}" 2>/dev/null || true
-      chmod 600 "${AIKB_LCD_INPUT}" 2>/dev/null || true
-   fi
+   for f in "${AIKB_LCD_INPUT}" "${AIKB_LCD_CTRL}"; do
+      if [ -e "$f" ] && [ ! -p "$f" ]; then
+         rm -f "$f"
+      fi
+      if [ ! -p "$f" ]; then
+         mkfifo "$f" 2>/dev/null || true
+         chmod 600 "$f" 2>/dev/null || true
+      fi
+   done
 }
 
 start_aikb_hid_input()
@@ -36,7 +42,7 @@ start_aikb_hid_input()
 
    prepare_aikb_lcd_input
 
-   "${HID_INPUT}" --hid /dev/hidg0 --screen-out "${AIKB_LCD_INPUT}" >> "${HID_LOG}" 2>&1 &
+   "${HID_INPUT}" --hid /dev/hidg0 --screen-out "${AIKB_LCD_INPUT}" --ctrl-out "${AIKB_LCD_CTRL}" >> "${HID_LOG}" 2>&1 &
    HID_PID=$!
    sleep 1
    if kill -0 "${HID_PID}" >/dev/null 2>&1; then
@@ -93,7 +99,19 @@ start_aikb_lcd_ui()
    fi
 
    echo "$(date '+%H:%M:%S') start aikb_lcd_ui; fb=$(cat /proc/fb 2>/dev/null)" >> "${LCD_LOG}"
-   "${LCD_UI}" --fb /dev/fb0 --input "${AIKB_LCD_INPUT}" --rotate auto --view terminal >> "${LCD_LOG}" 2>&1 &
+   LCD_SPLASH_ARG=""
+   if [ -f "${AIKB_LCD_SPLASH}" ]; then
+      LCD_SPLASH_ARG="--splash ${AIKB_LCD_SPLASH}"
+   fi
+   LCD_BOOT_ANIM_ARG=""
+   if [ -f "${AIKB_LCD_BOOT_ANIM}" ]; then
+      LCD_BOOT_ANIM_ARG="--boot-anim ${AIKB_LCD_BOOT_ANIM}"
+   fi
+   LCD_WAIT_ANIM_ARG=""
+   if [ -f "${AIKB_LCD_WAIT_ANIM}" ]; then
+      LCD_WAIT_ANIM_ARG="--wait-anim ${AIKB_LCD_WAIT_ANIM}"
+   fi
+   "${LCD_UI}" --fb /dev/fb0 --input "${AIKB_LCD_INPUT}" --ctrl "${AIKB_LCD_CTRL}" ${LCD_BOOT_ANIM_ARG} ${LCD_WAIT_ANIM_ARG} ${LCD_SPLASH_ARG} --rotate auto --view terminal >> "${LCD_LOG}" 2>&1 &
    LCD_PID=$!
    sleep 1
    if kill -0 "${LCD_PID}" >/dev/null 2>&1; then
@@ -103,5 +121,8 @@ start_aikb_lcd_ui()
    fi
 }
 
-start_aikb_hid_input
+# LCD first so the boot animation / splash blits before any visible green
+# panel-init pattern. start_aikb_hid_input's internal `sleep 1` used to delay
+# the LCD startup by ~1s, which was the visible green window.
 start_aikb_lcd_ui
+start_aikb_hid_input

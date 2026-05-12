@@ -17,6 +17,7 @@
 #include "../drivers/video/cvitek/vip_common.h"
 
 #include <cvi_panels/cvi_panels.h>
+#include <cvi_panels/cvi_uboot_splash.h>
 
 #include <asm/io.h>
 #include <asm/gpio.h>
@@ -248,7 +249,7 @@ static struct gc9503_yuv_color gc9503_rgb_to_yuv(u8 r, u8 g, u8 b)
 	return c;
 }
 
-static void gc9503_put_yuv_pixel(u8 *y_plane, u8 *u_plane, u8 *v_plane,
+static __maybe_unused void gc9503_put_yuv_pixel(u8 *y_plane, u8 *u_plane, u8 *v_plane,
 				 int pitch_y, int pitch_c, int x, int y,
 				 struct gc9503_yuv_color c)
 {
@@ -268,7 +269,7 @@ static void gc9503_put_yuv_pixel(u8 *y_plane, u8 *u_plane, u8 *v_plane,
 	}
 }
 
-static void gc9503_fill_rect(u8 *y_plane, u8 *u_plane, u8 *v_plane,
+static __maybe_unused void gc9503_fill_rect(u8 *y_plane, u8 *u_plane, u8 *v_plane,
 			     int pitch_y, int pitch_c,
 			     int x, int y, int w, int h,
 			     struct gc9503_yuv_color c)
@@ -280,7 +281,7 @@ static void gc9503_fill_rect(u8 *y_plane, u8 *u_plane, u8 *v_plane,
 	}
 }
 
-static void gc9503_draw_char(u8 *y_plane, u8 *u_plane, u8 *v_plane,
+static __maybe_unused void gc9503_draw_char(u8 *y_plane, u8 *u_plane, u8 *v_plane,
 			     int pitch_y, int pitch_c,
 			     int x, int y, unsigned char ch, int scale,
 			     struct gc9503_yuv_color c)
@@ -301,7 +302,7 @@ static void gc9503_draw_char(u8 *y_plane, u8 *u_plane, u8 *v_plane,
 	}
 }
 
-static void gc9503_draw_text(u8 *y_plane, u8 *u_plane, u8 *v_plane,
+static __maybe_unused void gc9503_draw_text(u8 *y_plane, u8 *u_plane, u8 *v_plane,
 			     int pitch_y, int pitch_c,
 			     int x, int y, const char *s, int scale,
 			     struct gc9503_yuv_color c)
@@ -314,12 +315,12 @@ static void gc9503_draw_text(u8 *y_plane, u8 *u_plane, u8 *v_plane,
 	}
 }
 
-static int gc9503_text_width(const char *s, int scale)
+static __maybe_unused int gc9503_text_width(const char *s, int scale)
 {
 	return strlen(s) * VIDEO_FONT_WIDTH * scale;
 }
 
-static void gc9503_draw_center_text(u8 *y_plane, u8 *u_plane, u8 *v_plane,
+static __maybe_unused void gc9503_draw_center_text(u8 *y_plane, u8 *u_plane, u8 *v_plane,
 				    int pitch_y, int pitch_c,
 				    int y, const char *s, int scale,
 				    struct gc9503_yuv_color c)
@@ -330,7 +331,7 @@ static void gc9503_draw_center_text(u8 *y_plane, u8 *u_plane, u8 *v_plane,
 			 x, y, s, scale, c);
 }
 
-static void gc9503_draw_vibe_icon(u8 *y_plane, u8 *u_plane, u8 *v_plane,
+static __maybe_unused void gc9503_draw_vibe_icon(u8 *y_plane, u8 *u_plane, u8 *v_plane,
 				  int pitch_y, int pitch_c,
 				  struct gc9503_yuv_color amber,
 				  struct gc9503_yuv_color dim)
@@ -370,9 +371,6 @@ static void gc9503_show_vibe_splash(void)
 	};
 	struct sclr_disp_cfg *cfg = sclr_disp_get_cfg();
 	struct gc9503_yuv_color bg = gc9503_rgb_to_yuv(0, 0, 0);
-	struct gc9503_yuv_color amber = gc9503_rgb_to_yuv(255, 179, 60);
-	struct gc9503_yuv_color text = gc9503_rgb_to_yuv(255, 238, 194);
-	struct gc9503_yuv_color dim = gc9503_rgb_to_yuv(54, 39, 17);
 	int pitch_y = ALIGN(GC9503_PANEL_W, 32);
 	int pitch_c = ALIGN(GC9503_PANEL_W / 2, 32);
 	int y_rows = ALIGN(((GC9503_PANEL_H + 1) & ~(BIT(0))), 16);
@@ -384,17 +382,31 @@ static void gc9503_show_vibe_splash(void)
 	u8 *y_plane = (u8 *)(uintptr_t)addr0;
 	u8 *u_plane = (u8 *)(uintptr_t)addr1;
 	u8 *v_plane = (u8 *)(uintptr_t)addr2;
+	int row;
 
+	/* Background fills the panel-pitch padding columns left over after
+	 * we copy in the tightly-packed image rows below.
+	 */
 	memset(y_plane, bg.y, pitch_y * y_rows);
 	memset(u_plane, bg.u, pitch_c * c_rows);
 	memset(v_plane, bg.v, pitch_c * c_rows);
 
-	gc9503_draw_vibe_icon(y_plane, u_plane, v_plane, pitch_y, pitch_c,
-			      amber, dim);
-	gc9503_draw_center_text(y_plane, u_plane, v_plane, pitch_y, pitch_c,
-				276, "Vibe Coding", 4, text);
-	gc9503_draw_center_text(y_plane, u_plane, v_plane, pitch_y, pitch_c,
-				344, "starting", 2, amber);
+	/* IMG_9872 (Vibe Coding promo frame 1) -- panel-native YV12 baked into
+	 * the u-boot binary by tools/cvi_make_splash.py. Source stride is
+	 * tight (Y=PANEL_W, U/V=PANEL_W/2); destination has pitch padding.
+	 */
+	for (row = 0; row < GC9503_PANEL_H; row++)
+		memcpy(y_plane + row * pitch_y,
+		       IMG_9872_YV12_Y + row * GC9503_PANEL_W,
+		       GC9503_PANEL_W);
+	for (row = 0; row < GC9503_PANEL_H / 2; row++) {
+		memcpy(u_plane + row * pitch_c,
+		       IMG_9872_YV12_U + row * (GC9503_PANEL_W / 2),
+		       GC9503_PANEL_W / 2);
+		memcpy(v_plane + row * pitch_c,
+		       IMG_9872_YV12_V + row * (GC9503_PANEL_W / 2),
+		       GC9503_PANEL_W / 2);
+	}
 
 	flush_cache(addr0, ALIGN(end - addr0, 0x1000));
 
@@ -415,7 +427,7 @@ static void gc9503_show_vibe_splash(void)
 	sclr_disp_enable_window_bgcolor(false);
 	sclr_disp_reg_force_up();
 
-	printf("GC9503 splash: show landscape Vibe Coding boot page\n");
+	printf("GC9503 splash: show IMG_9872 (Vibe Coding boot frame)\n");
 }
 
 #if PANLE_ADAPTIVITY

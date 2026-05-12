@@ -58,3 +58,39 @@
 /install/**/*.ubifs
 /install/**/*.ext4
 /install/**/*.tar.gz
+
+# --- Optimized Additions for Lean Repository ---
+
+# Object and archive files
+**/*.o
+**/*.a
+**/*.ko
+**/*.so*
+**/*.map
+**/*.sym
+**/*.elf
+**/*.dtb
+**/*.dtbo
+
+# Source package downloads (prevents uploading large tars)
+/oss/*.tar.gz
+/oss/*.tar.bz2
+/oss/*.tar.xz
+/oss/*.zip
+/oss/*.tgz
+
+# Kernel/U-Boot temporary files and generated headers
+.config.old
+.config.prev
+.auto.conf*
+.tmp_versions/
+include/config/
+include/generated/
+arch/*/include/generated/
+
+# Development and packaging caches
+.pytest_cache/
+.eslintcache
+node_modules/
+dist/
+build_artifact/
