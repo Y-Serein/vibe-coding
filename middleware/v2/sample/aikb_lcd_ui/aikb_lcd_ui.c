@@ -156,6 +156,10 @@ static bool g_show_splash;
  */
 #define ANIM_MAGIC_STR  "AKIM"
 #define ANIM_FLAG_LOOP  0x1u
+#define PET_AKIM_FLAG_ARGB8888 0x2u
+#ifndef PET_ASKING_AKIM_PATH
+#define PET_ASKING_AKIM_PATH "/mnt/system/usr/share/aikb/pet/asking.akim"
+#endif
 struct anim_header {
 	char     magic[4];
 	uint32_t version;
@@ -178,6 +182,8 @@ struct anim_state {
 };
 static struct anim_state g_boot_anim = { .label = "boot-anim" };
 static struct anim_state g_wait_anim = { .label = "wait-anim" };
+static struct anim_state g_pet_asking_anim = { .label = "pet-asking" };
+static bool g_pet_asking_argb8888;
 
 static int find_cell_preset(int w, int h)
 {
@@ -294,6 +300,14 @@ static const uint32_t C_MUTED = 0xa77a3d;
 static const uint32_t C_DIM = 0x5d421d;
 static const uint32_t C_GREEN = 0x46c800;
 static const uint32_t C_RED = 0xff4b2e;
+static const uint32_t C_GRUVBOX_BG = 0x1d2021;
+static const uint32_t C_GRUVBOX_DARK0 = 0x282828;
+static const uint32_t C_GRUVBOX_DARK1 = 0x3c3836;
+static const uint32_t C_GRUVBOX_LINE = 0xebdbb2;
+static const uint32_t C_GRUVBOX_TEXT = 0xfbf1c7;
+static const uint32_t C_GRUVBOX_MUTED = 0xbdae93;
+static const uint32_t C_GRUVBOX_YELLOW = 0xfabd2f;
+static const uint32_t C_GRUVBOX_BLUE = 0x83a598;
 
 static void on_signal(int sig)
 {
@@ -1448,26 +1462,6 @@ static void render_terminal(struct canvas *c, const struct terminal *term,
 			      0x8aa1b1);
 }
 
-static const char *pet_mood_name(enum pet_mood mood)
-{
-	switch (mood) {
-	case PET_IDLE:
-		return "IDLE";
-	case PET_ASKING:
-		return "ASKING";
-	case PET_CODING:
-		return "CODING";
-	case PET_REVIEWING:
-		return "REVIEWING";
-	case PET_ERROR:
-		return "ERROR";
-	case PET_SLEEP:
-		return "SLEEP";
-	default:
-		return "IDLE";
-	}
-}
-
 static bool parse_pet_mood(const char *s, enum pet_mood *out)
 {
 	if (streq_ci(s, "IDLE")) {
@@ -1522,13 +1516,13 @@ static int pet_clamp_pct(int v)
 static void pet_init(struct pet_state *p)
 {
 	memset(p, 0, sizeof(*p));
-	p->mood = PET_IDLE;
+	p->mood = PET_ASKING;
 	p->start_time_ms = monotonic_now_ms();
 	p->last_interaction_ms = p->start_time_ms;
 	p->energy = 72;
 	p->affection = 54;
 	p->focus = 66;
-	pet_set_message(p, "standing by on the board");
+	pet_set_message(p, "waiting for your confirmation");
 }
 
 static void pet_touch(struct pet_state *p)
@@ -1650,44 +1644,22 @@ static void pet_apply_event_line(struct pet_state *p, const char *line)
 	}
 }
 
-static void draw_px_block(struct canvas *c, int ox, int oy, int scale,
-			  int px, int py, int w, int h, uint32_t color)
-{
-	fill_rect(c, ox + px * scale, oy + py * scale, w * scale,
-		  h * scale, color);
-}
-
-static void draw_pet_bar(struct canvas *c, int x, int y, int w, const char *label,
-			 int value, uint32_t color)
-{
-	int fill;
-
-	if (value < 0)
-		value = 0;
-	if (value > 100)
-		value = 100;
-	draw_text(c, x, y, label, 1, C_MUTED);
-	stroke_rect(c, x + 58, y - 2, w, 12, C_LINE);
-	fill = (w - 4) * value / 100;
-	fill_rect(c, x + 60, y, fill, 8, color);
-}
-
 static void draw_pet_background(struct canvas *c, uint32_t frame)
 {
-	canvas_clear(c, 0x11110f);
-	fill_rect(c, 0, 0, UI_W, UI_H, 0x161310);
+	canvas_clear(c, C_GRUVBOX_BG);
+	fill_rect(c, 0, 0, UI_W, UI_H, 0x151514);
 	for (int y = 0; y < UI_H; y += 4)
-		fill_rect(c, 0, y, UI_W, 1, 0x0b0b0a);
+		fill_rect(c, 0, y, UI_W, 1, 0x0d0d0c);
 	for (int y = 0; y < UI_H; y += 6) {
 		for (int x = (y * 13 + (int)frame) & 31; x < UI_W; x += 64) {
 			uint32_t n = ((uint32_t)x * 1103515245u) ^
 				     ((uint32_t)y * 2654435761u) ^ frame;
 			if ((n & 7u) == 0)
-				put_px(c, x, y, 0x28241f);
+				put_px(c, x, y, C_GRUVBOX_DARK0);
 		}
 	}
 	for (int i = 0; i < 44; i++) {
-		uint32_t shade = i < 24 ? 0x0d0c0b : 0x11100e;
+		uint32_t shade = i < 24 ? 0x0b0b0a : 0x11100e;
 
 		hline(c, i, i, UI_W - i * 2, shade);
 		hline(c, i, UI_H - 1 - i, UI_W - i * 2, shade);
@@ -1696,76 +1668,290 @@ static void draw_pet_background(struct canvas *c, uint32_t frame)
 	}
 }
 
+static void draw_pet_bullet(struct canvas *c, int x, int y, int size,
+			    uint32_t color)
+{
+	fill_rect(c, x + 2, y, size - 4, size, color);
+	fill_rect(c, x, y + 2, size, size - 4, color);
+}
+
+static void draw_pet_rotate_icon(struct canvas *c, int x, int y, bool right,
+				 uint32_t color)
+{
+	if (right) {
+		hline(c, x + 4, y + 5, 15, color);
+		hline(c, x + 4, y + 6, 15, color);
+		vline(c, x + 4, y + 7, 9, color);
+		hline(c, x + 7, y + 18, 11, color);
+		fill_rect(c, x + 17, y + 2, 3, 3, color);
+		fill_rect(c, x + 17, y + 7, 3, 3, color);
+		fill_rect(c, x + 20, y + 5, 4, 3, color);
+	} else {
+		hline(c, x + 9, y + 5, 15, color);
+		hline(c, x + 9, y + 6, 15, color);
+		vline(c, x + 23, y + 7, 9, color);
+		hline(c, x + 10, y + 18, 11, color);
+		fill_rect(c, x + 8, y + 2, 3, 3, color);
+		fill_rect(c, x + 8, y + 7, 3, 3, color);
+		fill_rect(c, x + 4, y + 5, 4, 3, color);
+	}
+}
+
+static void draw_pet_down_icon(struct canvas *c, int x, int y, int scale,
+			       uint32_t color)
+{
+	int thick = scale * 2;
+
+	fill_rect(c, x + 12 * scale, y, thick, 16 * scale, color);
+	fill_rect(c, x + 6 * scale, y + 12 * scale, thick, 4 * scale, color);
+	fill_rect(c, x + 18 * scale, y + 12 * scale, thick, 4 * scale, color);
+	fill_rect(c, x + 8 * scale, y + 16 * scale, thick, 4 * scale, color);
+	fill_rect(c, x + 16 * scale, y + 16 * scale, thick, 4 * scale, color);
+	fill_rect(c, x + 10 * scale, y + 20 * scale, 8 * scale, thick, color);
+}
+
+static void draw_pet_menu_icon(struct canvas *c, int x, int y, int scale,
+			       uint32_t color)
+{
+	int h = scale * 2;
+	int w = scale * 16;
+	int dot = scale * 3;
+
+	for (int i = 0; i < 3; i++) {
+		int yy = y + i * scale * 6;
+
+		fill_rect(c, x, yy, dot, dot, color);
+		fill_rect(c, x + scale * 6, yy + scale / 2, w, h, color);
+	}
+}
+
+static void draw_pet_temp(struct canvas *c, int x, int y, int scale)
+{
+	int dot = scale;
+
+	draw_text(c, x, y, "23", scale, C_GRUVBOX_BLUE);
+	fill_rect(c, x + 18 * scale, y + 2 * scale, dot * 2, dot,
+		  C_GRUVBOX_BLUE);
+	fill_rect(c, x + 17 * scale, y + 3 * scale, dot, dot * 2,
+		  C_GRUVBOX_BLUE);
+	fill_rect(c, x + 20 * scale, y + 3 * scale, dot, dot * 2,
+		  C_GRUVBOX_BLUE);
+	fill_rect(c, x + 18 * scale, y + 5 * scale, dot * 2, dot,
+		  C_GRUVBOX_BLUE);
+	draw_text(c, x + 26 * scale, y, "C", scale, C_GRUVBOX_BLUE);
+}
+
+#define PET_DINO_W 72
+#define PET_DINO_H 57
+
+static const char *const PET_DINO_MAP[PET_DINO_H] = {
+	"........................................................................",
+	"........................................................................",
+	".........................................oodgggcccggcd..................",
+	".....................................oodglhhhhhbbbbbbhlddd..............",
+	"...................................odlhbhlllgggggggllbbbbbhgo...........",
+	".................................dghlccggggggggggggggllllhbbhl..........",
+	"................................obhlgggggggggggggggggggggllhbbg.........",
+	"...............................gcggggglggggggggggggggggggggggbbd........",
+	"............................dddgcggggdoodggggggggggggggggggoolbho.......",
+	".........................oooodggggggdodggggggggggggggggggggoolhyg.......",
+	".........................cbd.gggggggdggllgggggggggggggggggggggghbo......",
+	".........................ogooggggggggggdodgggggggggggggggggggggcho......",
+	"......................ogcgodggggggggggodhoogggggggggggggggggggglho......",
+	".....................dbbcg.dgggggggggg.gho.dggggggggggggggggggggg.......",
+	"......................ocgo.gggggggggggo....dggggggggggggggggggggg.......",
+	"........................o.oggggggggggggd..dggggggggggggggddooooo........",
+	"........................doogggggggggccccggggggggggggggdoodddggco........",
+	"......................occoogggggggglhhhgggggggggggggd.odglggggg.........",
+	".....................gbbcoogggggggglhccggggggggggdoooggggdddddo.........",
+	".....................dccco.ddggggggggggggggggggggddggggggolhd...........",
+	"........................do.odggggggggggggggggggggggggggggoglhlo.........",
+	".........................oooddgggggggggggggggggggggggggdd..dlbhd........",
+	"........................ocg.oddgggggggggggggggggggggggdo.ogdgcbho.......",
+	".......................cbcgd.ddggggggggggggggggggdgddo..ogggggglbo......",
+	".......................gcccdoooddggggggggggggggcggccgoo.oggggggcbho.....",
+	"...........................odo.ddddddgggggdgggchhhcccgd..odggggglbg.....",
+	"............................doo.oddddgggggggllhbbbhhhcc.ooogggggghbo....",
+	"..........................dgbdooodddggggggggchhbbbbbhhhoodooggggglho....",
+	".........................cbbco.dddggggggggggcbbbbbbbbbbgoddodggggcl.....",
+	".........................odcgooddgggghhgglggcbbbbbbbbbbhooddggggggg.....",
+	"...........................od.doogggghbhgdgglbbbbbbbbbbbloddggggggo.....",
+	".......................ddgdo.od.ggggggghhgodlbbbbbbbbbbbhoodgggggo......",
+	"......................cbbcgo.dgoggggggggchhdgbbbbbbbbbbbboodddgdo.......",
+	"......................dccgd.dggooggggggggcbgdbbbbbbbbbbbboodoooo........",
+	".......................ocd.odggd.odgggggggldgbbbbbbbbbbbbd..............",
+	"...................ocgdoooodggggd.oggggggdoghbbbbbbbbbbbbo..............",
+	"...................obbbd.odggggggd.oodddgodhbbbbbbbbbbbbbo..............",
+	"....................dccd.ggggggddddoo.oodhbbbbbbbbbbbbbbbooo............",
+	"............oo...oc.oddodggggggggggggodchbbbbbbbbbbbbbbhbooll...........",
+	"............cho..dcg..odgggggdggggghblogbbbbbbbbbbbbbbbhhoobbd..........",
+	"............dgco..oo.dggggggodggggglchlocbbbbbbbbbbbbbbccodclhg.........",
+	"............odggddodgggggggdogggggggllhgohbbbbbbbbbbbbhcd.dgcbl.........",
+	".............dggglggggggggdo.ggggggggcbhocbbbbbbbbbbbhco.dggglho........",
+	"..............dggggggggggddo.dgggggggchloccbbbbbbbbhhccooddgglco........",
+	"...............oggddgggdddgo.dggggggggccogchbhhhhbhccgoddddggggo........",
+	"................odggcccggccco.dgggggggggocccccccccccd.oddddgggd.........",
+	"o..................ogccccccccoodgggggggdoccccccccdgoodddddddddo..........",
+	"do....................odgdddddoddgggggd..odddgddo...odddddddd...........",
+	"dcd..........................dgddddddo..............oodddddo.............",
+	"ogo.oco......................gggdooo................oddddddooo...........",
+	"ocdoddo......................dgggddggdo.............odddgggclcld.........",
+	"odogd.......................ogggggccglhgo...........odddgghblgchgo.o....",
+	"ddddddddddddggdddgdooodooooooddgggbbdcbcbd.ooooooooooddddgghbddbbdoddddd",
+	"ooooooodooddddddddoooddoooooooddddccogcchd..oooooooooooooddgcoogcooooooo",
+	"........................................................................",
+	"........................................................................",
+	"........................................................................",
+};
+
+static uint32_t pet_dino_color(char ch)
+{
+	switch (ch) {
+	case 'o':
+		return 0x2b2519;
+	case 'd':
+		return 0x414222;
+	case 'g':
+		return 0x5d5a2f;
+	case 'l':
+		return 0x7e733d;
+	case 'h':
+		return 0xb1904c;
+	case 'b':
+		return 0xd7973e;
+	case 'y':
+		return C_GRUVBOX_YELLOW;
+	case 'c':
+		return 0xd65d0e;
+	case 'w':
+		return C_GRUVBOX_TEXT;
+	default:
+		return 0;
+	}
+}
+
+static void draw_pet_sprite_fallback(struct canvas *c, const struct pet_state *p,
+				     uint32_t frame)
+{
+	int scale = 3;
+	int ox = 330;
+	int oy = 86;
+
+	(void)p;
+	(void)frame;
+	for (int y = 0; y < PET_DINO_H; y++) {
+		const char *row = PET_DINO_MAP[y];
+
+		for (int x = 0; x < PET_DINO_W; x++) {
+			uint32_t color = pet_dino_color(row[x]);
+
+			if (!color)
+				continue;
+			fill_rect(c, ox + x * scale, oy + y * scale,
+				  scale, scale, color);
+		}
+	}
+}
+
+static void draw_pet_akim_frame(struct canvas *c, const struct anim_state *a,
+				bool argb8888)
+{
+	struct anim_header hdr;
+	const uint8_t *frame;
+	size_t frame_bytes;
+	int box_x = 306;
+	int box_y = 84;
+	int box_w = 306;
+	int box_h = 176;
+	int scale;
+	int dst_w;
+	int dst_h;
+	int dx;
+	int dy;
+
+	if (!a->active || !a->base)
+		return;
+	memcpy(&hdr, a->base, sizeof(hdr));
+	if (!hdr.width || !hdr.height)
+		return;
+	frame_bytes = (size_t)hdr.width * hdr.height * 4u;
+	frame = a->base + sizeof(struct anim_header) +
+		(size_t)a->frame_idx * frame_bytes;
+	scale = box_w / (int)hdr.width;
+	if (box_h / (int)hdr.height < scale)
+		scale = box_h / (int)hdr.height;
+	if (scale < 1)
+		scale = 1;
+	dst_w = (int)hdr.width * scale;
+	dst_h = (int)hdr.height * scale;
+	dx = box_x + (box_w - dst_w) / 2;
+	dy = box_y + (box_h - dst_h) / 2;
+
+	for (uint32_t y = 0; y < hdr.height; y++) {
+		for (uint32_t x = 0; x < hdr.width; x++) {
+			const uint8_t *px = frame + ((size_t)y * hdr.width + x) * 4u;
+			uint8_t r;
+			uint8_t g;
+			uint8_t b;
+			uint8_t alpha;
+			int tx = dx + (int)x * scale;
+			int ty = dy + (int)y * scale;
+
+			if (argb8888) {
+				b = px[0];
+				g = px[1];
+				r = px[2];
+				alpha = px[3];
+			} else {
+				r = px[0];
+				g = px[1];
+				b = px[2];
+				alpha = px[3];
+			}
+			if (!alpha)
+				continue;
+			if (alpha == 255) {
+				fill_rect(c, tx, ty, scale, scale,
+					  ((uint32_t)r << 16) |
+					  ((uint32_t)g << 8) | b);
+			} else {
+				for (int yy = 0; yy < scale; yy++) {
+					for (int xx = 0; xx < scale; xx++) {
+						int px_x = tx + xx;
+						int px_y = ty + yy;
+						uint32_t src;
+
+						if ((unsigned)px_x >=
+						    (unsigned)c->w ||
+						    (unsigned)px_y >=
+						    (unsigned)c->h)
+							continue;
+						src = ((uint32_t)r << 16) |
+						      ((uint32_t)g << 8) | b;
+						c->px[px_y * c->w + px_x] =
+							blend_rgb(c->px[px_y * c->w + px_x],
+								  src, alpha);
+					}
+				}
+			}
+		}
+	}
+}
+
 static void draw_pet_sprite(struct canvas *c, const struct pet_state *p,
 			    uint32_t frame)
 {
-	int scale = 6;
-	int ox = 384;
-	int oy = 88;
-	int bob = 0;
-	int arm = 0;
-	bool blink = false;
-	uint32_t outline = 0x1d2021;
-	uint32_t skin = 0x98971a;
-	uint32_t skin_hi = 0xb8bb26;
-	uint32_t belly = 0xd79921;
-	uint32_t cheek = 0xd65d0e;
-	uint32_t eye = 0xfbf1c7;
+	if (p->mood == PET_ASKING && g_pet_asking_anim.active) {
+		uint32_t step;
 
-	if (p->mood == PET_IDLE)
-		bob = (frame / 8) & 1;
-	else if (p->mood == PET_CODING)
-		arm = (frame / 5) & 1;
-	else if (p->mood == PET_REVIEWING)
-		bob = (frame / 6) & 1;
-	else if (p->mood == PET_ERROR && ((frame / 4) & 1))
-		skin_hi = 0xfb4934;
-	if (p->mood == PET_SLEEP)
-		bob = 2;
-	blink = (p->mood == PET_SLEEP) || (p->mood == PET_IDLE &&
-		(frame % 54u) > 49u);
-	oy += bob;
-
-	draw_px_block(c, ox, oy, scale, 10, 20, 13, 4, outline);
-	draw_px_block(c, ox, oy, scale, 8, 17, 17, 4, skin);
-	draw_px_block(c, ox, oy, scale, 11, 14, 11, 5, skin_hi);
-	draw_px_block(c, ox, oy, scale, 14, 18, 7, 9, belly);
-	draw_px_block(c, ox, oy, scale, 12, 9, 15, 8, skin_hi);
-	draw_px_block(c, ox, oy, scale, 14, 7, 10, 3, skin_hi);
-	draw_px_block(c, ox, oy, scale, 25, 10, 3, 5, skin_hi);
-	draw_px_block(c, ox, oy, scale, 9, 11, 3, 4, outline);
-	draw_px_block(c, ox, oy, scale, 11, 8, 2, 2, outline);
-	draw_px_block(c, ox, oy, scale, 22, 9, 3, 1, 0xfabd2f);
-	draw_px_block(c, ox, oy, scale, 22, 10, 4, 1, 0xfabd2f);
-	draw_px_block(c, ox, oy, scale, 22, 11, 5, 1, 0xfabd2f);
-	draw_px_block(c, ox, oy, scale, 8, 23, 4, 3, skin);
-	draw_px_block(c, ox, oy, scale, 21, 23, 4, 3, skin);
-	draw_px_block(c, ox, oy, scale, 5, 20, 5, 2, skin);
-	draw_px_block(c, ox, oy, scale, 2, 19, 4, 1, skin_hi);
-	draw_px_block(c, ox, oy, scale, 1, 18, 2, 1, skin_hi);
-	draw_px_block(c, ox, oy, scale, 7, 12, 2, 1, 0xfabd2f);
-	draw_px_block(c, ox, oy, scale, 6, 14, 2, 1, 0xfabd2f);
-	draw_px_block(c, ox, oy, scale, 7, 16, 2, 1, 0xfabd2f);
-	draw_px_block(c, ox, oy, scale, 13, 12, 2, 1, cheek);
-
-	if (blink) {
-		draw_px_block(c, ox, oy, scale, 15, 11, 3, 1, outline);
-	} else {
-		draw_px_block(c, ox, oy, scale, 15, 10, 2, 2, outline);
-		draw_px_block(c, ox, oy, scale, 16, 10, 1, 1, eye);
+		step = (uint32_t)(((uint64_t)frame * 83u) /
+				  g_pet_asking_anim.frame_delay_ms);
+		g_pet_asking_anim.frame_idx = step % g_pet_asking_anim.frame_count;
+		draw_pet_akim_frame(c, &g_pet_asking_anim,
+				    g_pet_asking_argb8888);
+		return;
 	}
-	draw_px_block(c, ox, oy, scale, 21, 13, 5, 1, outline);
-
-	if (p->mood == PET_CODING) {
-		draw_px_block(c, ox, oy, scale, 7, 18 + arm, 5, 2, skin_hi);
-		draw_px_block(c, ox, oy, scale, 24, 18 - arm, 4, 2, skin_hi);
-		fill_rect(c, ox + 70, oy + 176, 160, 34, 0x3c3836);
-		stroke_rect(c, ox + 70, oy + 176, 160, 34, 0x928374);
-		draw_text(c, ox + 92, oy + 186, "0101", 1, 0xb8bb26);
-	} else {
-		draw_px_block(c, ox, oy, scale, 7, 18, 5, 2, skin_hi);
-		draw_px_block(c, ox, oy, scale, 24, 17, 4, 4, skin_hi);
-	}
+	draw_pet_sprite_fallback(c, p, frame);
 }
 
 static void render_pet(struct canvas *c, struct pet_state *p)
@@ -1775,71 +1961,44 @@ static void render_pet(struct canvas *c, struct pet_state *p)
 	uint32_t frame = elapsed / 83u;
 	char buf[96];
 	int seconds = (int)(elapsed / 1000u);
-	int qy;
-	uint32_t mood_color = C_YELLOW;
 
 	p->frame_index = frame;
 	if (now_ms > p->last_interaction_ms + 120000u && p->mood == PET_IDLE)
 		p->mood = PET_SLEEP;
-	if (p->mood == PET_ERROR)
-		mood_color = ((frame / 4u) & 1u) ? C_RED : C_YELLOW;
-	else if (p->mood == PET_CODING)
-		mood_color = 0xb8bb26;
-	else if (p->mood == PET_REVIEWING)
-		mood_color = 0x8ec07c;
-	else if (p->mood == PET_SLEEP)
-		mood_color = 0x928374;
 
 	draw_pet_background(c, frame);
-	draw_text(c, 22, 26, "AIKB PET", 2, C_YELLOW);
-	draw_text_right(c, 648, 26, pet_mood_name(p->mood), 2, mood_color);
-	draw_text(c, 672, 30, "*", 1, C_YELLOW);
+	draw_text(c, 22, 24, "ASKING", 1, C_GRUVBOX_YELLOW);
+	draw_text(c, 608, 24, "IDLE", 1, C_GRUVBOX_YELLOW);
+	draw_pet_bullet(c, 675, 29, 9, C_GRUVBOX_YELLOW);
 	snprintf(buf, sizeof(buf), "%02d:%02d:%02d", seconds / 3600,
 		 (seconds / 60) % 60, seconds % 60);
-	draw_text(c, 712, 26, buf, 2, C_YELLOW);
-	draw_text(c, 828, 30, "*", 1, C_YELLOW);
-	snprintf(buf, sizeof(buf), "E%03d F%03d", p->energy, p->focus);
-	draw_text_right(c, 938, 26, buf, 1, 0x83a598);
-	hline(c, 22, 54, UI_W - 44, 0xebdbb2);
+	draw_text(c, 712, 24, buf, 1, C_GRUVBOX_YELLOW);
+	draw_pet_bullet(c, 830, 29, 9, C_GRUVBOX_YELLOW);
+	draw_pet_temp(c, 870, 24, 1);
+	hline(c, 22, 54, UI_W - 44, C_GRUVBOX_LINE);
+	hline(c, 22, 55, UI_W - 44, C_GRUVBOX_DARK1);
 
 	draw_pet_sprite(c, p, frame);
-	if (p->mood == PET_ASKING) {
-		qy = 118 + (int)((frame / 6u) % 4u) * 3;
-		draw_text(c, 614, qy, "?", 7, C_YELLOW);
-		draw_text(c, 680, qy + 22, "?", 3, C_AMBER);
-	} else if (p->mood == PET_REVIEWING) {
-		int sx = 312 + (int)((frame * 9u) % 340u);
-		fill_rect(c, sx, 94, 4, 170, 0x8ec07c);
-		fill_rect(c, sx + 5, 94, 2, 170, 0x427b58);
-	} else if (p->mood == PET_ERROR) {
-		draw_text(c, 602, 132, "!", 7, mood_color);
-	} else if (p->mood == PET_SLEEP) {
-		draw_text(c, 610, 118, "Z", 3, 0x928374);
-		draw_text(c, 650, 96, "z", 2, 0x928374);
-		draw_text(c, 684, 80, "z", 1, 0x928374);
-	}
 
-	snprintf(buf, sizeof(buf), "[ %s ]", pet_mood_name(p->mood));
-	draw_text(c, 364, 274, buf, 3, mood_color);
-	draw_text(c, 282, 312, "*", 1, C_YELLOW);
-	draw_text_fit(c, 304, 310, 360, p->message, 1, C_TEXT);
-	draw_text(c, 676, 312, "*", 1, C_YELLOW);
-	draw_pet_bar(c, 32, 82, 120, "ENERGY", p->energy, C_YELLOW);
-	draw_pet_bar(c, 32, 106, 120, "AFF", p->affection, 0xd3869b);
-	draw_pet_bar(c, 32, 130, 120, "FOCUS", p->focus, 0x8ec07c);
+	hline(c, 308, 247, 304, C_DIM);
+	hline(c, 336, 243, 248, C_LINE2);
+	draw_text(c, 324, 270, "[  ASKING  ]", 3, C_GRUVBOX_YELLOW);
+	draw_pet_bullet(c, 282, 314, 10, C_GRUVBOX_YELLOW);
+	draw_text(c, 304, 310, "waiting for your confirmation", 1,
+		  C_GRUVBOX_TEXT);
+	draw_pet_bullet(c, 670, 314, 10, C_GRUVBOX_YELLOW);
 
-	hline(c, 22, 344, UI_W - 44, 0xebdbb2);
-	draw_text(c, 42, 370, "<", 3, C_YELLOW);
-	draw_text(c, 88, 374, "touch", 1, C_TEXT);
-	draw_text(c, 210, 374, "|", 1, C_MUTED);
-	draw_text(c, 248, 374, "+", 2, C_YELLOW);
-	draw_text(c, 286, 374, "feed", 1, C_TEXT);
-	draw_text(c, 392, 374, "|", 1, C_MUTED);
-	draw_text(c, 430, 374, "KEY2 mood", 1, C_TEXT);
-	draw_text(c, 566, 374, "|", 1, C_MUTED);
-	draw_text(c, 604, 374, "ENC state", 1, C_TEXT);
-	draw_text(c, 744, 374, "|", 1, C_MUTED);
-	draw_text(c, 782, 374, "PUSH menu", 1, C_TEXT);
+	hline(c, 22, 344, UI_W - 44, C_GRUVBOX_LINE);
+	hline(c, 22, 345, UI_W - 44, C_GRUVBOX_DARK1);
+	draw_pet_rotate_icon(c, 42, 362, false, C_GRUVBOX_YELLOW);
+	draw_pet_rotate_icon(c, 88, 362, true, C_GRUVBOX_YELLOW);
+	draw_text(c, 154, 368, "rotate view", 1, C_GRUVBOX_TEXT);
+	draw_text(c, 334, 368, "|", 1, C_GRUVBOX_MUTED);
+	draw_pet_down_icon(c, 392, 362, 1, C_GRUVBOX_YELLOW);
+	draw_text(c, 442, 368, "press any key", 1, C_GRUVBOX_TEXT);
+	draw_text(c, 662, 368, "|", 1, C_GRUVBOX_MUTED);
+	draw_text(c, 742, 368, "menu", 1, C_GRUVBOX_TEXT);
+	draw_pet_menu_icon(c, 822, 365, 1, C_GRUVBOX_YELLOW);
 }
 
 static uint32_t state_color(const char *state)
@@ -2775,6 +2934,87 @@ static int anim_load(struct anim_state *a, const char *path)
 	return 0;
 }
 
+static int pet_akim_load(struct anim_state *a, const char *path)
+{
+	struct stat st;
+	void *map;
+	struct anim_header hdr;
+	size_t frame_bytes;
+	size_t expected;
+	int fd;
+
+	if (!path)
+		return -1;
+	if (stat(path, &st) < 0) {
+		if (errno != ENOENT)
+			warnf("%s %s: stat failed: %s", a->label, path,
+			      strerror(errno));
+		return -1;
+	}
+	if ((size_t)st.st_size < sizeof(hdr)) {
+		warnf("%s %s: file too small (%lld < %zu)", a->label, path,
+		      (long long)st.st_size, sizeof(hdr));
+		return -1;
+	}
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0) {
+		warnf("%s %s: open failed: %s", a->label, path, strerror(errno));
+		return -1;
+	}
+	map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+	close(fd);
+	if (map == MAP_FAILED) {
+		warnf("%s %s: mmap failed: %s", a->label, path, strerror(errno));
+		return -1;
+	}
+	memcpy(&hdr, map, sizeof(hdr));
+	if (memcmp(hdr.magic, ANIM_MAGIC_STR, 4) != 0) {
+		warnf("%s %s: bad magic %02x %02x %02x %02x", a->label, path,
+		      (uint8_t)hdr.magic[0], (uint8_t)hdr.magic[1],
+		      (uint8_t)hdr.magic[2], (uint8_t)hdr.magic[3]);
+		munmap(map, (size_t)st.st_size);
+		return -1;
+	}
+	if (hdr.version != 1 ||
+	    (hdr.flags & ~(ANIM_FLAG_LOOP | PET_AKIM_FLAG_ARGB8888)) != 0) {
+		warnf("%s %s: version=%u flags=0x%x not supported", a->label,
+		      path, hdr.version, hdr.flags);
+		munmap(map, (size_t)st.st_size);
+		return -1;
+	}
+	if (hdr.width == 0 || hdr.height == 0 ||
+	    hdr.width > (uint32_t)UI_W || hdr.height > (uint32_t)UI_H ||
+	    hdr.frame_count == 0 || hdr.frame_delay_ms == 0) {
+		warnf("%s %s: invalid %ux%u count=%u delay=%u", a->label,
+		      path, hdr.width, hdr.height, hdr.frame_count,
+		      hdr.frame_delay_ms);
+		munmap(map, (size_t)st.st_size);
+		return -1;
+	}
+	frame_bytes = (size_t)hdr.width * hdr.height * 4u;
+	expected = sizeof(hdr) + (size_t)hdr.frame_count * frame_bytes;
+	if ((size_t)st.st_size != expected) {
+		warnf("%s %s: size %lld != expected %zu", a->label, path,
+		      (long long)st.st_size, expected);
+		munmap(map, (size_t)st.st_size);
+		return -1;
+	}
+	a->base = (const uint8_t *)map;
+	a->size = (size_t)st.st_size;
+	a->frame_count = hdr.frame_count;
+	a->frame_delay_ms = hdr.frame_delay_ms;
+	a->frame_idx = 0;
+	a->loop = true;
+	a->active = true;
+	g_pet_asking_argb8888 = (hdr.flags & PET_AKIM_FLAG_ARGB8888) != 0;
+	clock_gettime(CLOCK_MONOTONIC, &a->started_at);
+	warnf("%s %s loaded (%ux%u, %u frames * %u ms, %s, %zu bytes)",
+	      a->label, path, hdr.width, hdr.height, a->frame_count,
+	      a->frame_delay_ms, g_pet_asking_argb8888 ? "ARGB8888" : "RGBA",
+	      a->size);
+	return 0;
+}
+
 static void anim_blit(const struct anim_state *a, struct canvas *c)
 {
 	const uint8_t *frame = a->base + sizeof(struct anim_header) +
@@ -3284,6 +3524,7 @@ int main(int argc, char **argv)
 		anim_load(&g_boot_anim, boot_anim_path);
 	if (wait_anim_path)
 		anim_load(&g_wait_anim, wait_anim_path);
+	pet_akim_load(&g_pet_asking_anim, PET_ASKING_AKIM_PATH);
 
 	g_cell_w = initial_cell_w;
 	g_cell_h = initial_cell_h;
@@ -3313,6 +3554,7 @@ int main(int argc, char **argv)
 		ret = write_ppm(dump_path, &c);
 		kitty_graphics_destroy(kitty);
 		font_destroy(&font);
+		anim_release(&g_pet_asking_anim);
 		free(c.px);
 		return ret ? 1 : 0;
 	}
@@ -3452,5 +3694,6 @@ int main(int argc, char **argv)
 	g_show_splash = false;
 	anim_release(&g_boot_anim);
 	anim_release(&g_wait_anim);
+	anim_release(&g_pet_asking_anim);
 	return ret;
 }
