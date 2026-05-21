@@ -35,6 +35,7 @@ typedef struct _optionExt_ {
 } optionExt;
 
 typedef enum {
+	DSI_PANEL_GC9503_CXW034,
 	DSI_PANEL_3AML069LP01G,
 	DSI_PANEL_GM8775C,
 	DSI_PANEL_HX8394_EVB,
@@ -96,6 +97,7 @@ static optionExt long_option_ext[] = {
 };
 
 static char *s_panel_model_type_arr[] = {
+	"GC9503_CXW034",
 	"3AML069LP01G",
 	"GM8775C",
 	"HX8394_EVB",
@@ -192,6 +194,7 @@ int dsi_init(int devno, const struct dsc_instr *cmds, int size)
 CVI_S32 SAMPLE_MIPI_TX_ENABLE(void)
 {
 	CVI_S32 ret = 0;
+	struct combo_dev_cfg_s *dev_cfg = g_panel_desc.stdsicfg.dev_cfg;
 
 	fd = open(MIPI_TX_NAME, O_RDWR | O_NONBLOCK, 0);
 	if (fd == -1) {
@@ -229,8 +232,57 @@ CVI_S32 SAMPLE_MIPI_TX_ENABLE(void)
 	}
 
 	printf("Init for MIPI-Driver-%s\n", g_panel_desc.panel_mode);
+	printf("MIPI cfg: pixel_clk=%u lane_id={%d,%d,%d,%d,%d} pn_swap={%d,%d,%d,%d,%d}\n",
+	       dev_cfg->pixel_clk,
+	       dev_cfg->lane_id[0], dev_cfg->lane_id[1], dev_cfg->lane_id[2],
+	       dev_cfg->lane_id[3], dev_cfg->lane_id[4],
+	       dev_cfg->lane_pn_swap[0], dev_cfg->lane_pn_swap[1], dev_cfg->lane_pn_swap[2],
+	       dev_cfg->lane_pn_swap[3], dev_cfg->lane_pn_swap[4]);
+	printf("MIPI timing: hact=%u hsa=%u hbp=%u hfp=%u vact=%u vsa=%u vbp=%u vfp=%u\n",
+	       dev_cfg->sync_info.vid_hline_pixels,
+	       dev_cfg->sync_info.vid_hsa_pixels,
+	       dev_cfg->sync_info.vid_hbp_pixels,
+	       dev_cfg->sync_info.vid_hfp_pixels,
+	       dev_cfg->sync_info.vid_active_lines,
+	       dev_cfg->sync_info.vid_vsa_lines,
+	       dev_cfg->sync_info.vid_vbp_lines,
+	       dev_cfg->sync_info.vid_vfp_lines);
 
 	return CVI_SUCCESS;
+}
+
+static CVI_S32 SAMPLE_PANEL_ENABLE_DSI_VO(VO_DEV VoDev)
+{
+	CVI_S32 ret = 0;
+	struct combo_dev_cfg_s *dev_cfg = g_panel_desc.stdsicfg.dev_cfg;
+	VO_PUB_ATTR_S stVoPubAttr;
+
+	memset(&stVoPubAttr, 0, sizeof(stVoPubAttr));
+	stVoPubAttr.enIntfType = VO_INTF_MIPI;
+	stVoPubAttr.enIntfSync = VO_OUTPUT_USER;
+	stVoPubAttr.stSyncInfo.bSynm = 1;
+	stVoPubAttr.stSyncInfo.bIop = 1;
+	stVoPubAttr.stSyncInfo.u16FrameRate = 60;
+	stVoPubAttr.stSyncInfo.u16Vact = dev_cfg->sync_info.vid_active_lines;
+	stVoPubAttr.stSyncInfo.u16Vbb = dev_cfg->sync_info.vid_vbp_lines;
+	stVoPubAttr.stSyncInfo.u16Vfb = dev_cfg->sync_info.vid_vfp_lines;
+	stVoPubAttr.stSyncInfo.u16Hact = dev_cfg->sync_info.vid_hline_pixels;
+	stVoPubAttr.stSyncInfo.u16Hbb = dev_cfg->sync_info.vid_hbp_pixels;
+	stVoPubAttr.stSyncInfo.u16Hfb = dev_cfg->sync_info.vid_hfp_pixels;
+	stVoPubAttr.stSyncInfo.u16Hpw = dev_cfg->sync_info.vid_hsa_pixels;
+	stVoPubAttr.stSyncInfo.u16Vpw = dev_cfg->sync_info.vid_vsa_lines;
+	stVoPubAttr.stSyncInfo.bIdv = 0;
+	stVoPubAttr.stSyncInfo.bIhs = dev_cfg->sync_info.vid_hsa_pos_polarity;
+	stVoPubAttr.stSyncInfo.bIvs = dev_cfg->sync_info.vid_vsa_pos_polarity;
+
+	ret = CVI_VO_SetPubAttr(VoDev, &stVoPubAttr);
+	printf("CVI_VO_SetPubAttr returned %#x\n", ret);
+	if (ret != CVI_SUCCESS)
+		return ret;
+
+	ret = CVI_VO_Enable(VoDev);
+	printf("CVI_VO_Enable returned %#x\n", ret);
+	return ret;
 }
 
 CVI_S32 SAMPLE_PANEL_ENABLE(void)
@@ -244,6 +296,11 @@ CVI_S32 SAMPLE_PANEL_ENABLE(void)
 			printf("SAMPLE_MIPI_TX_ENABLE fail!\n");
 			return CVI_FAILURE;
 		}
+		ret = SAMPLE_PANEL_ENABLE_DSI_VO(VoDev);
+		if (ret != CVI_SUCCESS) {
+			printf("SAMPLE_PANEL_ENABLE_DSI_VO fail with %#x!\n", ret);
+			return CVI_FAILURE;
+		}
 	} else {
 		ret = CVI_VO_SetPubAttr(VoDev, &g_panel_desc.stVoPubAttr);
 		if (ret != CVI_SUCCESS) {
@@ -254,6 +311,7 @@ CVI_S32 SAMPLE_PANEL_ENABLE(void)
 	}
 
 	ret = CVI_VO_ShowPattern(VoDev, VO_PAT_COLORBAR);
+	printf("CVI_VO_ShowPattern returned %#x\n", ret);
 	if (ret != CVI_SUCCESS) {
 		printf("failed with %#x!\n", ret);
 		return CVI_FAILURE;
@@ -345,6 +403,14 @@ void SAMPLE_DSI_CONTROLE(void)
 void SAMPLE_SET_PANEL_DESC(void)
 {
 	switch (g_input_para.panel_model) {
+	case DSI_PANEL_GC9503_CXW034:
+		g_panel_desc.panel_mode = "GC9503_CXW034";
+		g_panel_desc.panel_type = PANEL_MODE_DSI;
+		g_panel_desc.stdsicfg.dev_cfg = &dev_cfg_gc9503_cxw034_412x960;
+		g_panel_desc.stdsicfg.hs_timing_cfg = &hs_timing_cfg_gc9503_cxw034_412x960;
+		g_panel_desc.stdsicfg.dsi_init_cmds = dsi_init_cmds_gc9503_cxw034_412x960;
+		g_panel_desc.stdsicfg.dsi_init_cmds_size = ARRAY_SIZE(dsi_init_cmds_gc9503_cxw034_412x960);
+		break;
 	case DSI_PANEL_ILI9881C:
 		g_panel_desc.panel_type = PANEL_MODE_DSI;
 		g_panel_desc.stdsicfg.dev_cfg = &dev_cfg_ili9881c_720x1280;

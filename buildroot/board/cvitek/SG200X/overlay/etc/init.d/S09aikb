@@ -3,28 +3,58 @@
 case "$1" in
   start)
 	. /etc/profile
-	if [ ! -e /dev/fb0 ] && [ -f /mnt/system/ko/soph_fb.ko ]; then
-		insmod /mnt/system/ko/soph_fb.ko option=1 opt_bpp=32 \
-			>/tmp/aikb_fb_init.log 2>&1 || true
-	fi
-	# Push panel-format pre-rotated still (IMG_9876 packed by
-	# scripts/make_splash_fb.py) to /dev/fb0 the instant fb is up so the
-	# green panel-init pattern is overwritten before aikb_lcd_ui's first
-	# fb_blit lands.
-	if [ -e /dev/fb0 ] && [ -f /mnt/system/usr/share/aikb/splash_fb.bin ]; then
-		dd if=/mnt/system/usr/share/aikb/splash_fb.bin \
-			of=/dev/fb0 bs=1582080 count=1 conv=notrunc \
-			>>/tmp/aikb_fb_init.log 2>&1 || true
+	AIKB_BOOT_VIEW="${AIKB_VIEW:-dashboard}"
+	if [ "${AIKB_BOOT_VIEW}" != "video" ]; then
+		if [ ! -e /dev/fb0 ] && [ -f /mnt/system/ko/soph_fb.ko ]; then
+			insmod /mnt/system/ko/soph_fb.ko option=1 opt_bpp=32 \
+				>/tmp/aikb_fb_init.log 2>&1 || true
+		fi
+		if [ -e /dev/fb0 ]; then
+			if [ -f /tmp/aikb_fb_keeper.pid ] &&
+				kill -0 "$(cat /tmp/aikb_fb_keeper.pid)" >/dev/null 2>&1; then
+				echo "fb keeper already running: $(cat /tmp/aikb_fb_keeper.pid)" \
+					>>/tmp/aikb_fb_init.log
+			else
+				(
+					exec 9<>/dev/fb0 || exit 0
+					while true; do
+						sleep 65535
+					done
+				) &
+				echo "$!" >/tmp/aikb_fb_keeper.pid
+				echo "fb keeper pid=$!" >>/tmp/aikb_fb_init.log
+			fi
+		fi
+		# Push panel-format pre-rotated still (IMG_9876 packed by
+		# scripts/make_splash_fb.py) to /dev/fb0 the instant fb is up so the
+		# green panel-init pattern is overwritten before aikb_lcd_ui's first
+		# fb_blit lands.
+		if [ -e /dev/fb0 ] && [ -f /mnt/system/usr/share/aikb/splash_fb.bin ]; then
+			dd if=/mnt/system/usr/share/aikb/splash_fb.bin \
+				of=/dev/fb0 bs=1582080 count=1 conv=notrunc \
+				>>/tmp/aikb_fb_init.log 2>&1 || true
+		fi
+	else
+		echo "video mode: skip framebuffer init" >/tmp/aikb_fb_init.log
 	fi
 	if [ -x /mnt/system/auto.sh ]; then
-		sh /mnt/system/auto.sh &
+		AIKB_VIEW="${AIKB_BOOT_VIEW}" sh /mnt/system/auto.sh &
 	else
 		echo "/mnt/system/auto.sh not executable" > /tmp/aikb_lcd_ui.log
 	fi
 	;;
   stop)
+	killall sample_vdecvo >/dev/null 2>&1 || true
+	if [ -f /tmp/aikb_video_controller.pid ]; then
+		kill "$(cat /tmp/aikb_video_controller.pid)" >/dev/null 2>&1 || true
+		rm -f /tmp/aikb_video_controller.pid
+	fi
 	killall aikb_hid_input >/dev/null 2>&1 || true
 	killall aikb_lcd_ui >/dev/null 2>&1 || true
+	if [ -f /tmp/aikb_fb_keeper.pid ]; then
+		kill "$(cat /tmp/aikb_fb_keeper.pid)" >/dev/null 2>&1 || true
+		rm -f /tmp/aikb_fb_keeper.pid
+	fi
 	;;
   restart)
 	"$0" stop

@@ -28,6 +28,7 @@ extern "C" {
 #include "dsi_hx8399_1080p.h"
 #include "dsi_gm8775c.h"
 #include "dsi_lt9611.h"
+#include "dsi_gc9503_cxw034.h"
 #include "lvds_lcm185x56.h"
 #include "hw_mcu_st7789v3.h"
 #include "bt656_tp2803.h"

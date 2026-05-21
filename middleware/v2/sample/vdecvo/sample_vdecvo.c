@@ -11,21 +11,28 @@
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <signal.h>
 #include <linux/socket.h>
+#include <fcntl.h>
+#include <pthread.h>
 
 #include "cvi_buffer.h"
 #include "sample_comm.h"
 #include "cvi_sys.h"
 
 #define MAX_VDEC_NUM 4
-#define VDEC_WIDTH 1920
-#define VDEC_HEIGHT 1080
+#define AIKB_PANEL_WIDTH 412
+#define AIKB_PANEL_HEIGHT 960
+#define AIKB_VIDEO_WIDTH AIKB_PANEL_WIDTH
+#define AIKB_VIDEO_HEIGHT AIKB_PANEL_HEIGHT
+#define AIKB_VIDEO_CTRL_PATH "/tmp/aikb_video_ctrl"
+#define AIKB_VIDEO_PATH_MAX 255
 
 typedef struct _SAMPLE_VDEC_PARAM_S {
 	VDEC_CHN        VdecChn;
 	VDEC_CHN_ATTR_S stChnAttr;
-	char            decode_file_name[64];
+	char            decode_file_name[AIKB_VIDEO_PATH_MAX + 1];
 	CVI_BOOL        stop_thread;
 	pthread_t       vdec_thread;
 	RECT_S          stDispRect;
@@ -40,6 +47,134 @@ static pthread_t send_vo_thread;
 static CVI_VOID *s_h264file[MAX_VDEC_NUM];
 static bool is_using_vo = true;
 static bool is_running = true;
+static pthread_mutex_t g_video_ctrl_lock = PTHREAD_MUTEX_INITIALIZER;
+static char g_current_video_file[AIKB_VIDEO_PATH_MAX + 1];
+static char g_pending_video_file[AIKB_VIDEO_PATH_MAX + 1];
+static pthread_t g_video_ctrl_thread;
+static bool g_video_ctrl_thread_started;
+
+static void strip_line_end(char *line)
+{
+	size_t len = strlen(line);
+
+	while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+		line[len - 1] = '\0';
+		len--;
+	}
+}
+
+static void note_current_video_file(const char *path)
+{
+	pthread_mutex_lock(&g_video_ctrl_lock);
+	snprintf(g_current_video_file, sizeof(g_current_video_file), "%s", path);
+	pthread_mutex_unlock(&g_video_ctrl_lock);
+}
+
+static void request_video_file_switch(const char *path)
+{
+	pthread_mutex_lock(&g_video_ctrl_lock);
+	if (strcmp(path, g_current_video_file) != 0)
+		snprintf(g_pending_video_file, sizeof(g_pending_video_file), "%s", path);
+	pthread_mutex_unlock(&g_video_ctrl_lock);
+}
+
+static bool take_pending_video_file(char *path, size_t path_size)
+{
+	bool has_pending = false;
+
+	pthread_mutex_lock(&g_video_ctrl_lock);
+	if (g_pending_video_file[0] != '\0') {
+		snprintf(path, path_size, "%s", g_pending_video_file);
+		g_pending_video_file[0] = '\0';
+		has_pending = true;
+	}
+	pthread_mutex_unlock(&g_video_ctrl_lock);
+	return has_pending;
+}
+
+static CVI_VOID *thread_video_ctrl(CVI_VOID *arg)
+{
+	(void)arg;
+	prctl(PR_SET_NAME, "aikb-video-ctrl");
+
+	while (is_running) {
+		char line[AIKB_VIDEO_PATH_MAX + 16];
+		int fd = open(AIKB_VIDEO_CTRL_PATH, O_RDWR);
+		FILE *fp;
+
+		if (fd < 0) {
+			perror("open video ctrl");
+			sleep(1);
+			continue;
+		}
+		fp = fdopen(fd, "r");
+		if (fp == NULL) {
+			perror("fdopen video ctrl");
+			close(fd);
+			sleep(1);
+			continue;
+		}
+		while (is_running && fgets(line, sizeof(line), fp) != NULL) {
+			char *path = line;
+
+			strip_line_end(line);
+			if (strncmp(line, "file ", 5) == 0)
+				path = line + 5;
+			if (path[0] == '\0')
+				continue;
+			if (access(path, R_OK) != 0) {
+				printf("video ctrl missing file: %s\n", path);
+				continue;
+			}
+			printf("video ctrl switch: %s\n", path);
+			request_video_file_switch(path);
+		}
+		fclose(fp);
+	}
+	return NULL;
+}
+
+static void start_video_ctrl_thread(void)
+{
+	struct stat st;
+
+	if (stat(AIKB_VIDEO_CTRL_PATH, &st) == 0) {
+		if (!S_ISFIFO(st.st_mode)) {
+			unlink(AIKB_VIDEO_CTRL_PATH);
+			(void)mkfifo(AIKB_VIDEO_CTRL_PATH, 0600);
+		}
+	} else {
+		(void)mkfifo(AIKB_VIDEO_CTRL_PATH, 0600);
+	}
+	if (pthread_create(&g_video_ctrl_thread, NULL, thread_video_ctrl, NULL) == 0)
+		g_video_ctrl_thread_started = true;
+	else
+		perror("pthread_create video ctrl");
+}
+
+static void set_single_video_display_rect(SAMPLE_VDEC_PARAM_S *param)
+{
+	/*
+	 * Keep the decoded frame in the panel's physical 412x960 orientation.
+	 * The source video is pre-rotated during conversion so VO can receive
+	 * frames that match the enabled channel size.
+	 */
+	const CVI_U32 canvas_w = AIKB_VIDEO_WIDTH;
+	const CVI_U32 canvas_h = AIKB_VIDEO_HEIGHT;
+	const CVI_U32 src_w = AIKB_VIDEO_WIDTH;
+	const CVI_U32 src_h = AIKB_VIDEO_HEIGHT;
+	CVI_U32 out_w = canvas_w;
+	CVI_U32 out_h = (canvas_w * src_h + src_w / 2) / src_w;
+
+	if (out_h > canvas_h) {
+		out_h = canvas_h;
+		out_w = (canvas_h * src_w + src_h / 2) / src_h;
+	}
+	param->stDispRect.s32X = (canvas_w - out_w) / 2;
+	param->stDispRect.s32Y = (canvas_h - out_h) / 2;
+	param->stDispRect.u32Width = out_w;
+	param->stDispRect.u32Height = out_h;
+}
 
 #define SHOW_STATISTICS_1
 // #define SHOW_STATISTICS_2
@@ -85,10 +220,30 @@ CVI_VOID *thread_vdec_send_stream(CVI_VOID *arg)
 		return (CVI_VOID *)(CVI_FAILURE);
 	}
 	printf("thread_vdec_send_stream %d\n", param->VdecChn);
+	note_current_video_file(param->decode_file_name);
 	u64PTS = 0;
 	while (!param->stop_thread) {
 		int retry = 0;
+		char next_file[AIKB_VIDEO_PATH_MAX + 1];
 
+		if (param->VdecChn == 0 &&
+		    take_pending_video_file(next_file, sizeof(next_file))) {
+			FILE *next_fp = fopen(next_file, "rb");
+
+			if (next_fp == NULL) {
+				printf("open switch file err, %s\n", next_file);
+			} else {
+				fclose(fpStrm);
+				fpStrm = next_fp;
+				snprintf(param->decode_file_name,
+					 sizeof(param->decode_file_name),
+					 "%s", next_file);
+				s32UsedBytes = 0;
+				u64PTS = 0;
+				note_current_video_file(next_file);
+				printf("video switched to %s\n", next_file);
+			}
+		}
 		bEndOfStream = CVI_FALSE;
 		bFindStart = CVI_FALSE;
 		bFindEnd = CVI_FALSE;
@@ -642,8 +797,8 @@ CVI_S32 SAMPLE_VPSS_Overlay_4vdec(CVI_VOID)
 	CVI_S32 s32Ret = CVI_SUCCESS;
 	int filelen;
 
-	stSize.u32Width = VDEC_WIDTH;
-	stSize.u32Height = VDEC_HEIGHT;
+	stSize.u32Width = AIKB_VIDEO_WIDTH;
+	stSize.u32Height = AIKB_VIDEO_HEIGHT;
 
 	/************************************************
 	 * step3:  Init SYS and common VB
@@ -679,8 +834,8 @@ CVI_S32 SAMPLE_VPSS_Overlay_4vdec(CVI_VOID)
 	stVpssGrpAttr.u32MaxH                        = stSize.u32Height;
 	stVpssGrpAttr.u8VpssDev                      = 0;
 
-	astVpssChnAttr[VpssChn].u32Width                    = 1280;
-	astVpssChnAttr[VpssChn].u32Height                   = 720;
+	astVpssChnAttr[VpssChn].u32Width                    = AIKB_VIDEO_WIDTH;
+	astVpssChnAttr[VpssChn].u32Height                   = AIKB_VIDEO_HEIGHT;
 	astVpssChnAttr[VpssChn].enVideoFormat               = VIDEO_FORMAT_LINEAR;
 	astVpssChnAttr[VpssChn].enPixelFormat               = SAMPLE_PIXEL_FORMAT;
 	astVpssChnAttr[VpssChn].stFrameRate.s32SrcFrameRate = 30;
@@ -712,10 +867,24 @@ CVI_S32 SAMPLE_VPSS_Overlay_4vdec(CVI_VOID)
 	/************************************************
 	 * step6:  Init VO
 	 ************************************************/
-	RECT_S stDefDispRect  = {0, 0, 720, 1280};
-	SIZE_S stDefImageSize = {720, 1280};
-	VO_CHN VoChn = 0;
-
+	RECT_S stDefDispRect  = {0, 0, AIKB_PANEL_WIDTH, AIKB_PANEL_HEIGHT};
+	SIZE_S stDefImageSize = {AIKB_PANEL_WIDTH, AIKB_PANEL_HEIGHT};
+	VO_SYNC_INFO_S stAikbPanelSyncInfo = {
+		.bSynm = 1,
+		.bIop = 1,
+		.u16FrameRate = 60,
+		.u16Vact = AIKB_PANEL_HEIGHT,
+		.u16Vbb = 20,
+		.u16Vfb = 20,
+		.u16Hact = AIKB_PANEL_WIDTH,
+		.u16Hbb = 50,
+		.u16Hfb = 50,
+		.u16Hpw = 10,
+		.u16Vpw = 10,
+		.bIdv = 0,
+		.bIhs = 0,
+		.bIvs = 0,
+	};
 	s32Ret = SAMPLE_COMM_VO_GetDefConfig(&stVoConfig);
 	if (s32Ret != CVI_SUCCESS) {
 		CVI_TRACE_LOG(CVI_DBG_ERR, "SAMPLE_COMM_VO_GetDefConfig failed with %#x\n", s32Ret);
@@ -724,7 +893,8 @@ CVI_S32 SAMPLE_VPSS_Overlay_4vdec(CVI_VOID)
 
 	stVoConfig.VoDev		 = 0;
 	stVoConfig.stVoPubAttr.enIntfType  = VO_INTF_MIPI;
-	stVoConfig.stVoPubAttr.enIntfSync  = VO_OUTPUT_720x1280_60;
+	stVoConfig.stVoPubAttr.enIntfSync  = VO_OUTPUT_USER;
+	stVoConfig.stVoPubAttr.stSyncInfo  = stAikbPanelSyncInfo;
 	stVoConfig.stDispRect	 = stDefDispRect;
 	stVoConfig.stImageSize	 = stDefImageSize;
 	stVoConfig.enPixFormat	 = SAMPLE_PIXEL_FORMAT;
@@ -736,7 +906,6 @@ CVI_S32 SAMPLE_VPSS_Overlay_4vdec(CVI_VOID)
 		return s32Ret;
 	}
 
-	CVI_VO_SetChnRotation(stVoConfig.VoDev, VoChn, ROTATION_90);
 	}
 
 	SAMPLE_VDEC_CONFIG_S stVdecCfg = {0};
@@ -751,44 +920,30 @@ CVI_S32 SAMPLE_VPSS_Overlay_4vdec(CVI_VOID)
 
 	pVdecChn[0]->VdecChn = 0;
 	pVdecChn[0]->stop_thread = CVI_FALSE;
-	filelen = snprintf(pVdecChn[0]->decode_file_name, 63, "%s", (char *)s_h264file[0]);
+	filelen = snprintf(pVdecChn[0]->decode_file_name,
+			   sizeof(pVdecChn[0]->decode_file_name), "%s",
+			   (char *)s_h264file[0]);
 	pVdecChn[0]->stChnAttr.enType = find_file_type(pVdecChn[0]->decode_file_name, filelen);
 	pVdecChn[0]->stChnAttr.enMode = VIDEO_MODE_FRAME;
-	pVdecChn[0]->stChnAttr.u32PicWidth = VDEC_WIDTH;
-	pVdecChn[0]->stChnAttr.u32PicHeight = VDEC_HEIGHT;
+	pVdecChn[0]->stChnAttr.u32PicWidth = AIKB_VIDEO_WIDTH;
+	pVdecChn[0]->stChnAttr.u32PicHeight = AIKB_VIDEO_HEIGHT;
 	pVdecChn[0]->stChnAttr.u32FrameBufCnt = 3;
-	pVdecChn[0]->stChnAttr.u32StreamBufSize = 1920*1080;
+	pVdecChn[0]->stChnAttr.u32StreamBufSize = AIKB_VIDEO_WIDTH * AIKB_VIDEO_HEIGHT;
 	pVdecChn[0]->stDispRect.s32X = 0;
 	pVdecChn[0]->stDispRect.s32Y = 0;
 	pVdecChn[0]->stDispRect.u32Width = 640;
 	pVdecChn[0]->stDispRect.u32Height = 360;
+	if (decoding_file_num == 1)
+		set_single_video_display_rect(pVdecChn[0]);
 
-	memcpy(pVdecChn[1], pVdecChn[0], sizeof(SAMPLE_VDEC_PARAM_S));
-	pVdecChn[1]->VdecChn = 1;
-	filelen = snprintf(pVdecChn[1]->decode_file_name, 63, "%s", (char *)s_h264file[1]);
-	pVdecChn[1]->stChnAttr.enType = find_file_type(pVdecChn[1]->decode_file_name, filelen);
-	pVdecChn[1]->stDispRect.s32X = 640;
-	pVdecChn[1]->stDispRect.s32Y = 0;
-	pVdecChn[1]->stDispRect.u32Width = 640;
-	pVdecChn[1]->stDispRect.u32Height = 360;
-
-	memcpy(pVdecChn[2], pVdecChn[0], sizeof(SAMPLE_VDEC_PARAM_S));
-	pVdecChn[2]->VdecChn = 2;
-	filelen = snprintf(pVdecChn[2]->decode_file_name, 63, "%s", (char *)s_h264file[2]);
-	pVdecChn[2]->stChnAttr.enType = find_file_type(pVdecChn[2]->decode_file_name, filelen);
-	pVdecChn[2]->stDispRect.s32X = 0;
-	pVdecChn[2]->stDispRect.s32Y = 360;
-	pVdecChn[2]->stDispRect.u32Width = 640;
-	pVdecChn[2]->stDispRect.u32Height = 360;
-
-	memcpy(pVdecChn[3], pVdecChn[0], sizeof(SAMPLE_VDEC_PARAM_S));
-	pVdecChn[3]->VdecChn = 3;
-	filelen = snprintf(pVdecChn[3]->decode_file_name, 63, "%s", (char *)s_h264file[3]);
-	pVdecChn[3]->stChnAttr.enType = find_file_type(pVdecChn[3]->decode_file_name, filelen);
-	pVdecChn[3]->stDispRect.s32X = 640;
-	pVdecChn[3]->stDispRect.s32Y = 360;
-	pVdecChn[3]->stDispRect.u32Width = 640;
-	pVdecChn[3]->stDispRect.u32Height = 360;
+	for (int i = 1; i < stVdecCfg.s32ChnNum; i++) {
+		memcpy(pVdecChn[i], pVdecChn[0], sizeof(SAMPLE_VDEC_PARAM_S));
+		pVdecChn[i]->VdecChn = i;
+		filelen = snprintf(pVdecChn[i]->decode_file_name,
+				    sizeof(pVdecChn[i]->decode_file_name), "%s",
+				    (char *)s_h264file[i]);
+		pVdecChn[i]->stChnAttr.enType = find_file_type(pVdecChn[i]->decode_file_name, filelen);
+	}
 
 #define vbMaxFrmNum 8
 	////////////////////////////////////////////////////
@@ -798,8 +953,8 @@ CVI_S32 SAMPLE_VPSS_Overlay_4vdec(CVI_VOID)
 
 	for (int i = 0; i < stVdecCfg.s32ChnNum; i++) {
 		astSampleVdec[i].enType = pVdecChn[i]->stChnAttr.enType;
-		astSampleVdec[i].u32Width = VDEC_WIDTH;
-		astSampleVdec[i].u32Height = VDEC_HEIGHT;
+		astSampleVdec[i].u32Width = AIKB_VIDEO_WIDTH;
+		astSampleVdec[i].u32Height = AIKB_VIDEO_HEIGHT;
 
 		astSampleVdec[i].enMode = VIDEO_MODE_FRAME;
 		astSampleVdec[i].stSampleVdecVideo.enDecMode = VIDEO_DEC_MODE_IP;
@@ -820,12 +975,13 @@ CVI_S32 SAMPLE_VPSS_Overlay_4vdec(CVI_VOID)
 		start_vdec(pVdecChn[i]);
 	}
 
+	if (stVdecCfg.s32ChnNum == 1)
+		start_video_ctrl_thread();
 	start_thread(&stVdecCfg);
 
-	do {
-		printf("---------------press Ctrl+C to exit!---------------\n");
-		getchar();
-	} while (is_running);
+	printf("---------------press Ctrl+C to exit!---------------\n");
+	while (is_running)
+		pause();
 
 	stop_thread(&stVdecCfg);
 	printf("stop thread\n");
@@ -891,10 +1047,8 @@ int main(int argc, char *argv[])
 		return CVI_FAILURE;
 	}
 	s32Index = atoi(argv[1]);
-	s_h264file[0] = argv[2];
-	s_h264file[1] = argv[3];
-	s_h264file[2] = argv[4];
-	s_h264file[3] = argv[5];
+	for (int i = 0; i < decoding_file_num; i++)
+		s_h264file[i] = argv[i + 2];
 	signal(SIGINT, SAMPLE_VIO_HandleSig);
 	signal(SIGALRM, SAMPLE_VIO_HandleSig);
 	signal(SIGTERM, SAMPLE_VIO_HandleSig);

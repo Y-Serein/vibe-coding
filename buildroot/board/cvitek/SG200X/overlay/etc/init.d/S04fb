@@ -3,6 +3,11 @@
 if [ "$1" = "start" ]
 then
 	. /etc/profile
+	AIKB_BOOT_VIEW="${AIKB_VIEW:-video}"
+	if [ "${AIKB_BOOT_VIEW}" = "video" ]; then
+		echo "video mode: skip framebuffer init"
+		exit 0
+	fi
 	if [ -e /boot/fb ]
 	then
 		echo "framebuffer enable"
