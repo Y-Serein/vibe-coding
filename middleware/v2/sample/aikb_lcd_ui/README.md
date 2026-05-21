@@ -25,6 +25,10 @@ Render once to an image for local inspection:
 ```sh
 ./aikb_lcd_ui --dump-ppm /tmp/aikb-lcd-ui.ppm
 ./aikb_lcd_ui --view pet --dump-ppm /tmp/pet.ppm --once
+./aikb_lcd_ui --view pet \
+  --pet-asset-root ../../../../buildroot/board/cvitek/SG200X/overlay/mnt/system/usr/share/aikb/pet \
+  --dump-ppm /tmp/pet-asset.ppm \
+  --pet-qa-dump /tmp/pet-asset.qa
 ```
 
 Run on the board framebuffer with the VT100 terminal view and mock data:
@@ -59,6 +63,35 @@ The default AIKB boot path uses Vendor HID for screen writes instead: `auto.sh`
 creates `/tmp/aikb_lcd_ui.in`, starts this app with that FIFO as `--input`, and
 starts `aikb_hid_input --screen-out /tmp/aikb_lcd_ui.in` to translate HID
 output report `0x20` into terminal bytes.
+
+When started with `--ctrl`, the control FIFO accepts:
+
+- `cell W H` — change the terminal cell preset.
+- `view terminal|dashboard|pet` — switch the active renderer without restarting.
+- `session N state X` — board-side session table update from `aikb_hid_input`;
+  `N` is the sid, `X` ∈ `{connected, disconnected, run, wait, done, error}`.
+- `session N removed` — drop sid `N` from the board-side table.
+
+When started with `--ui-ctrl-out PATH`, the renderer drives the picker state
+machine on `aikb_hid_input` by emitting lines on that FIFO:
+
+- `view picker` / `view terminal` — announce a view transition so `aikb_hid_input`
+  knows whether outgoing `CMD_KEY_EVENT` / `CMD_ENCODER_EVENT` packets should be
+  suppressed (picker) or stamped with `g_active_sid` (terminal).
+- `select N` — encoder rotation in the picker moved the highlight to sid `N`.
+- `focus N` — the user pressed `CONFIRM` / encoder switch on sid `N`;
+  `aikb_hid_input` then emits one `CMD_SESSION_FOCUS(N)` to the host and sets
+  its `g_active_sid` to `N` so the VT100 stream gate opens.
+
+Key bindings in the session picker:
+
+- `SESSION` (KEY 2) — enter the picker. No-op while already in the picker.
+- `Encoder ±1` — move the highlight through live sessions.
+- `CONFIRM` (KEY 6) or encoder push — focus the highlighted sid and switch back
+  to the terminal view.
+- `REJECT` (KEY 0) — exit the picker without changing focus.
+- All other keys in the picker are eaten board-locally: nothing is forwarded to
+  the host while the picker is open.
 
 `--rotate auto` renders the UI as 960x412 and automatically rotates it clockwise
 when the framebuffer reports 412x960. Use `--rotate ccw` if the physical mount
@@ -141,10 +174,110 @@ Useful font paths checked automatically:
 
 `--view pet` is a local board-side desktop pet. It reuses the 960x412 logical
 canvas and framebuffer blitter, including `--rotate auto`, `--pixel-format`,
-`--alpha`, and `--dump-ppm`. The first version draws the pixel pet in C code,
-so it has no external PNG dependency. The board startup script now uses pet as
-the default view; set `AIKB_VIEW=terminal` or `AIKB_VIEW=dashboard` to force the
-older views.
+`--alpha`, and `--dump-ppm`. The product character path is asset-driven:
+`asking.akim` is the default pet pack entry at
+`/mnt/system/usr/share/aikb/pet/asking.akim`. The C rectangle dinosaur remains
+only as a fallback when the AKIM asset is missing or invalid. The board startup
+script now uses pet as the default view; set `AIKB_VIEW=terminal` or
+`AIKB_VIEW=dashboard` to force the older views.
+
+Pet assets are described by an in-code manifest so the runtime has no JSON
+parser dependency. The manifest records state name, frame count expectation,
+frame duration, and AKIM path. `asking.akim` currently carries the core
+character poses in one pack:
+
+```text
+idle      frames 0..7
+thinking  frames 8..13
+happy     frames 14..19
+asking    frames 20..25
+sleep     frames 26..31
+```
+
+For local dump tests, point the runtime at an unpacked pet asset directory:
+
+```sh
+./aikb_lcd_ui --view pet \
+  --pet-asset-root ../../../../buildroot/board/cvitek/SG200X/overlay/mnt/system/usr/share/aikb/pet \
+  --pet-scene asking --pet-pose confused \
+  --dump-ppm /tmp/pet-asset.ppm \
+  --pet-qa-dump /tmp/pet-asset.qa
+
+./aikb_lcd_ui --view pet --pet-force-fallback \
+  --dump-ppm /tmp/pet-fallback.ppm \
+  --pet-qa-dump /tmp/pet-fallback.qa
+```
+
+Convert PNG frame sequences into AKIM with:
+
+```sh
+python3 scripts/png_frames_to_akim.py \
+  --in frames/asking_*.png \
+  --out asking.akim \
+  --frame-delay-ms 120
+```
+
+Input PNG frames must share the same dimensions. RGBA PNG alpha is preserved;
+RGB PNGs are packed as fully opaque. Pet AKIM frames are scaled into the middle
+character stage box, so source art should be cropped around the character and
+kept pixel-crisp.
+
+For video or full-screen frame captures, use the ROI-based asset tool instead
+of cropping by fixed header/footer bands. The first pass writes a contact-sheet
+preview with the selected ROI rectangle overlaid; use it to confirm that the
+box contains only the dynamic subject, such as the dinosaur, question mark, and
+foot platform:
+
+```sh
+python3 scripts/mp4_or_frames_to_akim.py \
+  --input /path/to/source.mp4 \
+  --start-sec 1.2 \
+  --duration-sec 3.2 \
+  --fps 10 \
+  --roi-percent 32,18,36,58 \
+  --preview-out /tmp/asking_roi_preview.png
+```
+
+After the ROI is confirmed, pack the same source to ARGB8888 AKIM with
+nearest-neighbor scaling:
+
+```sh
+python3 scripts/mp4_or_frames_to_akim.py \
+  --input /path/to/source.mp4 \
+  --start-sec 1.2 \
+  --duration-sec 3.2 \
+  --fps 10 \
+  --roi-percent 32,18,36,58 \
+  --width 64 \
+  --height 48 \
+  --preview-out /tmp/asking_roi_preview.png \
+  --out /tmp/asking.akim
+```
+
+PNG frame directories or globs use the same options:
+
+```sh
+python3 scripts/mp4_or_frames_to_akim.py \
+  --input R_raw/pet_asset_pipeline/asking_ref_frames \
+  --fps 12 \
+  --roi 14,9,72,54 \
+  --width 64 \
+  --height 48 \
+  --preview-out /tmp/asking_frames_roi.png \
+  --out /tmp/asking.akim
+```
+
+Use `--fps 15` or `--fps 20` if the source motion feels too sparse; this
+increases frame count and AKIM size for the same duration.
+
+Check the packed AKIM by dumping it back to PNG frames:
+
+```sh
+python3 scripts/dump_akim.py \
+  --in /tmp/asking.akim \
+  --out-dir /tmp/asking_dump \
+  --preview-out /tmp/asking_dump_sheet.png
+```
 
 When pet view receives normal host VT100 bytes on `--input` instead of a
 `PET ...` command line, it switches to terminal view, clears the terminal state,

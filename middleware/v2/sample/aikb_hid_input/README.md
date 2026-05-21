@@ -6,17 +6,26 @@ the host over the vendor HID interface, using the **vibe-bridge protocol v0**
 
 ## Pin Map
 
-All inputs are configured as GPIOA inputs with internal pull-up enabled and
-pull-down disabled. Buttons and the encoder switch are active-low.
+Inputs are configured as GPIO inputs with software pull-up enabled for the
+current test board. RTC GPIOE inputs keep the existing RTC ioblk pull-up path
+and also program the SDIO1 pad-control addresses from the SG2002 U-Boot
+headers. GPIOA22/A23/A24/A25/A27 use the cv181x EMMC pad-control registers at
+`0x0300191c..0x0300192c`; GPIOA15/SPK_EN uses `0x03001908`. Buttons and the
+encoder switch are active-low. The final hardware can drop these software
+pull-ups once external pulls are present and verified.
 
 | Logical input | Board pin | Pad | GPIO bit |
 | --- | --- | --- | --- |
-| key0 | A15 | SPK_EN | GPIOA15 |
-| key1 | A24 | SPINOR_CS_X | GPIOA24 |
-| key2 | A23 | SPINOR_MISO | GPIOA23 |
-| encoder A | A27 | SPINOR_WP_X | GPIOA27 |
-| encoder B | A25 | SPINOR_MOSI | GPIOA25 |
-| encoder E | A22 | SPINOR_SCK | GPIOA22 |
+| key0 | P19 | RTC pad | GPIOE19 |
+| key1 | A22 | EMMC_CLK / SPINOR_SCK alt | GPIOA22 |
+| key2 | A25 | EMMC_DAT0 / SPINOR_MOSI alt | GPIOA25 |
+| key3 | A27 | EMMC_DAT3 / SPINOR_WP_X alt | GPIOA27 |
+| key4 | A23 | EMMC_CMD / SPINOR_MISO alt | GPIOA23 |
+| key5 | A24 | EMMC_DAT1 / SPINOR_CS_X alt | GPIOA24 |
+| key6 | A15 | SPK_EN | GPIOA15 |
+| encoder A | P22 | RTC pad | GPIOE22 |
+| encoder B | P23 | RTC pad | GPIOE23 |
+| encoder E | P21 | RTC pad | GPIOE21 |
 
 ## Wire format
 
@@ -38,35 +47,76 @@ byte..63 = zero pad
 | cmd | Name | Payload |
 | --- | --- | --- |
 | 0x01 | `CMD_REQUEST_SESSION` | UTF-8 plugin/wrapper hint (optional) |
-| 0x30 | `CMD_VT100_STREAM` | raw VT100 bytes for the active LCD |
-| 0x50 | `CMD_STATUS_UPDATE` | informational; firmware just touches sid |
-| 0x20 / 0x21 / 0x40 | `WINDOW_SWITCH` / `WINDOW_ACTIVATE` / `UI_SCALE_CHANGE` | currently no-op in firmware (handled by host daemon) |
+| 0x04 | `CMD_SESSION_HEARTBEAT` | empty; host must send one every 10s per live sid (`sid` field carries the target) |
+| 0x30 | `CMD_VT100_STREAM` | raw VT100 bytes — only forwarded to the screen FIFO when `sid == g_active_sid` (board-focused window) |
+| 0x50 | `CMD_STATUS_UPDATE` | `[state]` (1 byte `SessionState`: `CONNECTED/DISCONNECTED/RUN/WAIT/DONE/ERROR`); board stores it for the grid row |
+| 0x40 | `CMD_UI_SCALE_CHANGE` | forwards `cell W H` to `aikb_lcd_ui --ctrl` |
+| 0x20 | `CMD_WINDOW_SWITCH` | **deprecated**: board owns its own UI now; firmware ignores it |
+| 0x21 | `CMD_WINDOW_ACTIVATE` | **deprecated**: board owns its own UI now; firmware ignores it |
 
 ### Board → host (input reports 0x10)
 
 | cmd | Name | Payload |
 | --- | --- | --- |
 | 0x02 | `CMD_SESSION_RESPONSE` | `[Status]` (1 byte: `SESSION_CREATED` etc.) |
-| 0x03 | `CMD_SESSION_INVALID` | `[Status]` (`INVALID` / `RECLAIMED` / `POOL_FULL`) |
-| 0x10 | `CMD_KEY_EVENT` | `[key_bits]` — bit0..bit2 = key0..key2, bit7 = encoder switch |
+| 0x03 | `CMD_SESSION_INVALID` | `[Status]` (`INVALID` / `RECLAIMED` / `EXPIRED` / `POOL_FULL` / `DISCONNECTED`) |
+| 0x05 | `CMD_SESSION_FOCUS` | empty; `sid` is the session the on-board picker confirmed. Host opens the VT100 stream gate so only this sid's bytes are sent back. |
+| 0x10 | `CMD_KEY_EVENT` | `[key_bits, encoder_pressed]` — bits 0..6 = newly pressed key0..key6 edges, bit7 reserved, byte1 bit0 = encoder switch press edge |
 | 0x11 | `CMD_ENCODER_EVENT` | `[delta:int8]` — left −1, right +1 |
 
-Key and encoder events use `sid = 0` (broadcast); the host daemon decides
-which session to route them to.
+`CMD_KEY_EVENT` and `CMD_ENCODER_EVENT` always carry the **currently-displayed
+sid** (the board's `g_active_sid` while in the terminal view). Picker-view
+input is consumed board-locally and is **not** forwarded over HID; only
+`CMD_SESSION_FOCUS` crosses the wire when the user confirms a selection.
 
 ## Session table
 
-The firmware owns a 256-slot session table indexed by sid. Allocation rules:
+The firmware owns a 256-slot session table indexed by sid. Allocation and
+liveness rules:
 
-- `CMD_REQUEST_SESSION` → linear-probe a free slot starting from `g_next_sid`.
+- `CMD_REQUEST_SESSION` → linear-probe a free slot starting from `g_next_sid`,
+  initialise `last_heartbeat_ms = now`, emit `session N state connected\n` on
+  the lcd_ui ctrl-out FIFO.
 - Pool full → evict the LRU slot, send `CMD_SESSION_INVALID(RECLAIMED)` for
   the old sid first, then `CMD_SESSION_RESPONSE(CREATED)` for the new owner.
+- `CMD_SESSION_HEARTBEAT` → touch `last_heartbeat_ms` and clear the
+  `disconnected` flag (re-emits `session N state connected\n` if recovering).
 - `CMD_VT100_STREAM` for an unknown sid → reply `CMD_SESSION_INVALID(INVALID)`,
-  drop the payload.
-- Any traffic for a known sid touches its `last_active_ms`.
+  drop the payload. `sid == 0` is no longer accepted (the legacy dashboard JSON
+  side channel has been retired; the board renders the grid from its own table).
+- `CMD_STATUS_UPDATE` payload[0] is parsed as a `SessionState` byte; stored on
+  the entry and mirrored to lcd_ui as `session N state X\n`.
 
-Long-term TTL expiry is handled by the host daemon; the firmware only enforces
-the LRU pressure when the pool is full.
+Heartbeat reaper, run every ~1s in the main loop:
+
+- `now − last_heartbeat_ms ≥ 30 s` and not yet flagged → mark
+  `disconnected = true`, set `state_byte = DISCONNECTED`, emit
+  `session N state disconnected\n` to lcd_ui, send
+  `CMD_SESSION_INVALID(sid, EXPIRED)` to host so it stops streaming.
+- `now − last_heartbeat_ms ≥ 60 s` (already disconnected) → free the slot,
+  emit `session N removed\n`, drop `g_active_sid` / `g_selected_sid` if they
+  pointed at it.
+
+## ui-ctrl FIFO (lcd_ui → hid_input)
+
+`--ui-ctrl-in PATH` opens a FIFO that `aikb_lcd_ui` writes line-oriented
+commands to. The grammar is intentionally tiny:
+
+```text
+view picker          # board entered the session picker
+view terminal        # board returned to the terminal view
+select N             # picker highlight moved to sid N
+focus N              # picker confirmed sid N — board emits CMD_SESSION_FOCUS
+                     # and switches g_view back to BOARD_VIEW_TERMINAL
+```
+
+The reverse direction (`--ctrl-out`, hid_input → lcd_ui) carries the existing
+`cell W H` line plus the new session-table notifications:
+
+```text
+session N state X    # X ∈ {connected, disconnected, run, wait, done, error}
+session N removed    # entry was freed by the 60 s GC
+```
 
 ## Screen FIFO
 
@@ -103,8 +153,9 @@ ENC_BTN DOWN
 cat /tmp/aikb_hid_input.log
 ```
 
-If the encoder direction is reversed on the final hardware, start with
-`--reverse`.
+The encoder emits one `CMD_ENCODER_EVENT` after two valid quadrature edges,
+which matches the current mechanical encoder used on the test board. If the
+encoder direction is reversed on the final hardware, start with `--reverse`.
 
 ## Host-side validation
 

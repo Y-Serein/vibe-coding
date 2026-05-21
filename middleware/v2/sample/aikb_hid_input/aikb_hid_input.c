@@ -38,15 +38,19 @@
 #define PINMUX_BASE 0x03001000u
 #define PINMUX_PAGE_SIZE 0x1000u
 #define GPIOA_BASE 0x03020000u
+#define GPIOE_BASE 0x05021000u
 #define GPIO_PAGE_SIZE 0x1000u
+#define IOBLK_RTC_BASE 0x05027000u
+#define IOBLK_RTC_PAGE_SIZE 0x1000u
 
 #define GPIO_SWPORTA_DDR 0x04u
 #define GPIO_EXT_PORTA 0x50u
 
 #define IOBLK_PULL_UP_BIT BIT_U32(2)
 #define IOBLK_PULL_DOWN_BIT BIT_U32(3)
+#define IOBLK_NONE 0u
 #define PINMUX_FUNC_MASK 0x7u
-#define PINMUX_FUNC_GPIOA 0x3u
+#define PINMUX_FUNC_GPIO 0x3u
 
 /* HID transport parameters — must match the gadget descriptor in
  * buildroot/board/cvitek/SG200X/overlay/etc/init.d/S08usbdev. */
@@ -62,10 +66,12 @@
 #define CMD_REQUEST_SESSION 0x01
 #define CMD_SESSION_RESPONSE 0x02
 #define CMD_SESSION_INVALID 0x03
+#define CMD_SESSION_HEARTBEAT 0x04   /* H->B every 10s per live sid; touch last_hb */
+#define CMD_SESSION_FOCUS 0x05       /* B->H when board selects a sid */
 #define CMD_KEY_EVENT 0x10
 #define CMD_ENCODER_EVENT 0x11
-#define CMD_WINDOW_SWITCH 0x20
-#define CMD_WINDOW_ACTIVATE 0x21
+#define CMD_WINDOW_SWITCH 0x20       /* deprecated: board ignores */
+#define CMD_WINDOW_ACTIVATE 0x21     /* deprecated: board ignores */
 #define CMD_VT100_STREAM 0x30
 #define CMD_UI_SCALE_CHANGE 0x40
 #define CMD_STATUS_UPDATE 0x50
@@ -79,10 +85,33 @@
 #define SESSION_EXPIRED 0x03
 #define SESSION_POOL_FULL 0x04
 #define SESSION_RECLAIMED 0x05
+#define SESSION_DISCONNECTED 0x06
+
+/* State bytes carried in CMD_STATUS_UPDATE payload[0]. Board grid shows the
+ * latest value for each sid (in addition to the heartbeat-derived CONNECTED /
+ * DISCONNECTED indicator). */
+#define SESSION_STATE_CONNECTED 0x00
+#define SESSION_STATE_DISCONNECTED 0x01
+#define SESSION_STATE_RUN 0x02
+#define SESSION_STATE_WAIT 0x03
+#define SESSION_STATE_DONE 0x04
+#define SESSION_STATE_ERROR 0x05
+
+/* Heartbeat policy: 30s without CMD_SESSION_HEARTBEAT marks DISCONNECTED;
+ * 60s without it frees the slot. */
+#define SESSION_HEARTBEAT_TIMEOUT_MS 30000u
+#define SESSION_GC_TIMEOUT_MS 60000u
 
 #define SESSION_BROADCAST 0u
 #define MAX_SESSIONS 256
 #define PLUGIN_HINT_MAX 24
+#define KEY_COUNT 7
+#define ENCODER_STEPS_PER_EVENT 2
+
+enum gpio_bank {
+	GPIO_BANK_A,
+	GPIO_BANK_E,
+};
 
 struct mmio_page {
 	uint32_t base;
@@ -92,9 +121,11 @@ struct mmio_page {
 
 struct pin_def {
 	const char *name;
+	enum gpio_bank bank;
 	uint8_t gpio_bit;
 	uint32_t pinmux_addr;
 	uint32_t ioblk_addr;
+	uint32_t ioblk_alt_addr;
 };
 
 struct debouncer {
@@ -108,6 +139,7 @@ struct config {
 	const char *screen_out_path;
 	const char *ctrl_out_path;
 	const char *event_out_path;
+	const char *ui_ctrl_in_path;
 	unsigned poll_ms;
 	unsigned debounce_ms;
 	bool debug;
@@ -117,26 +149,45 @@ struct config {
 
 struct session_entry {
 	bool used;
+	bool disconnected;
+	uint8_t state_byte;          /* last SESSION_STATE_* received from host */
 	uint64_t last_active_ms;
+	uint64_t last_heartbeat_ms;
 	char plugin_hint[PLUGIN_HINT_MAX];
 };
 
+/* View state owned by aikb_lcd_ui; mirrored here so KEY/ENC HID upstream knows
+ * which sid to stamp on each event. lcd_ui announces transitions via the
+ * --ui-ctrl-in FIFO (lines: "view picker|terminal", "select N", "focus N"). */
+enum board_view {
+	BOARD_VIEW_TERMINAL = 0,
+	BOARD_VIEW_PICKER = 1,
+};
+
+static enum board_view g_view = BOARD_VIEW_TERMINAL;
+static uint16_t g_active_sid = 0;    /* terminal view: sid whose VT100 we render */
+static uint16_t g_selected_sid = 0;  /* picker view: sid currently highlighted */
+
 static const struct pin_def g_keys[] = {
-	{ "key0_A15", 15, 0x03001020u, 0x03001908u },
-	{ "key1_A24", 24, 0x03001040u, 0x03001928u },
-	{ "key2_A23", 23, 0x0300103cu, 0x03001924u },
+	{ "key0_P19", GPIO_BANK_E, 19, 0x030010d4u, 0x05027090u, 0x0502705cu },
+	{ "key1_A22", GPIO_BANK_A, 22, 0x03001050u, 0x0300191cu, IOBLK_NONE },
+	{ "key2_A25", GPIO_BANK_A, 25, 0x03001054u, 0x03001920u, IOBLK_NONE },
+	{ "key3_A27", GPIO_BANK_A, 27, 0x03001058u, 0x03001924u, IOBLK_NONE },
+	{ "key4_A23", GPIO_BANK_A, 23, 0x0300105cu, 0x03001928u, IOBLK_NONE },
+	{ "key5_A24", GPIO_BANK_A, 24, 0x03001060u, 0x0300192cu, IOBLK_NONE },
+	{ "key6_A15", GPIO_BANK_A, 15, 0x0300103cu, 0x03001908u, IOBLK_NONE },
 };
 
 static const struct pin_def g_enc_a = {
-	"encA_A27", 27, 0x03001038u, 0x03001920u
+	"encA_P22", GPIO_BANK_E, 22, 0x030010e0u, 0x0502709cu, 0x05027068u
 };
 
 static const struct pin_def g_enc_b = {
-	"encB_A25", 25, 0x03001034u, 0x0300191cu
+	"encB_P23", GPIO_BANK_E, 23, 0x030010e4u, 0x050270a0u, 0x0502706cu
 };
 
 static const struct pin_def g_enc_e = {
-	"encE_A22", 22, 0x03001030u, 0x03001918u
+	"encE_P21", GPIO_BANK_E, 21, 0x030010dcu, 0x05027098u, 0x05027064u
 };
 
 static volatile sig_atomic_t g_stop;
@@ -212,52 +263,118 @@ static void mmio_write32(struct mmio_page *page, uint32_t addr, uint32_t val)
 	*mmio_reg(page, addr) = val;
 }
 
-static void configure_pin(struct mmio_page *pinmux, const struct pin_def *pin,
-			  bool debug)
+static struct mmio_page *ioblk_page_for_pin(struct mmio_page *pinmux,
+					    struct mmio_page *rtc_ioblk,
+					    const struct pin_def *pin)
 {
-	uint32_t mux = mmio_read32(pinmux, pin->pinmux_addr);
-	uint32_t ioblk = mmio_read32(pinmux, pin->ioblk_addr);
+	if (pin->ioblk_addr >= IOBLK_RTC_BASE &&
+	    pin->ioblk_addr < IOBLK_RTC_BASE + IOBLK_RTC_PAGE_SIZE)
+		return rtc_ioblk;
+	return pinmux;
+}
 
-	mux = (mux & ~PINMUX_FUNC_MASK) | PINMUX_FUNC_GPIOA;
+static const char *gpio_bank_name(enum gpio_bank bank)
+{
+	return bank == GPIO_BANK_E ? "E" : "A";
+}
+
+static uint32_t enable_pin_pull_up(struct mmio_page *pinmux,
+				   struct mmio_page *rtc_ioblk,
+				   uint32_t addr)
+{
+	struct pin_def tmp = {
+		.ioblk_addr = addr,
+	};
+	struct mmio_page *ioblk_page;
+	uint32_t ioblk;
+
+	ioblk_page = ioblk_page_for_pin(pinmux, rtc_ioblk, &tmp);
+	ioblk = mmio_read32(ioblk_page, addr);
 	ioblk |= IOBLK_PULL_UP_BIT;
 	ioblk &= ~IOBLK_PULL_DOWN_BIT;
+	mmio_write32(ioblk_page, addr, ioblk);
+	return ioblk;
+}
+
+static void configure_pin(struct mmio_page *pinmux,
+			  struct mmio_page *rtc_ioblk,
+			  const struct pin_def *pin, bool debug)
+{
+	uint32_t mux = mmio_read32(pinmux, pin->pinmux_addr);
+	uint32_t ioblk = 0;
+	uint32_t ioblk_alt = 0;
+
+	mux = (mux & ~PINMUX_FUNC_MASK) | PINMUX_FUNC_GPIO;
 
 	mmio_write32(pinmux, pin->pinmux_addr, mux);
-	mmio_write32(pinmux, pin->ioblk_addr, ioblk);
+	if (pin->ioblk_addr != IOBLK_NONE)
+		ioblk = enable_pin_pull_up(pinmux, rtc_ioblk, pin->ioblk_addr);
+	if (pin->ioblk_alt_addr != IOBLK_NONE)
+		ioblk_alt = enable_pin_pull_up(pinmux, rtc_ioblk,
+					       pin->ioblk_alt_addr);
 
 	if (debug) {
-		fprintf(stderr,
-			"aikb_hid_input: %-9s gpio=A%u pinmux=0x%08x ioblk=0x%08x\n",
-			pin->name, pin->gpio_bit, mux, ioblk);
+		if (pin->ioblk_addr == IOBLK_NONE) {
+			fprintf(stderr,
+				"aikb_hid_input: %-9s gpio=%s%u pinmux=0x%08x ioblk=n/a\n",
+				pin->name, gpio_bank_name(pin->bank), pin->gpio_bit,
+				mux);
+		} else if (pin->ioblk_alt_addr != IOBLK_NONE) {
+			fprintf(stderr,
+				"aikb_hid_input: %-9s gpio=%s%u pinmux=0x%08x ioblk=0x%08x alt=0x%08x\n",
+				pin->name, gpio_bank_name(pin->bank), pin->gpio_bit,
+				mux, ioblk, ioblk_alt);
+		} else {
+			fprintf(stderr,
+				"aikb_hid_input: %-9s gpio=%s%u pinmux=0x%08x ioblk=0x%08x\n",
+				pin->name, gpio_bank_name(pin->bank), pin->gpio_bit,
+				mux, ioblk);
+		}
 	}
 }
 
-static int configure_board_inputs(struct mmio_page *pinmux,
-				  struct mmio_page *gpio, bool debug)
+static void configure_gpio_input(struct mmio_page *gpio, uint32_t gpio_base,
+				 uint32_t mask, const char *name, bool debug)
 {
-	uint32_t mask = 0;
-	uint32_t ddr;
+	uint32_t ddr = mmio_read32(gpio, gpio_base + GPIO_SWPORTA_DDR);
+
+	ddr &= ~mask;
+	mmio_write32(gpio, gpio_base + GPIO_SWPORTA_DDR, ddr);
+
+	if (debug)
+		fprintf(stderr,
+			"aikb_hid_input: GPIO%s_DDR=0x%08x input_mask=0x%08x\n",
+			name, ddr, mask);
+}
+
+static int configure_board_inputs(struct mmio_page *pinmux,
+				  struct mmio_page *rtc_ioblk,
+				  struct mmio_page *gpio_a,
+				  struct mmio_page *gpio_e, bool debug)
+{
+	uint32_t mask_a = 0;
+	uint32_t mask_e = 0;
 	size_t i;
 
 	for (i = 0; i < ARRAY_SIZE(g_keys); i++) {
-		configure_pin(pinmux, &g_keys[i], debug);
-		mask |= BIT_U32(g_keys[i].gpio_bit);
+		configure_pin(pinmux, rtc_ioblk, &g_keys[i], debug);
+		if (g_keys[i].bank == GPIO_BANK_E)
+			mask_e |= BIT_U32(g_keys[i].gpio_bit);
+		else
+			mask_a |= BIT_U32(g_keys[i].gpio_bit);
 	}
 
-	configure_pin(pinmux, &g_enc_a, debug);
-	configure_pin(pinmux, &g_enc_b, debug);
-	configure_pin(pinmux, &g_enc_e, debug);
-	mask |= BIT_U32(g_enc_a.gpio_bit);
-	mask |= BIT_U32(g_enc_b.gpio_bit);
-	mask |= BIT_U32(g_enc_e.gpio_bit);
+	configure_pin(pinmux, rtc_ioblk, &g_enc_a, debug);
+	configure_pin(pinmux, rtc_ioblk, &g_enc_b, debug);
+	configure_pin(pinmux, rtc_ioblk, &g_enc_e, debug);
+	mask_e |= BIT_U32(g_enc_a.gpio_bit);
+	mask_e |= BIT_U32(g_enc_b.gpio_bit);
+	mask_e |= BIT_U32(g_enc_e.gpio_bit);
 
-	ddr = mmio_read32(gpio, GPIOA_BASE + GPIO_SWPORTA_DDR);
-	ddr &= ~mask;
-	mmio_write32(gpio, GPIOA_BASE + GPIO_SWPORTA_DDR, ddr);
-
-	if (debug)
-		fprintf(stderr, "aikb_hid_input: GPIOA_DDR=0x%08x input_mask=0x%08x\n",
-			ddr, mask);
+	if (mask_a)
+		configure_gpio_input(gpio_a, GPIOA_BASE, mask_a, "A", debug);
+	if (mask_e)
+		configure_gpio_input(gpio_e, GPIOE_BASE, mask_e, "E", debug);
 
 	return 0;
 }
@@ -267,9 +384,16 @@ static bool gpio_level(uint32_t ext_port, uint8_t bit)
 	return (ext_port & BIT_U32(bit)) != 0;
 }
 
-static bool active_low_pressed(uint32_t ext_port, uint8_t bit)
+static bool pin_level(const struct pin_def *pin, uint32_t ext_a, uint32_t ext_e)
 {
-	return !gpio_level(ext_port, bit);
+	uint32_t ext_port = pin->bank == GPIO_BANK_E ? ext_e : ext_a;
+
+	return gpio_level(ext_port, pin->gpio_bit);
+}
+
+static bool pin_pressed(const struct pin_def *pin, uint32_t ext_a, uint32_t ext_e)
+{
+	return !pin_level(pin, ext_a, ext_e);
 }
 
 static void debounce_init(struct debouncer *d, bool raw, uint64_t now)
@@ -296,19 +420,15 @@ static bool debounce_update(struct debouncer *d, bool raw, uint64_t now,
 	return false;
 }
 
-static uint8_t build_key_bits(const struct debouncer keys[3],
-			      const struct debouncer *enc_sw)
+static uint8_t build_key_bits(const struct debouncer keys[KEY_COUNT])
 {
 	uint8_t bits = 0;
 	size_t i;
 
-	for (i = 0; i < 3; i++) {
+	for (i = 0; i < KEY_COUNT; i++) {
 		if (keys[i].stable)
 			bits |= (uint8_t)(1u << i);
 	}
-
-	if (enc_sw->stable)
-		bits |= 0x80u;
 
 	return bits;
 }
@@ -429,7 +549,10 @@ static uint16_t alloc_session(const uint8_t *hint, uint16_t hint_len,
 			g_next_sid = 1;
 		if (!g_sessions[sid].used) {
 			g_sessions[sid].used = true;
+			g_sessions[sid].disconnected = false;
+			g_sessions[sid].state_byte = SESSION_STATE_CONNECTED;
 			g_sessions[sid].last_active_ms = now;
+			g_sessions[sid].last_heartbeat_ms = now;
 			copy_hint(&g_sessions[sid], hint, hint_len);
 			return sid;
 		}
@@ -440,9 +563,26 @@ static uint16_t alloc_session(const uint8_t *hint, uint16_t hint_len,
 		return 0;
 
 	*evicted_out = lru;
+	g_sessions[lru].used = true;
+	g_sessions[lru].disconnected = false;
+	g_sessions[lru].state_byte = SESSION_STATE_CONNECTED;
 	g_sessions[lru].last_active_ms = now;
+	g_sessions[lru].last_heartbeat_ms = now;
 	copy_hint(&g_sessions[lru], hint, hint_len);
 	return lru;
+}
+
+static const char *session_state_name(uint8_t state)
+{
+	switch (state) {
+	case SESSION_STATE_CONNECTED:    return "connected";
+	case SESSION_STATE_DISCONNECTED: return "disconnected";
+	case SESSION_STATE_RUN:          return "run";
+	case SESSION_STATE_WAIT:         return "wait";
+	case SESSION_STATE_DONE:         return "done";
+	case SESSION_STATE_ERROR:        return "error";
+	default:                         return "unknown";
+	}
 }
 
 /* ----------------------------------------------------------- screen output */
@@ -527,13 +667,19 @@ static int write_screen_bytes(int *screen_fd, const char *path,
 
 /* ----------------------------------------------------------- input reports */
 
-static int send_key_event(int hid_fd, uint8_t key_bits, bool debug)
+static int send_key_event(int hid_fd, uint16_t sid, uint8_t key_bits,
+			  bool enc_pressed, bool debug)
 {
+	uint8_t payload[2] = {
+		key_bits,
+		enc_pressed ? 0x01u : 0x00u,
+	};
+
 	return send_hid_packet(hid_fd, REPORT_ID_HOST_BOUND, CMD_KEY_EVENT,
-			       SESSION_BROADCAST, &key_bits, 1, debug);
+			       sid, payload, sizeof(payload), debug);
 }
 
-static int send_encoder_event(int hid_fd, int delta, bool debug)
+static int send_encoder_event(int hid_fd, uint16_t sid, int delta, bool debug)
 {
 	uint8_t payload;
 
@@ -543,7 +689,13 @@ static int send_encoder_event(int hid_fd, int delta, bool debug)
 		delta = -127;
 	payload = (uint8_t)(int8_t)delta;
 	return send_hid_packet(hid_fd, REPORT_ID_HOST_BOUND, CMD_ENCODER_EVENT,
-			       SESSION_BROADCAST, &payload, 1, debug);
+			       sid, &payload, 1, debug);
+}
+
+static int send_session_focus(int hid_fd, uint16_t sid, bool debug)
+{
+	return send_hid_packet(hid_fd, REPORT_ID_HOST_BOUND, CMD_SESSION_FOCUS,
+			       sid, NULL, 0, debug);
 }
 
 static int write_event_line(int *event_fd, const char *path, const char *line,
@@ -559,24 +711,29 @@ static int write_event_line(int *event_fd, const char *path, const char *line,
 }
 
 static void emit_key_down_events(int *event_fd, const struct config *cfg,
-				 uint8_t old_bits, uint8_t new_bits)
+				 uint8_t old_bits, uint8_t new_bits,
+				 bool old_enc_pressed, bool new_enc_pressed)
 {
-	static const char *key_lines[3] = {
+	static const char *key_lines[KEY_COUNT] = {
 		"KEY 0 DOWN\n",
 		"KEY 1 DOWN\n",
 		"KEY 2 DOWN\n",
+		"KEY 3 DOWN\n",
+		"KEY 4 DOWN\n",
+		"KEY 5 DOWN\n",
+		"KEY 6 DOWN\n",
 	};
 
 	if (!cfg->event_out_path)
 		return;
-	for (size_t i = 0; i < 3; i++) {
+	for (size_t i = 0; i < KEY_COUNT; i++) {
 		uint8_t bit = (uint8_t)(1u << i);
 
 		if ((new_bits & bit) && !(old_bits & bit))
 			(void)write_event_line(event_fd, cfg->event_out_path,
 					       key_lines[i], cfg->debug);
 	}
-	if ((new_bits & 0x80u) && !(old_bits & 0x80u))
+	if (new_enc_pressed && !old_enc_pressed)
 		(void)write_event_line(event_fd, cfg->event_out_path,
 				       "ENC_BTN DOWN\n", cfg->debug);
 }
@@ -599,6 +756,30 @@ static void emit_encoder_events(int *event_fd, const struct config *cfg,
 				       cfg->debug);
 		delta++;
 	}
+}
+
+static void log_input_snapshot(uint32_t ext_a, uint32_t ext_e, uint8_t key_bits,
+			       bool enc_pressed, unsigned enc_state, int delta)
+{
+	bool any = false;
+
+	fprintf(stderr,
+		"aikb_hid_input: gpio ext_a=0x%08x ext_e=0x%08x keys=0x%02x enc_btn=%u enc_ab=%u delta=%d pressed=",
+		ext_a, ext_e, key_bits, enc_pressed ? 1u : 0u, enc_state,
+		delta);
+	for (size_t i = 0; i < ARRAY_SIZE(g_keys); i++) {
+		if (!(key_bits & (uint8_t)(1u << i)))
+			continue;
+		fprintf(stderr, "%s%s", any ? "," : "", g_keys[i].name);
+		any = true;
+	}
+	if (enc_pressed) {
+		fprintf(stderr, "%s%s", any ? "," : "", g_enc_e.name);
+		any = true;
+	}
+	if (!any)
+		fprintf(stderr, "none");
+	fprintf(stderr, "\n");
 }
 
 /* ---------------------------------------------------------- packet handler */
@@ -636,6 +817,37 @@ static int write_ctrl_line(int *ctrl_fd, const char *path, const char *line,
 		off += (size_t)n;
 	}
 	return 0;
+}
+
+/* Write a "session N state X" / "session N removed" line to the ctrl-out FIFO
+ * so aikb_lcd_ui can mirror the board-side session table into its grid. */
+static void emit_session_state_line(int *ctrl_fd, const struct config *cfg,
+				    uint16_t sid)
+{
+	char line[48];
+	int n;
+
+	if (!cfg->ctrl_out_path || sid == 0)
+		return;
+	n = snprintf(line, sizeof(line), "session %u state %s\n", sid,
+		     session_state_name(g_sessions[sid].state_byte));
+	if (n > 0 && n < (int)sizeof(line))
+		(void)write_ctrl_line(ctrl_fd, cfg->ctrl_out_path, line,
+				      cfg->debug);
+}
+
+static void emit_session_removed_line(int *ctrl_fd, const struct config *cfg,
+				      uint16_t sid)
+{
+	char line[32];
+	int n;
+
+	if (!cfg->ctrl_out_path || sid == 0)
+		return;
+	n = snprintf(line, sizeof(line), "session %u removed\n", sid);
+	if (n > 0 && n < (int)sizeof(line))
+		(void)write_ctrl_line(ctrl_fd, cfg->ctrl_out_path, line,
+				      cfg->debug);
 }
 
 static void handle_packet(int hid_fd, int *screen_fd, int *ctrl_fd,
@@ -685,12 +897,18 @@ static void handle_packet(int hid_fd, int *screen_fd, int *ctrl_fd,
 			(void)send_hid_packet(hid_fd, REPORT_ID_HOST_BOUND,
 					      CMD_SESSION_INVALID, evicted,
 					      &st, 1, cfg->debug);
+			emit_session_removed_line(ctrl_fd, cfg, evicted);
+			if (g_active_sid == evicted)
+				g_active_sid = 0;
+			if (g_selected_sid == evicted)
+				g_selected_sid = 0;
 		}
 		if (new_sid != 0) {
 			uint8_t st = SESSION_CREATED;
 			(void)send_hid_packet(hid_fd, REPORT_ID_HOST_BOUND,
 					      CMD_SESSION_RESPONSE, new_sid,
 					      &st, 1, cfg->debug);
+			emit_session_state_line(ctrl_fd, cfg, new_sid);
 		} else {
 			uint8_t st = SESSION_POOL_FULL;
 			(void)send_hid_packet(hid_fd, REPORT_ID_HOST_BOUND,
@@ -701,6 +919,26 @@ static void handle_packet(int hid_fd, int *screen_fd, int *ctrl_fd,
 		break;
 	}
 
+	case CMD_SESSION_HEARTBEAT:
+		if (!session_alive(sid)) {
+			/* Host thinks this sid lives, but board has already freed
+			 * it. Tell host so it stops the heartbeat thread. */
+			uint8_t st = SESSION_INVALID_S;
+			(void)send_hid_packet(hid_fd, REPORT_ID_HOST_BOUND,
+					      CMD_SESSION_INVALID, sid, &st, 1,
+					      cfg->debug);
+			break;
+		}
+		g_sessions[sid].last_heartbeat_ms = now;
+		g_sessions[sid].last_active_ms = now;
+		if (g_sessions[sid].disconnected) {
+			g_sessions[sid].disconnected = false;
+			if (g_sessions[sid].state_byte == SESSION_STATE_DISCONNECTED)
+				g_sessions[sid].state_byte = SESSION_STATE_CONNECTED;
+			emit_session_state_line(ctrl_fd, cfg, sid);
+		}
+		break;
+
 	case CMD_VT100_STREAM:
 		if (!session_alive(sid)) {
 			uint8_t st = SESSION_INVALID_S;
@@ -710,6 +948,9 @@ static void handle_packet(int hid_fd, int *screen_fd, int *ctrl_fd,
 			break;
 		}
 		touch_session(sid, now);
+		/* Stream gate: only the focused window's bytes reach the screen. */
+		if (sid != g_active_sid)
+			break;
 		if (cfg->screen_out_path && plen > 0) {
 			(void)write_screen_bytes(screen_fd, cfg->screen_out_path,
 						 payload, plen, cfg->debug);
@@ -717,9 +958,17 @@ static void handle_packet(int hid_fd, int *screen_fd, int *ctrl_fd,
 		break;
 
 	case CMD_STATUS_UPDATE:
-		if (session_alive(sid))
-			touch_session(sid, now);
-		/* Status payload is opaque to firmware; the host owns its meaning. */
+		if (!session_alive(sid))
+			break;
+		touch_session(sid, now);
+		if (plen >= 1) {
+			uint8_t st = payload[0];
+			if (st <= SESSION_STATE_ERROR &&
+			    g_sessions[sid].state_byte != st) {
+				g_sessions[sid].state_byte = st;
+				emit_session_state_line(ctrl_fd, cfg, sid);
+			}
+		}
 		break;
 
 	case CMD_UI_SCALE_CHANGE:
@@ -748,12 +997,11 @@ static void handle_packet(int hid_fd, int *screen_fd, int *ctrl_fd,
 
 	case CMD_WINDOW_SWITCH:
 	case CMD_WINDOW_ACTIVATE:
-		/* Multi-window routing lives in the host daemon for now. The
-		 * firmware will gain real handlers once aikb_lcd_ui learns to
-		 * keep multiple buffers. */
+		/* Deprecated: board owns its own UI. Host cannot drive view
+		 * transitions any more. */
 		if (cfg->debug) {
 			fprintf(stderr,
-				"aikb_hid_input: cmd 0x%02x sid=%u (no-op in firmware)\n",
+				"aikb_hid_input: ignored deprecated cmd 0x%02x sid=%u\n",
 				cmd, sid);
 		}
 		break;
@@ -788,6 +1036,171 @@ static void drain_packets(int hid_fd, int *screen_fd, int *ctrl_fd,
 	}
 }
 
+/* Read aikb_lcd_ui's --ui-ctrl-out FIFO and apply view / select / focus
+ * commands. lcd_ui is the source of truth for the picker state machine;
+ * aikb_hid_input only mirrors enough to stamp the right sid on outgoing
+ * key/encoder events and to forward CMD_SESSION_FOCUS to the host. */
+static int open_ui_ctrl_in(const char *path, bool debug)
+{
+	int flags = O_RDONLY | O_NONBLOCK | O_CLOEXEC;
+	struct stat st;
+	int fd;
+
+	if (!path)
+		return -1;
+	if (stat(path, &st) < 0) {
+		if (errno == ENOENT) {
+			if (mkfifo(path, 0600) != 0 && errno != EEXIST) {
+				if (debug)
+					fprintf(stderr,
+						"aikb_hid_input: mkfifo %s failed: %s\n",
+						path, strerror(errno));
+				return -1;
+			}
+		}
+	}
+	fd = open(path, flags);
+	if (fd < 0 && debug) {
+		fprintf(stderr, "aikb_hid_input: waiting for ui-ctrl-in %s: %s\n",
+			path, strerror(errno));
+	}
+	return fd;
+}
+
+static void apply_ui_ctrl_line(int hid_fd, int *ctrl_fd,
+			       const struct config *cfg, const char *line)
+{
+	unsigned val;
+
+	if (!line[0])
+		return;
+	if (!strcmp(line, "view picker")) {
+		g_view = BOARD_VIEW_PICKER;
+		return;
+	}
+	if (!strcmp(line, "view terminal")) {
+		g_view = BOARD_VIEW_TERMINAL;
+		return;
+	}
+	if (sscanf(line, "select %u", &val) == 1) {
+		if (val == 0 || val > MAX_SESSIONS) {
+			g_selected_sid = 0;
+			return;
+		}
+		g_selected_sid = (uint16_t)val;
+		return;
+	}
+	if (sscanf(line, "focus %u", &val) == 1) {
+		if (val == 0 || val > MAX_SESSIONS ||
+		    !g_sessions[val].used ||
+		    g_sessions[val].disconnected) {
+			if (cfg->debug)
+				fprintf(stderr,
+					"aikb_hid_input: focus %u rejected (not alive)\n",
+					val);
+			return;
+		}
+		g_active_sid = (uint16_t)val;
+		g_view = BOARD_VIEW_TERMINAL;
+		g_sessions[val].last_active_ms = now_ms();
+		if (hid_fd >= 0)
+			(void)send_session_focus(hid_fd, (uint16_t)val,
+						 cfg->debug);
+		(void)ctrl_fd;
+		return;
+	}
+	if (cfg->debug)
+		fprintf(stderr, "aikb_hid_input: ignored ui-ctrl line: %s\n", line);
+}
+
+static void drain_ui_ctrl(int *ui_ctrl_fd, int hid_fd, int *ctrl_fd,
+			  const struct config *cfg)
+{
+	static char buf[128];
+	static size_t len;
+	char tmp[128];
+	ssize_t n;
+
+	if (!cfg->ui_ctrl_in_path)
+		return;
+	if (*ui_ctrl_fd < 0) {
+		*ui_ctrl_fd = open_ui_ctrl_in(cfg->ui_ctrl_in_path, cfg->debug);
+		if (*ui_ctrl_fd < 0)
+			return;
+	}
+	for (;;) {
+		n = read(*ui_ctrl_fd, tmp, sizeof(tmp));
+		if (n < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+				return;
+			if (cfg->debug)
+				fprintf(stderr,
+					"aikb_hid_input: ui-ctrl read failed: %s\n",
+					strerror(errno));
+			close(*ui_ctrl_fd);
+			*ui_ctrl_fd = -1;
+			return;
+		}
+		if (n == 0)
+			return;
+		for (ssize_t i = 0; i < n; i++) {
+			char ch = tmp[i];
+
+			if (ch == '\r')
+				continue;
+			if (ch == '\n') {
+				buf[len] = '\0';
+				if (len > 0)
+					apply_ui_ctrl_line(hid_fd, ctrl_fd, cfg, buf);
+				len = 0;
+			} else if (len + 1 < sizeof(buf)) {
+				buf[len++] = ch;
+			} else {
+				len = 0;
+			}
+		}
+	}
+}
+
+/* Heartbeat reaper. 30s without CMD_SESSION_HEARTBEAT marks a session
+ * DISCONNECTED (notify host + lcd_ui); 60s frees the slot entirely. */
+static void reap_sessions(int hid_fd, int *ctrl_fd, const struct config *cfg,
+			  uint64_t now)
+{
+	uint16_t sid;
+
+	for (sid = 1; sid <= MAX_SESSIONS; sid++) {
+		struct session_entry *e = &g_sessions[sid];
+		uint64_t silent;
+
+		if (!e->used)
+			continue;
+		silent = now - e->last_heartbeat_ms;
+		if (!e->disconnected && silent >= SESSION_HEARTBEAT_TIMEOUT_MS) {
+			uint8_t st = SESSION_EXPIRED;
+
+			e->disconnected = true;
+			e->state_byte = SESSION_STATE_DISCONNECTED;
+			emit_session_state_line(ctrl_fd, cfg, sid);
+			if (hid_fd >= 0)
+				(void)send_hid_packet(hid_fd, REPORT_ID_HOST_BOUND,
+						      CMD_SESSION_INVALID, sid,
+						      &st, 1, cfg->debug);
+		}
+		if (e->disconnected && silent >= SESSION_GC_TIMEOUT_MS) {
+			e->used = false;
+			e->disconnected = false;
+			e->state_byte = SESSION_STATE_CONNECTED;
+			e->plugin_hint[0] = '\0';
+			emit_session_removed_line(ctrl_fd, cfg, sid);
+			if (g_active_sid == sid)
+				g_active_sid = 0;
+			if (g_selected_sid == sid)
+				g_selected_sid = 0;
+		}
+	}
+}
+
 /* -------------------------------------------------------------- arg parser */
 
 static void usage(FILE *out)
@@ -795,6 +1208,7 @@ static void usage(FILE *out)
 	fprintf(out,
 		"Usage: aikb_hid_input [--hid PATH] [--screen-out PATH]\n"
 		"                      [--ctrl-out PATH] [--event-out PATH]\n"
+		"                      [--ui-ctrl-in PATH]\n"
 		"                      [--poll-ms N] [--debounce-ms N]\n"
 		"                      [--reverse] [--debug] [--no-hid]\n");
 }
@@ -820,6 +1234,7 @@ static int parse_args(int argc, char **argv, struct config *cfg)
 	cfg->screen_out_path = NULL;
 	cfg->ctrl_out_path = NULL;
 	cfg->event_out_path = NULL;
+	cfg->ui_ctrl_in_path = NULL;
 	cfg->poll_ms = 2;
 	cfg->debounce_ms = 12;
 	cfg->debug = false;
@@ -835,6 +1250,8 @@ static int parse_args(int argc, char **argv, struct config *cfg)
 			cfg->ctrl_out_path = argv[++i];
 		} else if (strcmp(argv[i], "--event-out") == 0 && i + 1 < argc) {
 			cfg->event_out_path = argv[++i];
+		} else if (strcmp(argv[i], "--ui-ctrl-in") == 0 && i + 1 < argc) {
+			cfg->ui_ctrl_in_path = argv[++i];
 		} else if (strcmp(argv[i], "--poll-ms") == 0 && i + 1 < argc) {
 			if (parse_uint(argv[++i], &cfg->poll_ms) != 0)
 				return -1;
@@ -874,23 +1291,31 @@ int main(int argc, char **argv)
 	};
 	struct config cfg;
 	struct mmio_page pinmux = { 0 };
-	struct mmio_page gpio = { 0 };
-	struct debouncer keys[3];
+	struct mmio_page rtc_ioblk = { 0 };
+	struct mmio_page gpio_a = { 0 };
+	struct mmio_page gpio_e = { 0 };
+	struct debouncer keys[KEY_COUNT];
 	struct debouncer enc_sw;
 	uint64_t next_hid_try_ms = 0;
-	uint32_t ext_port;
+	uint32_t ext_a;
+	uint32_t ext_e;
 	unsigned enc_state;
 	int enc_acc = 0;
 	int pending_delta = 0;
 	int event_delta_pending = 0;
-	bool keys_dirty = true;
+	bool keys_dirty = false;
 	uint8_t key_bits;
+	uint8_t hid_prev_key_bits = 0;
 	uint8_t event_prev_key_bits = 0;
+	bool hid_prev_enc_pressed = false;
+	bool event_prev_enc_pressed = false;
 	int mem_fd = -1;
 	int hid_fd = -1;
 	int screen_fd = -1;
 	int ctrl_fd = -1;
 	int event_fd = -1;
+	int ui_ctrl_fd = -1;
+	uint64_t next_reap_ms = 0;
 	size_t i;
 
 	if (parse_args(argc, argv, &cfg) != 0)
@@ -909,27 +1334,36 @@ int main(int argc, char **argv)
 
 	if (mmio_map(mem_fd, &pinmux, PAGE_ALIGN_DOWN(PINMUX_BASE, 4096),
 		     PINMUX_PAGE_SIZE) != 0 ||
-	    mmio_map(mem_fd, &gpio, PAGE_ALIGN_DOWN(GPIOA_BASE, 4096),
+	    mmio_map(mem_fd, &rtc_ioblk, PAGE_ALIGN_DOWN(IOBLK_RTC_BASE, 4096),
+		     IOBLK_RTC_PAGE_SIZE) != 0 ||
+	    mmio_map(mem_fd, &gpio_a, PAGE_ALIGN_DOWN(GPIOA_BASE, 4096),
+		     GPIO_PAGE_SIZE) != 0 ||
+	    mmio_map(mem_fd, &gpio_e, PAGE_ALIGN_DOWN(GPIOE_BASE, 4096),
 		     GPIO_PAGE_SIZE) != 0) {
 		mmio_unmap(&pinmux);
-		mmio_unmap(&gpio);
+		mmio_unmap(&rtc_ioblk);
+		mmio_unmap(&gpio_a);
+		mmio_unmap(&gpio_e);
 		close(mem_fd);
 		return 1;
 	}
 
-	configure_board_inputs(&pinmux, &gpio, cfg.debug);
+	configure_board_inputs(&pinmux, &rtc_ioblk, &gpio_a, &gpio_e,
+			       cfg.debug);
 
-	ext_port = mmio_read32(&gpio, GPIOA_BASE + GPIO_EXT_PORTA);
+	ext_a = mmio_read32(&gpio_a, GPIOA_BASE + GPIO_EXT_PORTA);
+	ext_e = mmio_read32(&gpio_e, GPIOE_BASE + GPIO_EXT_PORTA);
 	for (i = 0; i < ARRAY_SIZE(g_keys); i++) {
-		debounce_init(&keys[i],
-			      active_low_pressed(ext_port, g_keys[i].gpio_bit),
+		debounce_init(&keys[i], pin_pressed(&g_keys[i], ext_a, ext_e),
 			      now_ms());
 	}
-	debounce_init(&enc_sw, active_low_pressed(ext_port, g_enc_e.gpio_bit),
-		      now_ms());
-	enc_state = (gpio_level(ext_port, g_enc_a.gpio_bit) ? 2u : 0u) |
-		    (gpio_level(ext_port, g_enc_b.gpio_bit) ? 1u : 0u);
-	event_prev_key_bits = build_key_bits(keys, &enc_sw);
+	debounce_init(&enc_sw, pin_pressed(&g_enc_e, ext_a, ext_e), now_ms());
+	enc_state = (pin_level(&g_enc_a, ext_a, ext_e) ? 2u : 0u) |
+		    (pin_level(&g_enc_b, ext_a, ext_e) ? 1u : 0u);
+	hid_prev_key_bits = build_key_bits(keys);
+	hid_prev_enc_pressed = enc_sw.stable;
+	event_prev_key_bits = build_key_bits(keys);
+	event_prev_enc_pressed = enc_sw.stable;
 
 	while (!g_stop) {
 		uint64_t now = now_ms();
@@ -945,27 +1379,31 @@ int main(int argc, char **argv)
 				}
 				next_hid_try_ms = now + 1000u;
 			} else {
-				keys_dirty = true;
-				if (cfg.debug)
+				hid_prev_key_bits = build_key_bits(keys);
+				hid_prev_enc_pressed = enc_sw.stable;
+				keys_dirty = false;
+				pending_delta = 0;
+				if (cfg.debug) {
 					fprintf(stderr, "aikb_hid_input: opened %s\n",
 						cfg.hid_path);
+				}
 			}
 		}
 
-		ext_port = mmio_read32(&gpio, GPIOA_BASE + GPIO_EXT_PORTA);
+		ext_a = mmio_read32(&gpio_a, GPIOA_BASE + GPIO_EXT_PORTA);
+		ext_e = mmio_read32(&gpio_e, GPIOE_BASE + GPIO_EXT_PORTA);
 		for (i = 0; i < ARRAY_SIZE(g_keys); i++) {
-			bool raw = active_low_pressed(ext_port, g_keys[i].gpio_bit);
+			bool raw = pin_pressed(&g_keys[i], ext_a, ext_e);
 			if (debounce_update(&keys[i], raw, now, cfg.debounce_ms))
 				keys_dirty = true;
 		}
-		if (debounce_update(&enc_sw,
-				    active_low_pressed(ext_port, g_enc_e.gpio_bit),
+		if (debounce_update(&enc_sw, pin_pressed(&g_enc_e, ext_a, ext_e),
 				    now, cfg.debounce_ms)) {
 			keys_dirty = true;
 		}
 
-		new_enc_state = (gpio_level(ext_port, g_enc_a.gpio_bit) ? 2u : 0u) |
-				(gpio_level(ext_port, g_enc_b.gpio_bit) ? 1u : 0u);
+		new_enc_state = (pin_level(&g_enc_a, ext_a, ext_e) ? 2u : 0u) |
+				(pin_level(&g_enc_b, ext_a, ext_e) ? 1u : 0u);
 		if (new_enc_state != enc_state) {
 			int step = qdec[(enc_state << 2) | new_enc_state];
 			if (cfg.reverse)
@@ -973,15 +1411,15 @@ int main(int argc, char **argv)
 			enc_acc += step;
 			enc_state = new_enc_state;
 
-			while (enc_acc >= 4) {
+			while (enc_acc >= ENCODER_STEPS_PER_EVENT) {
 				pending_delta++;
 				event_delta_pending++;
-				enc_acc -= 4;
+				enc_acc -= ENCODER_STEPS_PER_EVENT;
 			}
-			while (enc_acc <= -4) {
+			while (enc_acc <= -ENCODER_STEPS_PER_EVENT) {
 				pending_delta--;
 				event_delta_pending--;
-				enc_acc += 4;
+				enc_acc += ENCODER_STEPS_PER_EVENT;
 			}
 		}
 
@@ -996,10 +1434,12 @@ int main(int argc, char **argv)
 			event_delta_pending = -127;
 
 		if (keys_dirty) {
-			key_bits = build_key_bits(keys, &enc_sw);
+			key_bits = build_key_bits(keys);
 			emit_key_down_events(&event_fd, &cfg, event_prev_key_bits,
-					     key_bits);
+					     key_bits, event_prev_enc_pressed,
+					     enc_sw.stable);
 			event_prev_key_bits = key_bits;
+			event_prev_enc_pressed = enc_sw.stable;
 		}
 		if (event_delta_pending) {
 			emit_encoder_events(&event_fd, &cfg, event_delta_pending);
@@ -1009,27 +1449,60 @@ int main(int argc, char **argv)
 		if (hid_fd >= 0)
 			drain_packets(hid_fd, &screen_fd, &ctrl_fd, &cfg);
 
+		drain_ui_ctrl(&ui_ctrl_fd, hid_fd, &ctrl_fd, &cfg);
+
+		if (now >= next_reap_ms) {
+			reap_sessions(hid_fd, &ctrl_fd, &cfg, now);
+			next_reap_ms = now + 1000u;
+		}
+
+		if (cfg.debug && (keys_dirty || pending_delta)) {
+			key_bits = build_key_bits(keys);
+			log_input_snapshot(ext_a, ext_e, key_bits,
+					   enc_sw.stable, new_enc_state,
+					   pending_delta);
+		}
+
 		if (cfg.no_hid) {
-			if (cfg.debug && (keys_dirty || pending_delta)) {
-				key_bits = build_key_bits(keys, &enc_sw);
-				fprintf(stderr,
-					"aikb_hid_input: no-hid keys=0x%02x delta=%d\n",
-					key_bits, pending_delta);
-			}
 			keys_dirty = false;
 			pending_delta = 0;
 		} else if (hid_fd >= 0) {
 			int rc = 0;
+			/* Per Board/Host contract: KEY/ENCODER events MUST carry
+			 * the currently-displayed sid, and picker-view input is
+			 * board-local (no HID emission). */
+			bool send_to_host = (g_view == BOARD_VIEW_TERMINAL) &&
+					     g_active_sid != 0;
+			uint16_t event_sid = g_active_sid;
 
 			if (keys_dirty) {
-				key_bits = build_key_bits(keys, &enc_sw);
-				rc = send_key_event(hid_fd, key_bits, cfg.debug);
-				if (rc == 0)
+				uint8_t pressed_bits;
+				bool enc_pressed_event;
+
+				key_bits = build_key_bits(keys);
+				pressed_bits = key_bits & (uint8_t)~hid_prev_key_bits;
+				enc_pressed_event =
+					enc_sw.stable && !hid_prev_enc_pressed;
+				if (send_to_host &&
+				    (pressed_bits || enc_pressed_event)) {
+					rc = send_key_event(hid_fd, event_sid,
+							    pressed_bits,
+							    enc_pressed_event,
+							    cfg.debug);
+				}
+				if (rc == 0) {
+					hid_prev_key_bits = key_bits;
+					hid_prev_enc_pressed = enc_sw.stable;
 					keys_dirty = false;
+				}
 			}
 
 			if (rc == 0 && pending_delta) {
-				rc = send_encoder_event(hid_fd, pending_delta, cfg.debug);
+				if (send_to_host) {
+					rc = send_encoder_event(hid_fd, event_sid,
+								pending_delta,
+								cfg.debug);
+				}
 				if (rc == 0)
 					pending_delta = 0;
 			}
@@ -1057,8 +1530,12 @@ int main(int argc, char **argv)
 		close(ctrl_fd);
 	if (event_fd >= 0)
 		close(event_fd);
+	if (ui_ctrl_fd >= 0)
+		close(ui_ctrl_fd);
 	mmio_unmap(&pinmux);
-	mmio_unmap(&gpio);
+	mmio_unmap(&rtc_ioblk);
+	mmio_unmap(&gpio_a);
+	mmio_unmap(&gpio_e);
 	close(mem_fd);
 
 	return 0;

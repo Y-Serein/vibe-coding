@@ -87,6 +87,9 @@ enum app_view {
 	VIEW_TERMINAL,
 	VIEW_DASHBOARD,
 	VIEW_PET,
+	/* Diagnostic-only local picker. Normal SESSION handling is owned by
+	 * the host daemon so the board cannot display stale built-in rows. */
+	VIEW_SESSION_PICKER,
 };
 
 enum pet_mood {
@@ -96,6 +99,66 @@ enum pet_mood {
 	PET_REVIEWING,
 	PET_ERROR,
 	PET_SLEEP,
+};
+
+enum pet_scene {
+	PET_SCENE_ASKING,
+	PET_SCENE_UPDATING,
+	PET_SCENE_LISTENING,
+	PET_SCENE_FAULT,
+	PET_SCENE_STANDBY,
+	PET_SCENE_COUNT,
+};
+
+/* Per-key UI action: when aikb_hid_input emits "KEY N DOWN", show the
+ * matching label and pick the pet scene that should decorate the next host
+ * panel. Order is HID bit index, which mirrors aikb_hid_input's "KEY N"
+ * naming (KEY 0 = bit 0). Encoder push is host-owned and is intentionally
+ * not listed here, so it cannot locally flip VOICE into ASKING. */
+#define KEY_OVERLAY_DURATION_MS 8000u
+struct key_action {
+	const char       *event_line;
+	const char       *label;
+	enum pet_scene    scene;
+};
+static const struct key_action KEY_ACTIONS[] = {
+	{"KEY 0 DOWN",   "REJECT",  PET_SCENE_FAULT},
+	{"KEY 1 DOWN",   "VOICE",   PET_SCENE_LISTENING},
+	{"KEY 2 DOWN",   "SESSION", PET_SCENE_ASKING},
+	{"KEY 3 DOWN",   "REVIEW",  PET_SCENE_ASKING},
+	{"KEY 4 DOWN",   "MODEL",   PET_SCENE_UPDATING},
+	{"KEY 5 DOWN",   "MULTI",   PET_SCENE_ASKING},
+	{"KEY 6 DOWN",   "CONFIRM", PET_SCENE_UPDATING},
+};
+
+struct key_overlay {
+	char     label[16];
+	uint64_t expires_at_ms;
+	bool     active;
+};
+static struct key_overlay g_key_overlay;
+
+/* Set true the first time the host pushes any terminal byte. Used by the
+ * terminal view to fall back to a "WAITING FOR HOST TERMINAL STREAM" hint
+ * before any data has arrived (e.g. user picked a session via SESSION
+ * picker but the host hasn't streamed VT100 yet). */
+static bool g_terminal_has_data;
+
+enum pet_pose {
+	PET_POSE_IDLE,
+	PET_POSE_THINKING,
+	PET_POSE_HAPPY,
+	PET_POSE_CONFUSED,
+	PET_POSE_SLEEPY,
+	PET_POSE_COUNT,
+};
+
+enum pet_emotion {
+	PET_EMOTION_CALM,
+	PET_EMOTION_CURIOUS,
+	PET_EMOTION_HAPPY,
+	PET_EMOTION_CONFUSED,
+	PET_EMOTION_SLEEPY,
 };
 
 enum term_state {
@@ -144,6 +207,7 @@ static int g_rows;
  */
 static uint32_t *g_splash;
 static bool g_show_splash;
+static uint32_t *g_ui_shell;
 
 /*
  * Animations: --boot-anim and --wait-anim each take an "AKIM" container
@@ -152,13 +216,26 @@ static bool g_show_splash;
  *
  * Render priority: g_boot_anim (one-shot, plays first) > g_wait_anim (loops,
  * picks up after boot anim ends) > splash fallback > terminal/dashboard.
- * The first byte on the input FIFO releases both anim slots and the splash.
+ * Host bytes alone do not release these animations; a board key or explicit
+ * view change does, so the host cannot steal the startup/sleep surface.
  */
 #define ANIM_MAGIC_STR  "AKIM"
 #define ANIM_FLAG_LOOP  0x1u
 #define PET_AKIM_FLAG_ARGB8888 0x2u
 #ifndef PET_ASKING_AKIM_PATH
 #define PET_ASKING_AKIM_PATH "/mnt/system/usr/share/aikb/pet/asking.akim"
+#endif
+#ifndef PET_UPDATING_AKIM_PATH
+#define PET_UPDATING_AKIM_PATH "/mnt/system/usr/share/aikb/pet/updating.akim"
+#endif
+#ifndef PET_LISTENING_AKIM_PATH
+#define PET_LISTENING_AKIM_PATH "/mnt/system/usr/share/aikb/pet/listening.akim"
+#endif
+#ifndef PET_FAULT_AKIM_PATH
+#define PET_FAULT_AKIM_PATH "/mnt/system/usr/share/aikb/pet/fault.akim"
+#endif
+#ifndef PET_STANDBY_AKIM_PATH
+#define PET_STANDBY_AKIM_PATH "/mnt/system/usr/share/aikb/pet/standby.akim"
 #endif
 struct anim_header {
 	char     magic[4];
@@ -178,12 +255,22 @@ struct anim_state {
 	struct timespec  started_at;
 	bool             active;
 	bool             loop;
+	bool             argb8888;
 	const char      *label; /* for warnf */
 };
 static struct anim_state g_boot_anim = { .label = "boot-anim" };
 static struct anim_state g_wait_anim = { .label = "wait-anim" };
-static struct anim_state g_pet_asking_anim = { .label = "pet-asking" };
-static bool g_pet_asking_argb8888;
+static struct anim_state g_pet_anims[PET_SCENE_COUNT] = {
+	[PET_SCENE_ASKING] = { .label = "pet-asking" },
+	[PET_SCENE_UPDATING] = { .label = "pet-updating" },
+	[PET_SCENE_LISTENING] = { .label = "pet-listening" },
+	[PET_SCENE_FAULT] = { .label = "pet-fault" },
+	[PET_SCENE_STANDBY] = { .label = "pet-standby" },
+};
+static bool g_pet_anim_argb8888[PET_SCENE_COUNT];
+static char g_pet_asset_root[256];
+static char g_pet_asset_paths[PET_SCENE_COUNT][256];
+static bool g_pet_force_fallback;
 
 static int find_cell_preset(int w, int h)
 {
@@ -256,15 +343,47 @@ struct ui_session {
 struct ui_model {
 	struct ui_session sessions[MAX_SESSIONS];
 	int count;
-	int focus;
+	int focus;        /* session currently shown in terminal/dashboard rows */
+	int picker_idx;   /* session highlighted in VIEW_SESSION_PICKER */
 	int active_count;
 	int avg_usage;
 	float total_spend;
 	char window[48];
 };
 
+/* Board-owned session table populated from aikb_hid_input's --ctrl-out lines
+ * (`session N state X`, `session N removed`). The picker view renders straight
+ * out of this table; only sid + state are shown. */
+#define MAX_BOARD_SESSIONS 16
+enum board_session_state {
+	BSS_CONNECTED = 0,
+	BSS_DISCONNECTED,
+	BSS_RUN,
+	BSS_WAIT,
+	BSS_DONE,
+	BSS_ERROR,
+};
+struct board_session {
+	bool used;
+	uint16_t sid;
+	enum board_session_state state;
+};
+static struct board_session g_board_sessions[MAX_BOARD_SESSIONS];
+static uint16_t g_lcd_selected_sid;   /* current highlight in picker */
+static uint16_t g_lcd_active_sid;     /* sid the user last focused (terminal view) */
+static int g_ui_ctrl_out_fd = -1;
+static const char *g_ui_ctrl_out_path;
+
+struct pet_animation_state {
+	enum pet_pose pose;
+	enum pet_emotion emotion;
+	uint64_t pose_started_ms;
+};
+
 struct pet_state {
 	enum pet_mood mood;
+	enum pet_scene scene;
+	struct pet_animation_state anim;
 	uint32_t frame_index;
 	uint64_t start_time_ms;
 	uint64_t last_interaction_ms;
@@ -272,6 +391,7 @@ struct pet_state {
 	int energy;
 	int affection;
 	int focus;
+	int progress;
 };
 
 struct fb_target {
@@ -308,6 +428,8 @@ static const uint32_t C_GRUVBOX_TEXT = 0xfbf1c7;
 static const uint32_t C_GRUVBOX_MUTED = 0xbdae93;
 static const uint32_t C_GRUVBOX_YELLOW = 0xfabd2f;
 static const uint32_t C_GRUVBOX_BLUE = 0x83a598;
+static const uint32_t C_GRUVBOX_GREEN = 0xb8bb26;
+static const uint32_t C_GRUVBOX_RED = 0xfb4934;
 
 static void on_signal(int sig)
 {
@@ -532,6 +654,40 @@ static void draw_text_right(struct canvas *c, int right, int y, const char *s,
 			    int scale, uint32_t color)
 {
 	draw_text(c, right - text_w(s, scale), y, s, scale, color);
+}
+
+static void key_overlay_show(const char *label)
+{
+	size_t n = strlen(label);
+	if (n >= sizeof(g_key_overlay.label))
+		n = sizeof(g_key_overlay.label) - 1;
+	memcpy(g_key_overlay.label, label, n);
+	g_key_overlay.label[n] = '\0';
+	g_key_overlay.expires_at_ms = monotonic_now_ms() + KEY_OVERLAY_DURATION_MS;
+	g_key_overlay.active = true;
+}
+
+static bool key_overlay_active(void)
+{
+	if (!g_key_overlay.active)
+		return false;
+	if (monotonic_now_ms() >= g_key_overlay.expires_at_ms) {
+		g_key_overlay.active = false;
+		return false;
+	}
+	return true;
+}
+
+/* Active key-overlay label, or NULL when no key was pressed recently.
+ * Used by render_dashboard / render_session_picker to swap their header
+ * title for the last key name (e.g. "REJECT" / "VOICE" / "MODEL") so
+ * users see key feedback in the existing title slot, without a separate
+ * overlay chip cluttering the screen. */
+static const char *key_overlay_label(void)
+{
+	if (!key_overlay_active())
+		return NULL;
+	return g_key_overlay.label;
 }
 
 static void uppercase_copy(char *dst, size_t dst_sz, const char *src)
@@ -1060,7 +1216,7 @@ static void terminal_seed_mock(struct terminal *t)
 	terminal_write_string(t,
 		"\x1b[2J\x1b[H"
 		"\x1b[1;38;2;156;220;254mAIKB VT100 terminal\x1b[0m\r\n"
-		"\x1b[38;2;163;190;140mClaude Code stream ready\x1b[0m  "
+		"\x1b[38;2;163;190;140mHost CLI stream ready\x1b[0m  "
 		"Type-C: /dev/ttyGS0\r\n"
 		"Powerline: "
 		"\x1b[38;2;255;255;255;48;2;47;111;159m AIKB "
@@ -1491,17 +1647,171 @@ static bool parse_pet_mood(const char *s, enum pet_mood *out)
 	return false;
 }
 
+static bool parse_pet_scene(const char *s, enum pet_scene *out)
+{
+	if (streq_ci(s, "ASKING")) {
+		*out = PET_SCENE_ASKING;
+		return true;
+	}
+	if (streq_ci(s, "UPDATING")) {
+		*out = PET_SCENE_UPDATING;
+		return true;
+	}
+	if (streq_ci(s, "LISTENING") || streq_ci(s, "LISTEN") ||
+	    streq_ci(s, "VOICE")) {
+		*out = PET_SCENE_LISTENING;
+		return true;
+	}
+	if (streq_ci(s, "FAULT") || streq_ci(s, "ERROR")) {
+		*out = PET_SCENE_FAULT;
+		return true;
+	}
+	if (streq_ci(s, "STANDBY")) {
+		*out = PET_SCENE_STANDBY;
+		return true;
+	}
+	return false;
+}
+
+static bool parse_pet_pose(const char *s, enum pet_pose *out)
+{
+	if (streq_ci(s, "IDLE")) {
+		*out = PET_POSE_IDLE;
+		return true;
+	}
+	if (streq_ci(s, "THINKING") || streq_ci(s, "THINK")) {
+		*out = PET_POSE_THINKING;
+		return true;
+	}
+	if (streq_ci(s, "HAPPY")) {
+		*out = PET_POSE_HAPPY;
+		return true;
+	}
+	if (streq_ci(s, "CONFUSED")) {
+		*out = PET_POSE_CONFUSED;
+		return true;
+	}
+	if (streq_ci(s, "SLEEPY") || streq_ci(s, "CALM")) {
+		*out = PET_POSE_SLEEPY;
+		return true;
+	}
+	return false;
+}
+
+static enum pet_emotion pet_emotion_from_pose(enum pet_pose pose)
+{
+	switch (pose) {
+	case PET_POSE_THINKING:
+		return PET_EMOTION_CURIOUS;
+	case PET_POSE_HAPPY:
+		return PET_EMOTION_HAPPY;
+	case PET_POSE_CONFUSED:
+		return PET_EMOTION_CONFUSED;
+	case PET_POSE_SLEEPY:
+		return PET_EMOTION_SLEEPY;
+	case PET_POSE_IDLE:
+	default:
+		return PET_EMOTION_CALM;
+	}
+}
+
+static void pet_set_pose(struct pet_state *p, enum pet_pose pose)
+{
+	p->anim.pose = pose;
+	p->anim.emotion = pet_emotion_from_pose(pose);
+	p->anim.pose_started_ms = monotonic_now_ms();
+}
+
+static enum pet_scene pet_scene_from_mood(enum pet_mood mood)
+{
+	switch (mood) {
+	case PET_CODING:
+	case PET_REVIEWING:
+		return PET_SCENE_UPDATING;
+	case PET_ERROR:
+		return PET_SCENE_FAULT;
+	case PET_SLEEP:
+		return PET_SCENE_STANDBY;
+	case PET_IDLE:
+	case PET_ASKING:
+	default:
+		break;
+	}
+	return PET_SCENE_ASKING;
+}
+
+static enum pet_mood pet_mood_from_scene(enum pet_scene scene)
+{
+	switch (scene) {
+	case PET_SCENE_UPDATING:
+		return PET_CODING;
+	case PET_SCENE_LISTENING:
+		return PET_IDLE;
+	case PET_SCENE_FAULT:
+		return PET_ERROR;
+	case PET_SCENE_STANDBY:
+		return PET_SLEEP;
+	case PET_SCENE_ASKING:
+	default:
+		return PET_ASKING;
+	}
+}
+
+static enum pet_pose pet_pose_from_scene(enum pet_scene scene)
+{
+	switch (scene) {
+	case PET_SCENE_LISTENING:
+	case PET_SCENE_UPDATING:
+		return PET_POSE_THINKING;
+	case PET_SCENE_FAULT:
+		return PET_POSE_CONFUSED;
+	case PET_SCENE_STANDBY:
+		return PET_POSE_SLEEPY;
+	case PET_SCENE_ASKING:
+	default:
+		return PET_POSE_THINKING;
+	}
+}
+
+static const char *pet_scene_default_message(enum pet_scene scene)
+{
+	switch (scene) {
+	case PET_SCENE_UPDATING:
+		return "DOWNLOADING...";
+	case PET_SCENE_LISTENING:
+		return "tiny dino is listening to your words";
+	case PET_SCENE_FAULT:
+		return "system fault detected";
+	case PET_SCENE_STANDBY:
+		return "all systems nominal";
+	case PET_SCENE_ASKING:
+	default:
+		return "waiting for your confirmation";
+	}
+}
+
 static void pet_set_message(struct pet_state *p, const char *msg)
 {
 	safe_copy(p->message, sizeof(p->message), msg);
+}
+
+static void pet_set_scene(struct pet_state *p, enum pet_scene scene,
+			  const char *msg)
+{
+	p->scene = scene;
+	p->mood = pet_mood_from_scene(scene);
+	pet_set_pose(p, pet_pose_from_scene(scene));
+	pet_set_message(p, msg ? msg : pet_scene_default_message(p->scene));
+	p->last_interaction_ms = monotonic_now_ms();
 }
 
 static void pet_set_mood(struct pet_state *p, enum pet_mood mood,
 			 const char *msg)
 {
 	p->mood = mood;
-	if (msg)
-		pet_set_message(p, msg);
+	p->scene = pet_scene_from_mood(mood);
+	pet_set_pose(p, pet_pose_from_scene(p->scene));
+	pet_set_message(p, msg ? msg : pet_scene_default_message(p->scene));
 }
 
 static int pet_clamp_pct(int v)
@@ -1517,12 +1827,17 @@ static void pet_init(struct pet_state *p)
 {
 	memset(p, 0, sizeof(*p));
 	p->mood = PET_ASKING;
+	p->scene = PET_SCENE_ASKING;
+	p->anim.pose = PET_POSE_THINKING;
+	p->anim.emotion = PET_EMOTION_CURIOUS;
 	p->start_time_ms = monotonic_now_ms();
 	p->last_interaction_ms = p->start_time_ms;
+	p->anim.pose_started_ms = p->start_time_ms;
 	p->energy = 72;
 	p->affection = 54;
 	p->focus = 66;
-	pet_set_message(p, "waiting for your confirmation");
+	p->progress = 58;
+	pet_set_message(p, pet_scene_default_message(p->scene));
 }
 
 static void pet_touch(struct pet_state *p)
@@ -1551,21 +1866,17 @@ static void pet_feed(struct pet_state *p)
 
 static void pet_cycle_mood(struct pet_state *p, int delta)
 {
-	int mood = (int)p->mood + (delta >= 0 ? 1 : -1);
-
-	if (mood < 0)
-		mood = PET_SLEEP;
-	if (mood > PET_SLEEP)
-		mood = PET_IDLE;
-	pet_set_mood(p, (enum pet_mood)mood, "local state changed");
-	p->last_interaction_ms = monotonic_now_ms();
+	(void)delta;
+	pet_set_scene(p, PET_SCENE_ASKING, NULL);
 }
 
 static void pet_apply_command(struct pet_state *p, const char *line)
 {
 	enum pet_mood mood;
+	enum pet_scene scene;
 	char arg[32];
 	const char *msg;
+	int progress;
 
 	if (strncmp(line, "PET ", 4) != 0)
 		return;
@@ -1576,6 +1887,22 @@ static void pet_apply_command(struct pet_state *p, const char *line)
 	if (sscanf(line, "MOOD %31s", arg) == 1) {
 		if (parse_pet_mood(arg, &mood))
 			pet_set_mood(p, mood, "mood updated from input");
+		return;
+	}
+	if (sscanf(line, "SCENE %31s", arg) == 1) {
+		if (parse_pet_scene(arg, &scene))
+			pet_set_scene(p, scene, NULL);
+		return;
+	}
+	if (sscanf(line, "POSE %31s", arg) == 1) {
+		enum pet_pose pose;
+
+		if (parse_pet_pose(arg, &pose))
+			pet_set_pose(p, pose);
+		return;
+	}
+	if (sscanf(line, "PROGRESS %d", &progress) == 1) {
+		p->progress = pet_clamp_pct(progress);
 		return;
 	}
 	if (strncmp(line, "MESSAGE ", 8) == 0) {
@@ -1616,11 +1943,11 @@ static void pet_apply_command(struct pet_state *p, const char *line)
 static void pet_apply_event_line(struct pet_state *p, const char *line)
 {
 	if (streq_ci(line, "KEY 0 DOWN")) {
-		pet_touch(p);
+		pet_set_scene(p, PET_SCENE_FAULT, "rejected");
 		return;
 	}
 	if (streq_ci(line, "KEY 1 DOWN")) {
-		pet_feed(p);
+		pet_set_scene(p, PET_SCENE_LISTENING, "speak now");
 		return;
 	}
 	if (streq_ci(line, "KEY 2 DOWN")) {
@@ -1675,74 +2002,124 @@ static void draw_pet_bullet(struct canvas *c, int x, int y, int size,
 	fill_rect(c, x, y + 2, size, size - 4, color);
 }
 
+static int pet_font_text_w(struct font_ctx *font, const char *s,
+			   int cell_w, int fallback_scale)
+{
+	return (int)strlen(s) * (font && font->ready && cell_w > 0 ? cell_w :
+		VIDEO_FONT_WIDTH * fallback_scale);
+}
+
+static void draw_pet_font_text(struct canvas *c, struct font_ctx *font,
+			       int x, int y, const char *s, int cell_w,
+			       int fallback_scale, uint32_t color)
+{
+	for (; *s; s++) {
+		if (font && font->ready &&
+		    font_draw_cp(c, font, x, y, cell_w,
+				 (unsigned char)*s, color, C_GRUVBOX_BG)) {
+			x += cell_w;
+			continue;
+		}
+		draw_char(c, x, y, (unsigned char)*s, fallback_scale, color);
+		x += VIDEO_FONT_WIDTH * fallback_scale;
+	}
+}
+
+static void draw_pet_font_center(struct canvas *c, struct font_ctx *font,
+				 int cx, int y, const char *s, int cell_w,
+				 int fallback_scale, uint32_t color)
+{
+	draw_pet_font_text(c, font,
+			   cx - pet_font_text_w(font, s, cell_w,
+						fallback_scale) / 2,
+			   y, s, cell_w, fallback_scale, color);
+}
+
+static void draw_pet_icon_map(struct canvas *c, int x, int y,
+			      const char *const *map, int rows,
+			      bool mirror, uint32_t color)
+{
+	for (int row = 0; row < rows; row++) {
+		int cols = (int)strlen(map[row]);
+
+		for (int col = 0; col < cols; col++) {
+			int sx = mirror ? cols - 1 - col : col;
+
+			if (map[row][sx] == '.')
+				continue;
+			fill_rect(c, x + col * 2, y + row * 2, 2, 2, color);
+		}
+	}
+}
+
 static void draw_pet_rotate_icon(struct canvas *c, int x, int y, bool right,
 				 uint32_t color)
 {
-	if (right) {
-		hline(c, x + 4, y + 5, 15, color);
-		hline(c, x + 4, y + 6, 15, color);
-		vline(c, x + 4, y + 7, 9, color);
-		hline(c, x + 7, y + 18, 11, color);
-		fill_rect(c, x + 17, y + 2, 3, 3, color);
-		fill_rect(c, x + 17, y + 7, 3, 3, color);
-		fill_rect(c, x + 20, y + 5, 4, 3, color);
-	} else {
-		hline(c, x + 9, y + 5, 15, color);
-		hline(c, x + 9, y + 6, 15, color);
-		vline(c, x + 23, y + 7, 9, color);
-		hline(c, x + 10, y + 18, 11, color);
-		fill_rect(c, x + 8, y + 2, 3, 3, color);
-		fill_rect(c, x + 8, y + 7, 3, 3, color);
-		fill_rect(c, x + 4, y + 5, 4, 3, color);
-	}
+	static const char *const map[] = {
+		"...######...",
+		"..##....##..",
+		".##......##.",
+		"##........#.",
+		"##......####",
+		"##.....#####",
+		"##......####",
+		"##........#.",
+		".##......##.",
+		"..##....##..",
+		"...######...",
+	};
+
+	draw_pet_icon_map(c, x, y + 1, map, (int)(sizeof(map) / sizeof(map[0])),
+			  !right, color);
 }
 
-static void draw_pet_down_icon(struct canvas *c, int x, int y, int scale,
-			       uint32_t color)
+static void draw_pet_down_icon(struct canvas *c, int x, int y, uint32_t color)
 {
-	int thick = scale * 2;
+	static const char *const map[] = {
+		".....###.....",
+		"....#####....",
+		"....#####....",
+		"....#####....",
+		"....#####....",
+		"....#####....",
+		"....#####....",
+		"..#########..",
+		"...#######...",
+		"....#####....",
+		".....###.....",
+		"......#......",
+	};
 
-	fill_rect(c, x + 12 * scale, y, thick, 16 * scale, color);
-	fill_rect(c, x + 6 * scale, y + 12 * scale, thick, 4 * scale, color);
-	fill_rect(c, x + 18 * scale, y + 12 * scale, thick, 4 * scale, color);
-	fill_rect(c, x + 8 * scale, y + 16 * scale, thick, 4 * scale, color);
-	fill_rect(c, x + 16 * scale, y + 16 * scale, thick, 4 * scale, color);
-	fill_rect(c, x + 10 * scale, y + 20 * scale, 8 * scale, thick, color);
+	draw_pet_icon_map(c, x, y, map, (int)(sizeof(map) / sizeof(map[0])),
+			  false, color);
 }
 
-static void draw_pet_menu_icon(struct canvas *c, int x, int y, int scale,
-			       uint32_t color)
+static void draw_pet_menu_icon(struct canvas *c, int x, int y, uint32_t color)
 {
-	int h = scale * 2;
-	int w = scale * 16;
-	int dot = scale * 3;
+	static const char *const map[] = {
+		".###########.",
+		"#############",
+		".###########.",
+		".............",
+		".###########.",
+		"#############",
+		".###########.",
+		".............",
+		".###########.",
+		"#############",
+		".###########.",
+	};
 
-	for (int i = 0; i < 3; i++) {
-		int yy = y + i * scale * 6;
-
-		fill_rect(c, x, yy, dot, dot, color);
-		fill_rect(c, x + scale * 6, yy + scale / 2, w, h, color);
-	}
-}
-
-static void draw_pet_temp(struct canvas *c, int x, int y, int scale)
-{
-	int dot = scale;
-
-	draw_text(c, x, y, "23", scale, C_GRUVBOX_BLUE);
-	fill_rect(c, x + 18 * scale, y + 2 * scale, dot * 2, dot,
-		  C_GRUVBOX_BLUE);
-	fill_rect(c, x + 17 * scale, y + 3 * scale, dot, dot * 2,
-		  C_GRUVBOX_BLUE);
-	fill_rect(c, x + 20 * scale, y + 3 * scale, dot, dot * 2,
-		  C_GRUVBOX_BLUE);
-	fill_rect(c, x + 18 * scale, y + 5 * scale, dot * 2, dot,
-		  C_GRUVBOX_BLUE);
-	draw_text(c, x + 26 * scale, y, "C", scale, C_GRUVBOX_BLUE);
+	draw_pet_icon_map(c, x, y, map, (int)(sizeof(map) / sizeof(map[0])),
+			  false, color);
 }
 
 #define PET_DINO_W 72
 #define PET_DINO_H 57
+#define PET_STAGE_X 190
+#define PET_STAGE_Y 64
+#define PET_STAGE_W 580
+#define PET_STAGE_H 192
 
 static const char *const PET_DINO_MAP[PET_DINO_H] = {
 	"........................................................................",
@@ -1804,6 +2181,136 @@ static const char *const PET_DINO_MAP[PET_DINO_H] = {
 	"........................................................................",
 };
 
+static const char *const PET_AKIM_PATHS[PET_SCENE_COUNT] = {
+	[PET_SCENE_ASKING] = PET_ASKING_AKIM_PATH,
+	[PET_SCENE_UPDATING] = PET_UPDATING_AKIM_PATH,
+	[PET_SCENE_LISTENING] = PET_LISTENING_AKIM_PATH,
+	[PET_SCENE_FAULT] = PET_FAULT_AKIM_PATH,
+	[PET_SCENE_STANDBY] = PET_STANDBY_AKIM_PATH,
+};
+
+struct pet_scene_asset_manifest {
+	enum pet_scene scene;
+	const char *state;
+	const char *resource_path;
+	uint32_t expected_frames;
+	uint32_t frame_duration_ms;
+};
+
+struct pet_pose_range {
+	const char *state;
+	uint32_t first;
+	uint32_t count;
+};
+
+struct pet_character {
+	const char *name;
+	const struct pet_pose_range *pose_ranges;
+	int pose_count;
+};
+
+static const struct pet_pose_range PET_CORE_POSE_RANGES[PET_POSE_COUNT] = {
+	[PET_POSE_IDLE] = { "idle", 0, 8 },
+	[PET_POSE_THINKING] = { "thinking", 8, 6 },
+	[PET_POSE_HAPPY] = { "happy", 14, 6 },
+	[PET_POSE_CONFUSED] = { "asking", 20, 6 },
+	[PET_POSE_SLEEPY] = { "sleep", 26, 6 },
+};
+
+static const struct pet_scene_asset_manifest PET_ASSET_MANIFEST[PET_SCENE_COUNT] = {
+	[PET_SCENE_ASKING] = {
+		.scene = PET_SCENE_ASKING,
+		.state = "asking",
+		.resource_path = PET_ASKING_AKIM_PATH,
+		.expected_frames = 32,
+		.frame_duration_ms = 120,
+	},
+	[PET_SCENE_UPDATING] = {
+		.scene = PET_SCENE_UPDATING,
+		.state = "updating",
+		.resource_path = PET_UPDATING_AKIM_PATH,
+		.expected_frames = 0,
+		.frame_duration_ms = 120,
+	},
+	[PET_SCENE_LISTENING] = {
+		.scene = PET_SCENE_LISTENING,
+		.state = "listening",
+		.resource_path = PET_LISTENING_AKIM_PATH,
+		.expected_frames = 0,
+		.frame_duration_ms = 120,
+	},
+	[PET_SCENE_FAULT] = {
+		.scene = PET_SCENE_FAULT,
+		.state = "fault",
+		.resource_path = PET_FAULT_AKIM_PATH,
+		.expected_frames = 0,
+		.frame_duration_ms = 120,
+	},
+	[PET_SCENE_STANDBY] = {
+		.scene = PET_SCENE_STANDBY,
+		.state = "standby",
+		.resource_path = PET_STANDBY_AKIM_PATH,
+		.expected_frames = 0,
+		.frame_duration_ms = 120,
+	},
+};
+
+static const struct pet_character PET_CORE_CHARACTER = {
+	.name = "vibe-coding-companion",
+	.pose_ranges = PET_CORE_POSE_RANGES,
+	.pose_count = PET_POSE_COUNT,
+};
+
+static const struct pet_scene_asset_manifest *pet_asset_manifest(enum pet_scene scene)
+{
+	if (scene < 0 || scene >= PET_SCENE_COUNT)
+		return NULL;
+	return &PET_ASSET_MANIFEST[scene];
+}
+
+static const char *pet_scene_name(enum pet_scene scene);
+static const char *pet_pose_name(enum pet_pose pose);
+
+static const char *pet_asset_path(enum pet_scene scene)
+{
+	if (scene < 0 || scene >= PET_SCENE_COUNT)
+		return NULL;
+	if (g_pet_asset_paths[scene][0])
+		return g_pet_asset_paths[scene];
+	return PET_AKIM_PATHS[scene];
+}
+
+static void pet_set_asset_root(const char *root)
+{
+	size_t len;
+
+	if (!root || !root[0])
+		return;
+	safe_copy(g_pet_asset_root, sizeof(g_pet_asset_root), root);
+	len = strlen(g_pet_asset_root);
+	while (len > 1 && g_pet_asset_root[len - 1] == '/') {
+		g_pet_asset_root[len - 1] = '\0';
+		len--;
+	}
+	for (int i = 0; i < PET_SCENE_COUNT; i++) {
+		const char *base = strrchr(PET_AKIM_PATHS[i], '/');
+		size_t root_len = strlen(g_pet_asset_root);
+		size_t base_len;
+		char *dst = g_pet_asset_paths[i];
+
+		base = base ? base + 1 : PET_AKIM_PATHS[i];
+		base_len = strlen(base);
+		if (root_len + 1u + base_len >= sizeof(g_pet_asset_paths[i])) {
+			warnf("pet asset root too long, ignoring %s", base);
+			dst[0] = '\0';
+			continue;
+		}
+		memcpy(dst, g_pet_asset_root, root_len);
+		dst[root_len] = '/';
+		memcpy(dst + root_len + 1u, base, base_len + 1u);
+	}
+}
+
 static uint32_t pet_dino_color(char ch)
 {
 	switch (ch) {
@@ -1830,15 +2337,8 @@ static uint32_t pet_dino_color(char ch)
 	}
 }
 
-static void draw_pet_sprite_fallback(struct canvas *c, const struct pet_state *p,
-				     uint32_t frame)
+static void draw_pet_dino_fallback(struct canvas *c, int ox, int oy, int scale)
 {
-	int scale = 3;
-	int ox = 330;
-	int oy = 86;
-
-	(void)p;
-	(void)frame;
 	for (int y = 0; y < PET_DINO_H; y++) {
 		const char *row = PET_DINO_MAP[y];
 
@@ -1854,15 +2354,12 @@ static void draw_pet_sprite_fallback(struct canvas *c, const struct pet_state *p
 }
 
 static void draw_pet_akim_frame(struct canvas *c, const struct anim_state *a,
-				bool argb8888)
+				bool argb8888, int box_x, int box_y,
+				int box_w, int box_h)
 {
 	struct anim_header hdr;
 	const uint8_t *frame;
 	size_t frame_bytes;
-	int box_x = 306;
-	int box_y = 84;
-	int box_w = 306;
-	int box_h = 176;
 	int scale;
 	int dst_w;
 	int dst_h;
@@ -1877,6 +2374,51 @@ static void draw_pet_akim_frame(struct canvas *c, const struct anim_state *a,
 	frame_bytes = (size_t)hdr.width * hdr.height * 4u;
 	frame = a->base + sizeof(struct anim_header) +
 		(size_t)a->frame_idx * frame_bytes;
+
+	/* If the sprite is bigger than the box (e.g. 320x170 standby sprite
+	 * placed into a 160x90 dashboard slot), shrink with nearest sampling
+	 * to fit while preserving aspect. Aspect-fit chooses the dimension
+	 * that hits the box edge first. */
+	if ((int)hdr.width > box_w || (int)hdr.height > box_h) {
+		int fit_w = box_w;
+		int fit_h = (int)hdr.height * box_w / (int)hdr.width;
+		if (fit_h > box_h) {
+			fit_h = box_h;
+			fit_w = (int)hdr.width * box_h / (int)hdr.height;
+		}
+		int sdx = box_x + (box_w - fit_w) / 2;
+		int sdy = box_y + (box_h - fit_h) / 2;
+		for (int yi = 0; yi < fit_h; yi++) {
+			int sy = yi * (int)hdr.height / fit_h;
+			for (int xi = 0; xi < fit_w; xi++) {
+				int sx = xi * (int)hdr.width / fit_w;
+				const uint8_t *p = frame + ((size_t)sy * hdr.width + sx) * 4u;
+				uint8_t r, g, b, alpha;
+				if (argb8888) {
+					b = p[0]; g = p[1]; r = p[2]; alpha = p[3];
+				} else {
+					r = p[0]; g = p[1]; b = p[2]; alpha = p[3];
+				}
+				if (!alpha)
+					continue;
+				int px_x = sdx + xi;
+				int px_y = sdy + yi;
+				if ((unsigned)px_x >= (unsigned)c->w ||
+				    (unsigned)px_y >= (unsigned)c->h)
+					continue;
+				uint32_t src = ((uint32_t)r << 16) |
+					       ((uint32_t)g << 8) | b;
+				if (alpha == 255)
+					c->px[px_y * c->w + px_x] = src;
+				else
+					c->px[px_y * c->w + px_x] =
+						blend_rgb(c->px[px_y * c->w + px_x],
+							  src, alpha);
+			}
+		}
+		return;
+	}
+
 	scale = box_w / (int)hdr.width;
 	if (box_h / (int)hdr.height < scale)
 		scale = box_h / (int)hdr.height;
@@ -1938,67 +2480,313 @@ static void draw_pet_akim_frame(struct canvas *c, const struct anim_state *a,
 	}
 }
 
-static void draw_pet_sprite(struct canvas *c, const struct pet_state *p,
-			    uint32_t frame)
+static bool draw_pet_scene_akim(struct canvas *c, enum pet_scene scene,
+				uint32_t frame, int box_x, int box_y,
+				int box_w, int box_h)
 {
-	if (p->mood == PET_ASKING && g_pet_asking_anim.active) {
-		uint32_t step;
+	struct anim_state *a;
+	uint32_t step;
 
-		step = (uint32_t)(((uint64_t)frame * 83u) /
-				  g_pet_asking_anim.frame_delay_ms);
-		g_pet_asking_anim.frame_idx = step % g_pet_asking_anim.frame_count;
-		draw_pet_akim_frame(c, &g_pet_asking_anim,
-				    g_pet_asking_argb8888);
-		return;
-	}
-	draw_pet_sprite_fallback(c, p, frame);
+	if (scene < 0 || scene >= PET_SCENE_COUNT)
+		return false;
+	a = &g_pet_anims[scene];
+	if (!a->active || !a->frame_count || !a->frame_delay_ms)
+		return false;
+	step = (uint32_t)(((uint64_t)frame * 83u) / a->frame_delay_ms);
+	a->frame_idx = step % a->frame_count;
+	draw_pet_akim_frame(c, a, g_pet_anim_argb8888[scene], box_x, box_y,
+			    box_w, box_h);
+	return true;
 }
 
-static void render_pet(struct canvas *c, struct pet_state *p)
+static bool pet_asking_akim_is_single_pose(const struct anim_state *a)
 {
-	uint64_t now_ms = monotonic_now_ms();
-	uint32_t elapsed = (uint32_t)(now_ms - p->start_time_ms);
-	uint32_t frame = elapsed / 83u;
-	char buf[96];
-	int seconds = (int)(elapsed / 1000u);
+	const struct pet_scene_asset_manifest *manifest =
+		&PET_ASSET_MANIFEST[PET_SCENE_ASKING];
 
-	p->frame_index = frame;
-	if (now_ms > p->last_interaction_ms + 120000u && p->mood == PET_IDLE)
-		p->mood = PET_SLEEP;
+	return a && a->active && a->frame_count &&
+		manifest->expected_frames &&
+		a->frame_count != manifest->expected_frames;
+}
 
-	draw_pet_background(c, frame);
-	draw_text(c, 22, 24, "ASKING", 1, C_GRUVBOX_YELLOW);
-	draw_text(c, 608, 24, "IDLE", 1, C_GRUVBOX_YELLOW);
-	draw_pet_bullet(c, 675, 29, 9, C_GRUVBOX_YELLOW);
-	snprintf(buf, sizeof(buf), "%02d:%02d:%02d", seconds / 3600,
+static bool pet_render_character_akim(struct canvas *c,
+				      const struct pet_state *p,
+				      uint32_t frame, int box_x, int box_y,
+				      int box_w, int box_h)
+{
+	const struct pet_pose_range *range;
+	struct anim_state *a = &g_pet_anims[PET_SCENE_ASKING];
+	uint32_t first;
+	uint32_t count;
+	uint32_t local;
+
+	if (!a->active || !a->frame_count || !a->frame_delay_ms)
+		return false;
+	if (p->anim.pose >= PET_POSE_COUNT)
+		return false;
+	range = &PET_CORE_CHARACTER.pose_ranges[p->anim.pose];
+	first = range->first;
+	count = range->count;
+	if (p->anim.pose == PET_POSE_CONFUSED &&
+	    pet_asking_akim_is_single_pose(a)) {
+		first = 0;
+		count = a->frame_count;
+	}
+	if (!count || first >= a->frame_count)
+		return false;
+	local = (uint32_t)(((uint64_t)frame * 83u) / a->frame_delay_ms);
+	a->frame_idx = first + (local % count);
+	if (a->frame_idx >= a->frame_count)
+		a->frame_idx = first;
+	draw_pet_akim_frame(c, a, g_pet_anim_argb8888[PET_SCENE_ASKING],
+			    box_x, box_y, box_w, box_h);
+	return true;
+}
+
+static bool pet_pose_wants_question(enum pet_pose pose)
+{
+	return pose == PET_POSE_THINKING || pose == PET_POSE_CONFUSED;
+}
+
+static void draw_pet_question_mark(struct canvas *c, uint32_t frame)
+{
+	int bob = (int)((frame / 8u) & 1u);
+
+	draw_text(c, 595, 106 + bob, "?", 8, C_GRUVBOX_YELLOW);
+}
+
+static void pet_update_animation(struct pet_state *p, uint64_t now_ms)
+{
+	if (p->scene == PET_SCENE_ASKING) {
+		uint64_t age = now_ms - p->anim.pose_started_ms;
+
+		if (p->anim.pose == PET_POSE_THINKING && age > 12000u)
+			pet_set_pose(p, PET_POSE_IDLE);
+	}
+}
+
+static void pet_render_character(struct canvas *c, const struct pet_state *p,
+				 uint32_t frame, int box_x, int box_y,
+				 int box_w, int box_h)
+{
+	if (!g_pet_force_fallback &&
+	    pet_render_character_akim(c, p, frame, box_x, box_y, box_w, box_h)) {
+		if (pet_pose_wants_question(p->anim.pose) &&
+		    !pet_asking_akim_is_single_pose(
+			    &g_pet_anims[PET_SCENE_ASKING]))
+			draw_pet_question_mark(c, frame);
+		return;
+	}
+
+	switch (p->anim.pose) {
+	case PET_POSE_HAPPY:
+		draw_pet_dino_fallback(c, 318, 92, 3);
+		draw_text(c, 620, 112, "!", 7, C_GRUVBOX_YELLOW);
+		break;
+	case PET_POSE_CONFUSED:
+		draw_pet_dino_fallback(c, 318, 92, 3);
+		draw_pet_question_mark(c, frame);
+		break;
+	case PET_POSE_SLEEPY:
+		draw_pet_dino_fallback(c, 330, 96, 2);
+		draw_text(c, 600, 104, "z", 3, C_GRUVBOX_MUTED);
+		break;
+	case PET_POSE_THINKING:
+	case PET_POSE_IDLE:
+	default:
+		draw_pet_dino_fallback(c, 318, 88, 3);
+		if (pet_pose_wants_question(p->anim.pose))
+			draw_pet_question_mark(c, frame);
+		break;
+	}
+}
+
+static const char *pet_header_left(enum pet_scene scene)
+{
+	switch (scene) {
+	case PET_SCENE_UPDATING:
+		return "UPDATING";
+	case PET_SCENE_LISTENING:
+		return "LISTEN";
+	case PET_SCENE_FAULT:
+		return "FAULT";
+	case PET_SCENE_STANDBY:
+		return "STANDBY";
+	case PET_SCENE_ASKING:
+	default:
+		return "ASKING";
+	}
+}
+
+static const char *pet_header_state(enum pet_scene scene)
+{
+	switch (scene) {
+	case PET_SCENE_UPDATING:
+		return "UPDATING";
+	case PET_SCENE_LISTENING:
+		return "LISTEN";
+	case PET_SCENE_STANDBY:
+		return "STANDBY";
+	case PET_SCENE_ASKING:
+	default:
+		return "IDLE";
+	}
+}
+
+static const char *pet_scene_title(enum pet_scene scene)
+{
+	switch (scene) {
+	case PET_SCENE_UPDATING:
+		return "[ OTA FIRMWARE UPDATE ]";
+	case PET_SCENE_LISTENING:
+		return "[ VOICE INPUT ]";
+	case PET_SCENE_FAULT:
+		return "[ OVERHEAT ]";
+	case PET_SCENE_STANDBY:
+		return "[ NO ACTIVE SESSION ]";
+	case PET_SCENE_ASKING:
+	default:
+		return "[  ASKING  ]";
+	}
+}
+
+static int pet_scene_title_scale(enum pet_scene scene)
+{
+	return scene == PET_SCENE_UPDATING ? 2 : 3;
+}
+
+static const char *pet_footer_hint(enum pet_scene scene)
+{
+	switch (scene) {
+	case PET_SCENE_LISTENING:
+		return "speak now";
+	case PET_SCENE_FAULT:
+		return "press to confirm";
+	default:
+		return "press any key";
+	}
+}
+
+static void draw_pet_progress_bar(struct canvas *c, int x, int y, int w, int h,
+				  int value, uint32_t color)
+{
+	int fill;
+
+	value = pet_clamp_pct(value);
+	stroke_rect(c, x, y, w, h, C_GRUVBOX_LINE);
+	fill_rect(c, x + 3, y + 3, w - 6, h - 6, C_GRUVBOX_DARK0);
+	fill = (w - 8) * value / 100;
+	fill_rect(c, x + 4, y + 4, fill, h - 8, color);
+}
+
+static void draw_pet_scene_visual(struct canvas *c, const struct pet_state *p,
+				  uint32_t frame)
+{
+	int box_x = PET_STAGE_X;
+	int box_y = PET_STAGE_Y;
+	int box_w = PET_STAGE_W;
+	int box_h = PET_STAGE_H;
+
+	if (p->scene != PET_SCENE_ASKING &&
+	    !g_pet_force_fallback &&
+	    draw_pet_scene_akim(c, p->scene, frame, box_x, box_y, box_w, box_h))
+		return;
+	pet_render_character(c, p, frame, box_x, box_y, box_w, box_h);
+}
+
+static void draw_pet_header(struct canvas *c, struct font_ctx *font,
+			    enum pet_scene scene, int seconds)
+{
+	char time_buf[16];
+	const char *left = key_overlay_label();
+
+	if (!left)
+		left = pet_header_left(scene);
+	draw_pet_font_text(c, font, 22, 16, left, 12, 2, C_GRUVBOX_YELLOW);
+	snprintf(time_buf, sizeof(time_buf), "%02d:%02d:%02d", seconds / 3600,
 		 (seconds / 60) % 60, seconds % 60);
-	draw_text(c, 712, 24, buf, 1, C_GRUVBOX_YELLOW);
-	draw_pet_bullet(c, 830, 29, 9, C_GRUVBOX_YELLOW);
-	draw_pet_temp(c, 870, 24, 1);
+
+	if (scene == PET_SCENE_FAULT) {
+		draw_pet_font_text(c, font, 570, 16, time_buf, 12, 2,
+				   C_GRUVBOX_YELLOW);
+		draw_pet_bullet(c, 718, 29, 9, C_GRUVBOX_YELLOW);
+		draw_pet_font_text(c, font, 744, 16, "1 alert", 12, 2,
+				   C_GRUVBOX_RED);
+		draw_pet_bullet(c, 872, 29, 9, C_GRUVBOX_RED);
+		draw_pet_font_text(c, font, 898, 16, "fault", 12, 2,
+				   C_GRUVBOX_RED);
+	} else {
+		draw_pet_font_text(c, font, 548, 16, pet_header_state(scene),
+				   12, 2, C_GRUVBOX_YELLOW);
+		draw_pet_bullet(c, 656, 29, 9, C_GRUVBOX_YELLOW);
+		draw_pet_font_text(c, font, 680, 16, time_buf, 12, 2,
+				   C_GRUVBOX_YELLOW);
+		draw_pet_bullet(c, 822, 29, 9, C_GRUVBOX_YELLOW);
+		draw_pet_font_text(c, font, 852, 16, "23 C", 12, 2,
+				   C_GRUVBOX_BLUE);
+	}
+
 	hline(c, 22, 54, UI_W - 44, C_GRUVBOX_LINE);
 	hline(c, 22, 55, UI_W - 44, C_GRUVBOX_DARK1);
+}
 
-	draw_pet_sprite(c, p, frame);
-
-	hline(c, 308, 247, 304, C_DIM);
-	hline(c, 336, 243, 248, C_LINE2);
-	draw_text(c, 324, 270, "[  ASKING  ]", 3, C_GRUVBOX_YELLOW);
-	draw_pet_bullet(c, 282, 314, 10, C_GRUVBOX_YELLOW);
-	draw_text(c, 304, 310, "waiting for your confirmation", 1,
-		  C_GRUVBOX_TEXT);
-	draw_pet_bullet(c, 670, 314, 10, C_GRUVBOX_YELLOW);
+static void draw_pet_footer(struct canvas *c, struct font_ctx *font,
+			    enum pet_scene scene)
+{
+	const char *hint = pet_footer_hint(scene);
 
 	hline(c, 22, 344, UI_W - 44, C_GRUVBOX_LINE);
 	hline(c, 22, 345, UI_W - 44, C_GRUVBOX_DARK1);
 	draw_pet_rotate_icon(c, 42, 362, false, C_GRUVBOX_YELLOW);
 	draw_pet_rotate_icon(c, 88, 362, true, C_GRUVBOX_YELLOW);
-	draw_text(c, 154, 368, "rotate view", 1, C_GRUVBOX_TEXT);
-	draw_text(c, 334, 368, "|", 1, C_GRUVBOX_MUTED);
-	draw_pet_down_icon(c, 392, 362, 1, C_GRUVBOX_YELLOW);
-	draw_text(c, 442, 368, "press any key", 1, C_GRUVBOX_TEXT);
-	draw_text(c, 662, 368, "|", 1, C_GRUVBOX_MUTED);
-	draw_text(c, 742, 368, "menu", 1, C_GRUVBOX_TEXT);
-	draw_pet_menu_icon(c, 822, 365, 1, C_GRUVBOX_YELLOW);
+	draw_pet_font_text(c, font, 140, 360, "rotate view", 12, 2,
+			   C_GRUVBOX_TEXT);
+	draw_pet_font_text(c, font, 332, 360, "|", 12, 2,
+			   C_GRUVBOX_MUTED);
+	draw_pet_down_icon(c, 392, 362, C_GRUVBOX_YELLOW);
+	draw_pet_font_text(c, font, 432, 360, hint, 12, 2,
+			   C_GRUVBOX_TEXT);
+	draw_pet_font_text(c, font, 662, 360, "|", 12, 2,
+			   C_GRUVBOX_MUTED);
+	draw_pet_font_text(c, font, 742, 360, "menu", 12, 2,
+			    C_GRUVBOX_TEXT);
+	draw_pet_menu_icon(c, 822, 365, C_GRUVBOX_YELLOW);
+}
+
+static void render_pet(struct canvas *c, struct font_ctx *font,
+		       struct pet_state *p)
+{
+	uint64_t now_ms = monotonic_now_ms();
+	uint32_t elapsed = (uint32_t)(now_ms - p->start_time_ms);
+	uint32_t frame = elapsed / 83u;
+	int seconds = (int)(elapsed / 1000u);
+	const char *message;
+
+	p->frame_index = frame;
+	pet_update_animation(p, now_ms);
+
+	draw_pet_background(c, frame);
+	draw_pet_header(c, font, p->scene, seconds);
+	draw_pet_scene_visual(c, p, frame);
+
+	hline(c, 326, 258, 308, C_DIM);
+	hline(c, 356, 254, 248, C_LINE2);
+	draw_pet_font_center(c, font, UI_W / 2, 280, pet_scene_title(p->scene),
+			     16, pet_scene_title_scale(p->scene),
+			     p->scene == PET_SCENE_FAULT ?
+			     C_GRUVBOX_RED : C_GRUVBOX_YELLOW);
+	message = p->message[0] ? p->message :
+		  pet_scene_default_message(p->scene);
+	if (p->scene == PET_SCENE_UPDATING) {
+		draw_pet_progress_bar(c, 330, 303, 300, 18, p->progress,
+				      C_GRUVBOX_GREEN);
+		draw_pet_bullet(c, 282, 326, 10, C_GRUVBOX_YELLOW);
+		draw_pet_font_center(c, font, UI_W / 2, 318, message, 12, 1,
+				     C_GRUVBOX_TEXT);
+		draw_pet_bullet(c, 670, 326, 10, C_GRUVBOX_YELLOW);
+	}
+
+	draw_pet_footer(c, font, p->scene);
 }
 
 static uint32_t state_color(const char *state)
@@ -2079,49 +2867,7 @@ static void format_time(char *buf, size_t buf_sz)
 static void model_set_mock(struct ui_model *m)
 {
 	memset(m, 0, sizeof(*m));
-	m->count = 3;
-	m->focus = 1;
-	m->active_count = 3;
-	m->avg_usage = 62;
-	m->total_spend = 41.20f;
-	safe_copy(m->window, sizeof(m->window), "5h rolling window");
-
-	safe_copy(m->sessions[0].id, sizeof(m->sessions[0].id), "SLAM");
-	safe_copy(m->sessions[0].session, sizeof(m->sessions[0].session), "SLAM");
-	safe_copy(m->sessions[0].tool, sizeof(m->sessions[0].tool), "Claude Code");
-	safe_copy(m->sessions[0].mode, sizeof(m->sessions[0].mode), "PLAN");
-	safe_copy(m->sessions[0].model, sizeof(m->sessions[0].model), "opus-4.7");
-	safe_copy(m->sessions[0].reset, sizeof(m->sessions[0].reset), "1h 09m");
-	safe_copy(m->sessions[0].state, sizeof(m->sessions[0].state), "RUN");
-	safe_copy(m->sessions[0].task, sizeof(m->sessions[0].task), "map alignment");
-	safe_copy(m->sessions[0].now, sizeof(m->sessions[0].now), "optimizing scan matcher");
-	m->sessions[0].cost = 12.40f;
-	m->sessions[0].usage = 63;
-
-	safe_copy(m->sessions[1].id, sizeof(m->sessions[1].id), "WEBAPI");
-	safe_copy(m->sessions[1].session, sizeof(m->sessions[1].session), "WEBAPI");
-	safe_copy(m->sessions[1].tool, sizeof(m->sessions[1].tool), "Codex");
-	safe_copy(m->sessions[1].mode, sizeof(m->sessions[1].mode), "AUTO");
-	safe_copy(m->sessions[1].model, sizeof(m->sessions[1].model), "gpt-4.1");
-	safe_copy(m->sessions[1].reset, sizeof(m->sessions[1].reset), "2h 31m");
-	safe_copy(m->sessions[1].state, sizeof(m->sessions[1].state), "WAIT");
-	safe_copy(m->sessions[1].task, sizeof(m->sessions[1].task), "API integration cleanup");
-	safe_copy(m->sessions[1].now, sizeof(m->sessions[1].now),
-		  "editing router and auth middleware");
-	m->sessions[1].cost = 23.10f;
-	m->sessions[1].usage = 42;
-
-	safe_copy(m->sessions[2].id, sizeof(m->sessions[2].id), "DOCS");
-	safe_copy(m->sessions[2].session, sizeof(m->sessions[2].session), "DOCS");
-	safe_copy(m->sessions[2].tool, sizeof(m->sessions[2].tool), "Claude Code");
-	safe_copy(m->sessions[2].mode, sizeof(m->sessions[2].mode), "REVIEW");
-	safe_copy(m->sessions[2].model, sizeof(m->sessions[2].model), "sonnet-3.7");
-	safe_copy(m->sessions[2].reset, sizeof(m->sessions[2].reset), "0h 42m");
-	safe_copy(m->sessions[2].state, sizeof(m->sessions[2].state), "DONE");
-	safe_copy(m->sessions[2].task, sizeof(m->sessions[2].task), "release notes");
-	safe_copy(m->sessions[2].now, sizeof(m->sessions[2].now), "waiting for review");
-	m->sessions[2].cost = 5.70f;
-	m->sessions[2].usage = 81;
+	safe_copy(m->window, sizeof(m->window), "host data pending");
 }
 
 static void draw_session_row(struct canvas *c, const struct ui_session *s,
@@ -2212,58 +2958,365 @@ static void draw_bottom_status(struct canvas *c, const struct ui_session *s)
 	draw_text_fit(c, x, y, UI_W - x - 40, s->now, 1, C_AMBER);
 }
 
-static void render_dashboard(struct canvas *c, const struct ui_model *m)
+/* Pet sprite overlay: always painted last (after the active view) so the
+ * mascot lives on its own layer and stays in the bottom-left corner of
+ * every screen — dashboard, picker and terminal. The UI underneath keeps
+ * its own original layout (centred, full-width) and is allowed to be
+ * partially occluded; the pet box is sized to be visible without forcing
+ * the UI to redesign around it. VIEW_PET paints its own bigger pet, so
+ * render_frame skips this overlay there. */
+static void render_pet_overlay(struct canvas *c, const struct pet_state *p)
 {
-	char buf[96];
-	char time_buf[16];
+	uint64_t now_ms = monotonic_now_ms();
+	uint32_t frame = (uint32_t)((now_ms - p->start_time_ms) / 83u);
+	(void)draw_pet_scene_akim(c, p->scene, frame,
+				  16, UI_H - 220, 320, 204);
+}
+
+static void render_dashboard(struct canvas *c, const struct ui_model *m,
+			     struct font_ctx *font,
+			     const struct pet_state *p)
+{
 	int focus = m->focus;
+	uint64_t now_ms = monotonic_now_ms();
+	int seconds = (int)((now_ms - p->start_time_ms) / 1000u);
 
-	canvas_clear(c, C_BG);
-	fill_rect(c, 8, 8, UI_W - 16, UI_H - 16, C_PANEL);
-	stroke_round_rect(c, 8, 8, UI_W - 16, UI_H - 16, 12, C_LINE);
+	/* Solid black canvas + video-style header / footer (same look the
+	 * source mp4s use): left "ASKING/STANDBY/..." label, right
+	 * IDLE+clock+temp, golden rules top and bottom, three-icon footer. */
+	canvas_clear(c, C_GRUVBOX_BG);
+	fill_rect(c, 0, 0, UI_W, UI_H, 0x141312);
+	draw_pet_header(c, font, p->scene, seconds);
+	draw_pet_footer(c, font, p->scene);
 
-	draw_text(c, 32, 34, "OVERVIEW", 2, C_TEXT);
-	snprintf(buf, sizeof(buf), "%d active", m->active_count);
-	draw_text(c, 302, 42, buf, 1, C_AMBER);
-	draw_text(c, 376, 42, "*", 1, C_TEXT);
-	draw_text(c, 406, 42, m->window[0] ? m->window : "5h rolling window", 1, C_MUTED);
-	draw_text(c, 548, 42, "*", 1, C_TEXT);
-	snprintf(buf, sizeof(buf), "avg %d%%", m->avg_usage);
-	draw_text(c, 582, 42, buf, 1, C_MUTED);
-	draw_text(c, 664, 42, "*", 1, C_TEXT);
-	snprintf(buf, sizeof(buf), "total spend $%.2f", m->total_spend);
-	draw_text(c, 698, 42, buf, 1, C_MUTED);
-	format_time(time_buf, sizeof(time_buf));
-	draw_text_right(c, UI_W - 34, 42, time_buf, 1, C_AMBER);
-
-	hline(c, 22, 76, UI_W - 44, C_LINE);
-
-	draw_text(c, 34, 100, "SESSION", 1, C_MUTED);
-	draw_text(c, 176, 100, "TOOL", 1, C_MUTED);
-	draw_text(c, 286, 100, "MODE", 1, C_MUTED);
-	draw_text(c, 374, 100, "MODEL", 1, C_MUTED);
-	draw_text(c, 496, 100, "COST", 1, C_MUTED);
-	draw_text(c, 590, 100, "PLAN USAGE LIMITS", 1, C_MUTED);
-	draw_text(c, 792, 100, "RESETS IN", 1, C_MUTED);
-	draw_text(c, 884, 100, "STATE", 1, C_MUTED);
-	hline(c, 22, 128, UI_W - 44, C_LINE);
-
+	/* Body band lives between the header and footer rules (~y=60..340). */
 	if (m->count <= 0) {
-		draw_text(c, 366, 196, "WAITING FOR TYPE-C DATA", 1, C_MUTED);
+		const char *msg = "WAITING FOR HOST DATA";
+		int mw = text_w(msg, 2);
+		draw_text(c, (UI_W - mw) / 2, 188, msg, 2, C_GRUVBOX_MUTED);
 		return;
 	}
 
 	if (focus < 0 || focus >= m->count)
 		focus = 0;
 
+	/* Three-row session view: focus-1 above, focus highlighted, focus+1
+	 * below. Same draw_session_row helper as before — keeps the column
+	 * spacing the original layout designed. */
 	if (focus > 0)
-		draw_session_row(c, &m->sessions[focus - 1], 154, false);
-	draw_session_row(c, &m->sessions[focus], 207, true);
+		draw_session_row(c, &m->sessions[focus - 1], 100, false);
+	draw_session_row(c, &m->sessions[focus], 168, true);
 	if (focus + 1 < m->count)
-		draw_session_row(c, &m->sessions[focus + 1], 286, false);
+		draw_session_row(c, &m->sessions[focus + 1], 252, false);
+}
 
-	hline(c, 22, 326, UI_W - 44, C_LINE);
-	draw_bottom_status(c, &m->sessions[focus]);
+/* ---------------------------------------------------------------- board session table */
+
+static const char *board_session_state_str(enum board_session_state s)
+{
+	switch (s) {
+	case BSS_CONNECTED:    return "CONNECTED";
+	case BSS_DISCONNECTED: return "DISCONNECTED";
+	case BSS_RUN:          return "RUN";
+	case BSS_WAIT:         return "WAIT";
+	case BSS_DONE:         return "DONE";
+	case BSS_ERROR:        return "ERROR";
+	default:               return "?";
+	}
+}
+
+static int board_session_find_idx(uint16_t sid)
+{
+	for (int i = 0; i < MAX_BOARD_SESSIONS; i++) {
+		if (g_board_sessions[i].used && g_board_sessions[i].sid == sid)
+			return i;
+	}
+	return -1;
+}
+
+static int board_session_alloc_idx(void)
+{
+	for (int i = 0; i < MAX_BOARD_SESSIONS; i++) {
+		if (!g_board_sessions[i].used)
+			return i;
+	}
+	return -1;
+}
+
+static int board_session_count_live(void)
+{
+	int n = 0;
+	for (int i = 0; i < MAX_BOARD_SESSIONS; i++) {
+		if (g_board_sessions[i].used)
+			n++;
+	}
+	return n;
+}
+
+static bool board_session_state_from_name(const char *name,
+					  enum board_session_state *out)
+{
+	if (streq_ci(name, "connected"))    { *out = BSS_CONNECTED; return true; }
+	if (streq_ci(name, "disconnected")) { *out = BSS_DISCONNECTED; return true; }
+	if (streq_ci(name, "run"))          { *out = BSS_RUN; return true; }
+	if (streq_ci(name, "wait"))         { *out = BSS_WAIT; return true; }
+	if (streq_ci(name, "done"))         { *out = BSS_DONE; return true; }
+	if (streq_ci(name, "error"))        { *out = BSS_ERROR; return true; }
+	return false;
+}
+
+static void board_session_upsert(uint16_t sid, enum board_session_state state)
+{
+	int idx = board_session_find_idx(sid);
+	if (idx < 0)
+		idx = board_session_alloc_idx();
+	if (idx < 0)
+		return;
+	g_board_sessions[idx].used = true;
+	g_board_sessions[idx].sid = sid;
+	g_board_sessions[idx].state = state;
+}
+
+static void board_session_remove(uint16_t sid)
+{
+	int idx = board_session_find_idx(sid);
+	if (idx < 0)
+		return;
+	g_board_sessions[idx].used = false;
+	g_board_sessions[idx].sid = 0;
+	if (g_lcd_selected_sid == sid)
+		g_lcd_selected_sid = 0;
+	if (g_lcd_active_sid == sid)
+		g_lcd_active_sid = 0;
+}
+
+/* Return next live sid in iteration order, or 0 if there are none. */
+static uint16_t board_session_pick_first(void)
+{
+	for (int i = 0; i < MAX_BOARD_SESSIONS; i++) {
+		if (g_board_sessions[i].used)
+			return g_board_sessions[i].sid;
+	}
+	return 0;
+}
+
+static uint16_t board_session_step(uint16_t cur, int delta)
+{
+	uint16_t sids[MAX_BOARD_SESSIONS];
+	int n = 0;
+	for (int i = 0; i < MAX_BOARD_SESSIONS; i++) {
+		if (g_board_sessions[i].used)
+			sids[n++] = g_board_sessions[i].sid;
+	}
+	if (n == 0)
+		return 0;
+	if (n == 1)
+		return sids[0];
+	/* Locate current in the ordered list; if not found, start at 0. */
+	int idx = 0;
+	for (int i = 0; i < n; i++) {
+		if (sids[i] == cur) {
+			idx = i;
+			break;
+		}
+	}
+	idx = (idx + delta) % n;
+	if (idx < 0)
+		idx += n;
+	return sids[idx];
+}
+
+/* ---------------------------------------------------------------- ui-ctrl-out */
+
+/* Open the FIFO non-blocking, lazily, creating it if missing. */
+static int open_ui_ctrl_out(const char *path)
+{
+	struct stat st;
+	int fd;
+
+	if (!path)
+		return -1;
+	if (stat(path, &st) < 0 && errno == ENOENT) {
+		if (mkfifo(path, 0600) != 0 && errno != EEXIST)
+			return -1;
+	}
+	fd = open(path, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+	return fd;
+}
+
+static void ui_ctrl_emit(const char *line)
+{
+	size_t len;
+	size_t off = 0;
+
+	if (!g_ui_ctrl_out_path || !line)
+		return;
+	len = strlen(line);
+	if (g_ui_ctrl_out_fd < 0) {
+		g_ui_ctrl_out_fd = open_ui_ctrl_out(g_ui_ctrl_out_path);
+		if (g_ui_ctrl_out_fd < 0)
+			return;
+	}
+	while (off < len) {
+		ssize_t n = write(g_ui_ctrl_out_fd, line + off, len - off);
+		if (n < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				return;
+			close(g_ui_ctrl_out_fd);
+			g_ui_ctrl_out_fd = -1;
+			return;
+		}
+		if (n == 0)
+			return;
+		off += (size_t)n;
+	}
+}
+
+static void ui_ctrl_emit_view(const char *view_name)
+{
+	char line[32];
+	snprintf(line, sizeof(line), "view %s\n", view_name);
+	ui_ctrl_emit(line);
+}
+
+static void ui_ctrl_emit_select(uint16_t sid)
+{
+	char line[32];
+	snprintf(line, sizeof(line), "select %u\n", sid);
+	ui_ctrl_emit(line);
+}
+
+static void ui_ctrl_emit_focus(uint16_t sid)
+{
+	char line[32];
+	snprintf(line, sizeof(line), "focus %u\n", sid);
+	ui_ctrl_emit(line);
+}
+
+/* Picker has its own chrome: top label "SESSION" + clock + live count, bottom
+ * shows encoder/confirm/reject hints. Deliberately does not reuse
+ * draw_pet_header so the pet-scene label (ASKING/UPDATING/...) cannot leak
+ * into the picker view. */
+static void draw_picker_header(struct canvas *c, struct font_ctx *font,
+			       int seconds, int live_count)
+{
+	char time_buf[16];
+	char count_buf[24];
+
+	draw_pet_font_text(c, font, 22, 16, "SESSION", 12, 2, C_GRUVBOX_YELLOW);
+
+	snprintf(count_buf, sizeof(count_buf), "%d live", live_count);
+	draw_pet_font_text(c, font, 548, 16, count_buf, 12, 2,
+			   live_count > 0 ? C_GRUVBOX_YELLOW : C_GRUVBOX_MUTED);
+	draw_pet_bullet(c, 692, 29, 9, C_GRUVBOX_YELLOW);
+
+	snprintf(time_buf, sizeof(time_buf), "%02d:%02d:%02d",
+		 seconds / 3600, (seconds / 60) % 60, seconds % 60);
+	draw_pet_font_text(c, font, 716, 16, time_buf, 12, 2,
+			   C_GRUVBOX_YELLOW);
+
+	hline(c, 22, 54, UI_W - 44, C_GRUVBOX_LINE);
+	hline(c, 22, 55, UI_W - 44, C_GRUVBOX_DARK1);
+}
+
+static void draw_picker_footer(struct canvas *c, struct font_ctx *font)
+{
+	hline(c, 22, 344, UI_W - 44, C_GRUVBOX_LINE);
+	hline(c, 22, 345, UI_W - 44, C_GRUVBOX_DARK1);
+	draw_pet_rotate_icon(c, 42, 362, false, C_GRUVBOX_YELLOW);
+	draw_pet_rotate_icon(c, 88, 362, true, C_GRUVBOX_YELLOW);
+	draw_pet_font_text(c, font, 140, 360, "select sid", 12, 2,
+			   C_GRUVBOX_TEXT);
+	draw_pet_font_text(c, font, 332, 360, "|", 12, 2, C_GRUVBOX_MUTED);
+	draw_pet_down_icon(c, 392, 362, C_GRUVBOX_YELLOW);
+	draw_pet_font_text(c, font, 432, 360, "confirm focus", 12, 2,
+			   C_GRUVBOX_TEXT);
+	draw_pet_font_text(c, font, 690, 360, "|", 12, 2, C_GRUVBOX_MUTED);
+	draw_pet_font_text(c, font, 742, 360, "reject = back", 12, 2,
+			   C_GRUVBOX_TEXT);
+}
+
+/* Picker view: KEY 2 (SESSION) jumps here. Renders sid + state only. The
+ * picker_idx member of ui_model is no longer used — selection lives in
+ * g_lcd_selected_sid, and the list comes from g_board_sessions[]. */
+static void render_session_picker(struct canvas *c, const struct ui_model *m,
+				  struct font_ctx *font,
+				  const struct pet_state *p)
+{
+	uint64_t now_ms = monotonic_now_ms();
+	int seconds = (int)((now_ms - p->start_time_ms) / 1000u);
+	uint16_t sids[MAX_BOARD_SESSIONS];
+	int states[MAX_BOARD_SESSIONS];
+	int count = 0;
+
+	(void)m;
+
+	for (int i = 0; i < MAX_BOARD_SESSIONS; i++) {
+		if (g_board_sessions[i].used) {
+			sids[count] = g_board_sessions[i].sid;
+			states[count] = (int)g_board_sessions[i].state;
+			count++;
+		}
+	}
+
+	canvas_clear(c, C_GRUVBOX_BG);
+	fill_rect(c, 0, 0, UI_W, UI_H, 0x141312);
+	draw_picker_header(c, font, seconds, count);
+	draw_picker_footer(c, font);
+
+	const char *banner = "[ SELECT SESSION ]";
+	int bw = text_w(banner, 2);
+	draw_text(c, (UI_W - bw) / 2, 78, banner, 2, C_GRUVBOX_YELLOW);
+
+	if (count == 0) {
+		const char *msg = "NO HOST SESSIONS YET";
+		int mw = text_w(msg, 2);
+		draw_text(c, (UI_W - mw) / 2, 192, msg, 2, C_GRUVBOX_MUTED);
+		return;
+	}
+
+	int picker_idx = 0;
+	for (int i = 0; i < count; i++) {
+		if (sids[i] == g_lcd_selected_sid) {
+			picker_idx = i;
+			break;
+		}
+	}
+
+	const int rows_visible = 3;
+	int start = picker_idx - rows_visible / 2;
+	int max_start = count - rows_visible;
+	if (max_start < 0)
+		max_start = 0;
+	if (start < 0)
+		start = 0;
+	if (start > max_start)
+		start = max_start;
+
+	for (int i = 0; i < rows_visible && (start + i) < count; i++) {
+		int idx = start + i;
+		int row_y = 130 + i * 60;
+		bool sel = (idx == picker_idx);
+		char sid_label[24];
+		const char *state_label =
+			board_session_state_str((enum board_session_state)states[idx]);
+		uint32_t state_color = sel ? C_GRUVBOX_YELLOW : C_GRUVBOX_MUTED;
+		if ((enum board_session_state)states[idx] == BSS_DISCONNECTED ||
+		    (enum board_session_state)states[idx] == BSS_ERROR)
+			state_color = sel ? C_GRUVBOX_RED : 0x8a3a25;
+
+		snprintf(sid_label, sizeof(sid_label), "SID %u", sids[idx]);
+
+		if (sel) {
+			fill_rect(c, 60, row_y - 8, UI_W - 120, 48, 0x1a0e02);
+			stroke_round_rect(c, 60, row_y - 8,
+					  UI_W - 120, 48, 6, C_GRUVBOX_YELLOW);
+		}
+		draw_text_fit(c, 96, row_y, 360, sid_label, 2,
+			      sel ? C_GRUVBOX_YELLOW : C_GRUVBOX_TEXT);
+		draw_text_fit(c, 540, row_y, 320, state_label, 2,
+			      state_color);
+	}
 }
 
 static const char *find_json_key(const char *line, const char *key)
@@ -2356,8 +3409,8 @@ static int upsert_session(struct ui_model *m, const char *id)
 	memset(&m->sessions[idx], 0, sizeof(m->sessions[idx]));
 	safe_copy(m->sessions[idx].id, sizeof(m->sessions[idx].id), id);
 	safe_copy(m->sessions[idx].session, sizeof(m->sessions[idx].session), id);
-	safe_copy(m->sessions[idx].tool, sizeof(m->sessions[idx].tool), "Claude Code");
-	safe_copy(m->sessions[idx].mode, sizeof(m->sessions[idx].mode), "PLAN");
+	safe_copy(m->sessions[idx].tool, sizeof(m->sessions[idx].tool), "Host");
+	safe_copy(m->sessions[idx].mode, sizeof(m->sessions[idx].mode), "CLI");
 	safe_copy(m->sessions[idx].model, sizeof(m->sessions[idx].model), "-");
 	safe_copy(m->sessions[idx].reset, sizeof(m->sessions[idx].reset), "-");
 	safe_copy(m->sessions[idx].state, sizeof(m->sessions[idx].state), "RUN");
@@ -2763,6 +3816,176 @@ static int write_ppm(const char *path, const struct canvas *c)
 	return 0;
 }
 
+static int pet_write_qa_dump(const char *path, const struct canvas *c,
+			     const struct pet_state *p)
+{
+	const int box_x = PET_STAGE_X;
+	const int box_y = PET_STAGE_Y;
+	const int box_w = PET_STAGE_W;
+	const int box_h = PET_STAGE_H;
+	const struct pet_scene_asset_manifest *manifest =
+		pet_asset_manifest(p->scene);
+	const struct anim_state *a = &g_pet_anims[p->scene];
+	FILE *fp = fopen(path, "w");
+	int min_x = box_x + box_w;
+	int min_y = box_y + box_h;
+	int max_x = box_x - 1;
+	int max_y = box_y - 1;
+	int visible = 0;
+	int dark = 0;
+	int bright = 0;
+
+	if (!fp) {
+		warnf("open %s failed: %s", path, strerror(errno));
+		return -1;
+	}
+	for (int y = box_y; y < box_y + box_h; y++) {
+		for (int x = box_x; x < box_x + box_w; x++) {
+			uint32_t rgb = c->px[y * c->w + x];
+			int r = (int)((rgb >> 16) & 0xff);
+			int g = (int)((rgb >> 8) & 0xff);
+			int b = (int)(rgb & 0xff);
+			int luma = r * 3 + g * 4 + b;
+
+			if (luma > 130) {
+				visible++;
+				if (x < min_x)
+					min_x = x;
+				if (x > max_x)
+					max_x = x;
+				if (y < min_y)
+					min_y = y;
+				if (y > max_y)
+					max_y = y;
+			}
+			if (luma < 70)
+				dark++;
+			if (luma > 900)
+				bright++;
+		}
+	}
+
+	fprintf(fp, "AIKB pet character QA dump\n");
+	fprintf(fp, "scene=%s pose=%s character=%s\n",
+		pet_scene_name(p->scene), pet_pose_name(p->anim.pose),
+		PET_CORE_CHARACTER.name);
+	fprintf(fp, "asset_root=%s\n", g_pet_asset_root[0] ?
+		g_pet_asset_root : "(compile-time paths)");
+	fprintf(fp, "resource=%s\n", pet_asset_path(p->scene));
+	fprintf(fp, "asset_loaded=%s fallback_forced=%s\n",
+		(a->active && a->base) ? "yes" : "no",
+		g_pet_force_fallback ? "yes" : "no");
+	if (manifest) {
+		fprintf(fp, "manifest state=%s expected_frames=%u frame_duration_ms=%u\n",
+			manifest->state, manifest->expected_frames,
+			manifest->frame_duration_ms);
+	}
+	fprintf(fp, "stage_box=%d,%d %dx%d\n", box_x, box_y, box_w, box_h);
+	if (visible) {
+		fprintf(fp, "rendered_bbox=%d,%d %dx%d visible_pixels=%d\n",
+			min_x, min_y, max_x - min_x + 1, max_y - min_y + 1,
+			visible);
+	} else {
+		fprintf(fp, "rendered_bbox=none visible_pixels=0\n");
+	}
+	fprintf(fp, "stage_dark_pixels=%d stage_bright_pixels=%d\n", dark, bright);
+
+	if (a->active && a->base) {
+		struct anim_header hdr;
+		const uint8_t *frame;
+		size_t transparent = 0;
+		size_t semitransparent = 0;
+		size_t opaque = 0;
+		size_t edges = 0;
+		size_t pixels;
+		int src_min_x = 0;
+		int src_min_y = 0;
+		int src_max_x = -1;
+		int src_max_y = -1;
+		int scale;
+		int dst_w;
+		int dst_h;
+		int dx;
+		int dy;
+
+		memcpy(&hdr, a->base, sizeof(hdr));
+		pixels = (size_t)hdr.width * hdr.height;
+		frame = a->base + sizeof(struct anim_header) +
+			(size_t)a->frame_idx * pixels * 4u;
+		src_min_x = (int)hdr.width;
+		src_min_y = (int)hdr.height;
+		for (uint32_t y = 0; y < hdr.height; y++) {
+			for (uint32_t x = 0; x < hdr.width; x++) {
+				const uint8_t *px = frame + ((size_t)y * hdr.width + x) * 4u;
+				uint8_t alpha = px[3];
+
+				if (!alpha) {
+					transparent++;
+				} else {
+					if ((int)x < src_min_x)
+						src_min_x = (int)x;
+					if ((int)x > src_max_x)
+						src_max_x = (int)x;
+					if ((int)y < src_min_y)
+						src_min_y = (int)y;
+					if ((int)y > src_max_y)
+						src_max_y = (int)y;
+					if (alpha == 255)
+						opaque++;
+					else
+						semitransparent++;
+				}
+				if (x > 0) {
+					const uint8_t *left = px - 4;
+
+					if (px[0] != left[0] || px[1] != left[1] ||
+					    px[2] != left[2] || px[3] != left[3])
+						edges++;
+				}
+				if (y > 0) {
+					const uint8_t *up = px - (size_t)hdr.width * 4u;
+
+					if (px[0] != up[0] || px[1] != up[1] ||
+					    px[2] != up[2] || px[3] != up[3])
+						edges++;
+				}
+			}
+		}
+		fprintf(fp, "akim=%ux%u frames=%u delay_ms=%u format=%s frame=%u\n",
+			hdr.width, hdr.height, hdr.frame_count,
+			hdr.frame_delay_ms,
+			g_pet_anim_argb8888[p->scene] ? "ARGB8888" : "RGBA",
+			a->frame_idx);
+		fprintf(fp, "alpha transparent=%zu semitransparent=%zu opaque=%zu\n",
+			transparent, semitransparent, opaque);
+		scale = box_w / (int)hdr.width;
+		if (box_h / (int)hdr.height < scale)
+			scale = box_h / (int)hdr.height;
+		if (scale < 1)
+			scale = 1;
+		dst_w = (int)hdr.width * scale;
+		dst_h = (int)hdr.height * scale;
+		dx = box_x + (box_w - dst_w) / 2;
+		dy = box_y + (box_h - dst_h) / 2;
+		if (src_max_x >= src_min_x && src_max_y >= src_min_y) {
+			fprintf(fp, "asset_alpha_bbox=%d,%d %dx%d\n",
+				src_min_x, src_min_y,
+				src_max_x - src_min_x + 1,
+				src_max_y - src_min_y + 1);
+			fprintf(fp, "asset_rendered_bbox=%d,%d %dx%d scale=%d\n",
+				dx + src_min_x * scale, dy + src_min_y * scale,
+				(src_max_x - src_min_x + 1) * scale,
+				(src_max_y - src_min_y + 1) * scale, scale);
+		}
+		fprintf(fp, "clarity_edge_changes=%zu\n", edges);
+	} else {
+		fprintf(fp, "fallback_map=%dx%d\n", PET_DINO_W, PET_DINO_H);
+	}
+
+	fclose(fp);
+	return 0;
+}
+
 static int configure_serial_fd(int fd)
 {
 	struct termios tio;
@@ -2776,7 +3999,8 @@ static int configure_serial_fd(int fd)
 	return tcsetattr(fd, TCSANOW, &tio);
 }
 
-static int load_splash(const char *path)
+static int load_raw_canvas(const char *path, uint32_t **slot,
+			   const char *label, bool show_after_load)
 {
 	struct stat st;
 	uint32_t *buf;
@@ -2786,22 +4010,23 @@ static int load_splash(const char *path)
 	if (!path)
 		return -1;
 	if (stat(path, &st) < 0) {
-		warnf("splash %s: stat failed: %s", path, strerror(errno));
+		warnf("%s %s: stat failed: %s", label, path, strerror(errno));
 		return -1;
 	}
 	if ((size_t)st.st_size != SPLASH_BYTES) {
-		warnf("splash %s: size %lld != %zu (expect %dx%d 0x00RRGGBB)",
-		      path, (long long)st.st_size, SPLASH_BYTES, UI_W, UI_H);
+		warnf("%s %s: size %lld != %zu (expect %dx%d 0x00RRGGBB)",
+		      label, path, (long long)st.st_size, SPLASH_BYTES,
+		      UI_W, UI_H);
 		return -1;
 	}
 	fd = open(path, O_RDONLY | O_CLOEXEC);
 	if (fd < 0) {
-		warnf("splash %s: open failed: %s", path, strerror(errno));
+		warnf("%s %s: open failed: %s", label, path, strerror(errno));
 		return -1;
 	}
 	buf = malloc(SPLASH_BYTES);
 	if (!buf) {
-		warnf("splash %s: malloc %zu failed", path, SPLASH_BYTES);
+		warnf("%s %s: malloc %zu failed", label, path, SPLASH_BYTES);
 		close(fd);
 		return -1;
 	}
@@ -2810,7 +4035,7 @@ static int load_splash(const char *path)
 		if (n < 0) {
 			if (errno == EINTR)
 				continue;
-			warnf("splash %s: read failed: %s", path, strerror(errno));
+			warnf("%s %s: read failed: %s", label, path, strerror(errno));
 			free(buf);
 			close(fd);
 			return -1;
@@ -2821,15 +4046,28 @@ static int load_splash(const char *path)
 	}
 	close(fd);
 	if (got != SPLASH_BYTES) {
-		warnf("splash %s: short read %zu/%zu", path, got, SPLASH_BYTES);
+		warnf("%s %s: short read %zu/%zu", label, path, got,
+		      SPLASH_BYTES);
 		free(buf);
 		return -1;
 	}
-	g_splash = buf;
-	g_show_splash = true;
-	warnf("splash %s loaded (%dx%d, %zu bytes)", path, UI_W, UI_H,
+	free(*slot);
+	*slot = buf;
+	if (show_after_load)
+		g_show_splash = true;
+	warnf("%s %s loaded (%dx%d, %zu bytes)", label, path, UI_W, UI_H,
 	      SPLASH_BYTES);
 	return 0;
+}
+
+static int load_splash(const char *path)
+{
+	return load_raw_canvas(path, &g_splash, "splash", true);
+}
+
+static int load_ui_shell(const char *path)
+{
+	return load_raw_canvas(path, &g_ui_shell, "ui shell", false);
 }
 
 static long monotonic_elapsed_ms(const struct timespec *since)
@@ -2855,6 +4093,17 @@ static void anim_release(struct anim_state *a)
 	a->frame_idx = 0;
 	a->active = false;
 	a->loop = false;
+	a->argb8888 = false;
+}
+
+static void release_intro_surfaces(void)
+{
+	if (g_boot_anim.active)
+		anim_release(&g_boot_anim);
+	if (g_wait_anim.active)
+		anim_release(&g_wait_anim);
+	if (g_show_splash)
+		g_show_splash = false;
 }
 
 static int anim_load(struct anim_state *a, const char *path)
@@ -2895,7 +4144,8 @@ static int anim_load(struct anim_state *a, const char *path)
 		munmap(map, (size_t)st.st_size);
 		return -1;
 	}
-	if (hdr.version != 1 || (hdr.flags & ~ANIM_FLAG_LOOP) != 0) {
+	if (hdr.version != 1 ||
+	    (hdr.flags & ~(ANIM_FLAG_LOOP | PET_AKIM_FLAG_ARGB8888)) != 0) {
 		warnf("%s %s: version=%u flags=0x%x not supported", a->label,
 		      path, hdr.version, hdr.flags);
 		munmap(map, (size_t)st.st_size);
@@ -2926,23 +4176,31 @@ static int anim_load(struct anim_state *a, const char *path)
 	a->frame_delay_ms = hdr.frame_delay_ms;
 	a->frame_idx = 0;
 	a->loop = (hdr.flags & ANIM_FLAG_LOOP) != 0;
+	a->argb8888 = (hdr.flags & PET_AKIM_FLAG_ARGB8888) != 0;
 	a->active = true;
 	clock_gettime(CLOCK_MONOTONIC, &a->started_at);
-	warnf("%s %s loaded (%u frames * %u ms%s, %zu bytes)", a->label, path,
+	warnf("%s %s loaded (%u frames * %u ms%s, %s, %zu bytes)", a->label, path,
 	      a->frame_count, a->frame_delay_ms, a->loop ? ", looping" : "",
+	      a->argb8888 ? "ARGB8888" : "RGBA",
 	      a->size);
 	return 0;
 }
 
-static int pet_akim_load(struct anim_state *a, const char *path)
+static int pet_akim_load(struct anim_state *a,
+			 const struct pet_scene_asset_manifest *manifest,
+			 bool *argb8888)
 {
 	struct stat st;
 	void *map;
 	struct anim_header hdr;
 	size_t frame_bytes;
 	size_t expected;
+	const char *path;
 	int fd;
 
+	if (!manifest)
+		return -1;
+	path = pet_asset_path(manifest->scene);
 	if (!path)
 		return -1;
 	if (stat(path, &st) < 0) {
@@ -3006,20 +4264,56 @@ static int pet_akim_load(struct anim_state *a, const char *path)
 	a->frame_idx = 0;
 	a->loop = true;
 	a->active = true;
-	g_pet_asking_argb8888 = (hdr.flags & PET_AKIM_FLAG_ARGB8888) != 0;
+	*argb8888 = (hdr.flags & PET_AKIM_FLAG_ARGB8888) != 0;
 	clock_gettime(CLOCK_MONOTONIC, &a->started_at);
+	if (manifest->expected_frames &&
+	    hdr.frame_count < manifest->expected_frames) {
+		warnf("%s %s: %u frames < manifest expected %u",
+		      a->label, path, hdr.frame_count,
+		      manifest->expected_frames);
+	}
+	if (manifest->frame_duration_ms &&
+	    hdr.frame_delay_ms != manifest->frame_duration_ms) {
+		warnf("%s %s: frame delay %u ms differs from manifest %u ms",
+		      a->label, path, hdr.frame_delay_ms,
+		      manifest->frame_duration_ms);
+	}
 	warnf("%s %s loaded (%ux%u, %u frames * %u ms, %s, %zu bytes)",
 	      a->label, path, hdr.width, hdr.height, a->frame_count,
-	      a->frame_delay_ms, g_pet_asking_argb8888 ? "ARGB8888" : "RGBA",
+	      a->frame_delay_ms, *argb8888 ? "ARGB8888" : "RGBA",
 	      a->size);
 	return 0;
+}
+
+static const char *pet_scene_name(enum pet_scene scene)
+{
+	const struct pet_scene_asset_manifest *manifest = pet_asset_manifest(scene);
+
+	return manifest ? manifest->state : "unknown";
+}
+
+static const char *pet_pose_name(enum pet_pose pose)
+{
+	if (pose >= 0 && pose < PET_POSE_COUNT)
+		return PET_CORE_POSE_RANGES[pose].state;
+	return "unknown";
 }
 
 static void anim_blit(const struct anim_state *a, struct canvas *c)
 {
 	const uint8_t *frame = a->base + sizeof(struct anim_header) +
 			       (size_t)a->frame_idx * SPLASH_BYTES;
-	memcpy(c->px, frame, SPLASH_BYTES);
+	if (!a->argb8888) {
+		memcpy(c->px, frame, SPLASH_BYTES);
+		return;
+	}
+	for (size_t i = 0; i < (size_t)UI_W * UI_H; i++) {
+		const uint8_t *p = frame + i * 4u;
+
+		c->px[i] = ((uint32_t)p[2] << 16) |
+			   ((uint32_t)p[1] << 8) |
+			   (uint32_t)p[0];
+	}
 }
 
 /*
@@ -3123,6 +4417,8 @@ static bool pet_input_is_command(const char *buf, ssize_t len)
 static void feed_terminal_bytes(struct terminal *term, struct kitty_graphics *kitty,
 				const char *buf, ssize_t len)
 {
+	if (len > 0)
+		g_terminal_has_data = true;
 	struct terminal_emit_ctx emit_ctx = {
 		.term = term,
 		.kitty = kitty,
@@ -3156,20 +4452,8 @@ static void process_input_fd(int fd, struct ui_model *m, struct terminal *term,
 		}
 		if (rd == 0)
 			return;
-		if (g_boot_anim.active)
-			anim_release(&g_boot_anim);
-		if (g_wait_anim.active)
-			anim_release(&g_wait_anim);
-		if (g_show_splash)
-			g_show_splash = false;
-		if (*view == VIEW_PET && !pet_input_is_command(tmp, rd)) {
-			*view = VIEW_TERMINAL;
-			len = 0;
-			terminal_reset(term);
-			kitty_graphics_clear(kitty);
-			feed_terminal_bytes(term, kitty, tmp, rd);
+		if (*view == VIEW_PET && !pet_input_is_command(tmp, rd))
 			continue;
-		}
 		for (ssize_t i = 0; i < rd; i++) {
 			char ch = tmp[i];
 
@@ -3197,7 +4481,7 @@ static void process_input_fd(int fd, struct ui_model *m, struct terminal *term,
 	}
 }
 
-static void process_event_fd(int fd, struct pet_state *pet)
+static void process_event_fd(int fd, struct pet_state *pet, enum app_view *view)
 {
 	static char buf[LINE_BUF];
 	static size_t len;
@@ -3219,16 +4503,116 @@ static void process_event_fd(int fd, struct pet_state *pet)
 
 			if (ch == '\r')
 				continue;
-			if (ch == '\n') {
-				buf[len] = '\0';
-				if (len > 0)
-					pet_apply_event_line(pet, buf);
-				len = 0;
-			} else if (len + 1 < sizeof(buf)) {
-				buf[len++] = ch;
-			} else {
-				len = 0;
+			if (ch != '\n') {
+				if (len + 1 < sizeof(buf))
+					buf[len++] = ch;
+				else
+					len = 0;
+				continue;
 			}
+
+			buf[len] = '\0';
+			if (len == 0) {
+				continue;
+			}
+
+			/* Encoder rotation: in picker view, step the highlighted
+			 * sid and tell aikb_hid_input via ui-ctrl-out. In any
+			 * other view, encoder events are forwarded to the host
+			 * (the HID send path stamps g_active_sid on them). */
+			if (!strncmp(buf, "ENC ", 4)) {
+				if (*view == VIEW_SESSION_PICKER) {
+					int dir = 0;
+					if (!strncmp(buf, "ENC +", 5))
+						dir = +1;
+					else if (!strncmp(buf, "ENC -", 5))
+						dir = -1;
+					if (dir != 0 && board_session_count_live() > 0) {
+						g_lcd_selected_sid =
+							board_session_step(g_lcd_selected_sid, dir);
+						ui_ctrl_emit_select(g_lcd_selected_sid);
+					}
+				}
+				len = 0;
+				continue;
+			}
+
+			/* ENC_BTN / CONFIRM (KEY 6) in the picker with a live
+			 * selection: focus that sid and switch to terminal.
+			 * Without a selection, ENC_BTN does nothing here and
+			 * CONFIRM falls through to its generic KEY_ACTIONS
+			 * handler below (pet + UPDATING scene). */
+			if (*view == VIEW_SESSION_PICKER &&
+			    g_lcd_selected_sid != 0 &&
+			    (streq_ci(buf, "ENC_BTN DOWN") ||
+			     streq_ci(buf, "KEY 6 DOWN"))) {
+				ui_ctrl_emit_focus(g_lcd_selected_sid);
+				g_lcd_active_sid = g_lcd_selected_sid;
+				*view = VIEW_TERMINAL;
+				ui_ctrl_emit_view("terminal");
+				release_intro_surfaces();
+				len = 0;
+				continue;
+			}
+			if (*view == VIEW_SESSION_PICKER &&
+			    streq_ci(buf, "ENC_BTN DOWN")) {
+				/* No sid selected — ENC_BTN is the picker
+				 * confirm key only; nothing else to do. */
+				len = 0;
+				continue;
+			}
+
+			/* SESSION opens the board-local picker. Stateless: we
+			 * do not remember which view we came from, so any
+			 * subsequent product key (including REJECT) just runs
+			 * its normal action from the picker. */
+			if (streq_ci(buf, "KEY 2 DOWN")) {
+				if (*view != VIEW_SESSION_PICKER) {
+					if (g_lcd_selected_sid == 0 ||
+					    board_session_find_idx(g_lcd_selected_sid) < 0)
+						g_lcd_selected_sid =
+							board_session_pick_first();
+					*view = VIEW_SESSION_PICKER;
+					ui_ctrl_emit_view("picker");
+					if (g_lcd_selected_sid != 0)
+						ui_ctrl_emit_select(g_lcd_selected_sid);
+					release_intro_surfaces();
+				}
+				len = 0;
+				continue;
+			}
+
+			/* Any remaining product key (KEY 0/1/3/4/5/6) jumps to
+			 * the pet view with its matching scene + overlay. This
+			 * fires from any starting view, including the picker
+			 * — so users can exit the picker straight into the pet
+			 * view via any product key, not only SESSION/REJECT.
+			 *
+			 * KEY 2 is filtered out because SESSION is handled
+			 * above (it opens the picker, not the pet). */
+			for (size_t k = 0;
+			     k < sizeof(KEY_ACTIONS) / sizeof(KEY_ACTIONS[0]);
+			     k++) {
+				const struct key_action *act = &KEY_ACTIONS[k];
+
+				if (!streq_ci(buf, act->event_line))
+					continue;
+				if (!strcmp(act->event_line, "KEY 2 DOWN"))
+					break;
+				if (*view == VIEW_SESSION_PICKER) {
+					/* Leaving the picker: tell hid_input
+					 * so the HID send path stops treating
+					 * outgoing key events as picker-local. */
+					ui_ctrl_emit_view("terminal");
+				}
+				*view = VIEW_PET;
+				key_overlay_show(act->label);
+				pet->scene = act->scene;
+				pet->last_interaction_ms = monotonic_now_ms();
+				release_intro_surfaces();
+				break;
+			}
+			len = 0;
 		}
 	}
 }
@@ -3313,7 +4697,8 @@ static int parse_cell_size(const char *s, int *out_w, int *out_h)
 	return 0;
 }
 
-static void process_ctrl_fd(int fd, struct font_ctx *font, struct terminal *t)
+static void process_ctrl_fd(int fd, struct font_ctx *font, struct terminal *t,
+			    enum app_view *view)
 {
 	static char buf[64];
 	static size_t len;
@@ -3338,11 +4723,30 @@ static void process_ctrl_fd(int fd, struct font_ctx *font, struct terminal *t)
 			if (ch == '\n') {
 				int w;
 				int h;
+				enum app_view next_view;
+				unsigned sid_val;
+				char state_name[24];
 
 				buf[len] = '\0';
 				if (len > 0 &&
 				    sscanf(buf, "cell %d %d", &w, &h) == 2)
 					apply_cell_size(font, t, w, h);
+				else if (len > 5 &&
+					 !strncmp(buf, "view ", 5) &&
+					 parse_view(buf + 5, &next_view) == 0) {
+					*view = next_view;
+					release_intro_surfaces();
+				} else if (sscanf(buf, "session %u state %23s",
+						   &sid_val, state_name) == 2 &&
+					   sid_val != 0) {
+					enum board_session_state st;
+					if (board_session_state_from_name(state_name, &st))
+						board_session_upsert((uint16_t)sid_val, st);
+				} else if (sscanf(buf, "session %u removed",
+						   &sid_val) == 1 &&
+					   sid_val != 0) {
+					board_session_remove((uint16_t)sid_val);
+				}
 				len = 0;
 			} else if (len + 1 < sizeof(buf)) {
 				buf[len++] = ch;
@@ -3353,17 +4757,59 @@ static void process_ctrl_fd(int fd, struct font_ctx *font, struct terminal *t)
 	}
 }
 
+static void render_terminal_waiting_overlay(struct canvas *c,
+					    const struct ui_model *model)
+{
+	const char *msg = "WAITING FOR HOST TERMINAL STREAM";
+	int W = c->w;
+	int H = c->h;
+	int tw = text_w(msg, 2);
+	int box_w = tw + 80;
+	if (box_w > W - 60)
+		box_w = W - 60;
+	int box_h = 96;
+	int box_x = (W - box_w) / 2;
+	int box_y = (H - box_h) / 2;
+
+	fill_rect(c, box_x, box_y, box_w, box_h, 0x080807);
+	stroke_round_rect(c, box_x, box_y, box_w, box_h, 6, 0xf4b83d);
+	int tx = (W - tw) / 2;
+	int ty = box_y + 18;
+	draw_text(c, tx, ty, msg, 2, 0xffc233);
+
+	if (model->count > 0) {
+		char buf[96];
+		int idx = model->focus;
+		if (idx < 0 || idx >= model->count)
+			idx = 0;
+		const struct ui_session *s = &model->sessions[idx];
+		snprintf(buf, sizeof(buf), "session: %s",
+			 s->id[0] ? s->id : "-");
+		int sw = text_w(buf, 1);
+		draw_text(c, (W - sw) / 2, ty + 50, buf, 1, 0xa77a3d);
+	} else {
+		const char *sub = "no sessions registered yet";
+		int sw = text_w(sub, 1);
+		draw_text(c, (W - sw) / 2, ty + 50, sub, 1, 0xa77a3d);
+	}
+}
+
 static void render_app(struct canvas *c, enum app_view view,
 		       const struct ui_model *model, const struct terminal *term,
 		       struct font_ctx *font, const struct kitty_graphics *kitty,
 		       struct pet_state *pet)
 {
-	if (view == VIEW_TERMINAL)
+	if (view == VIEW_TERMINAL) {
 		render_terminal(c, term, font, kitty);
-	else if (view == VIEW_DASHBOARD)
-		render_dashboard(c, model);
-	else
-		render_pet(c, pet);
+		if (!g_terminal_has_data)
+			render_terminal_waiting_overlay(c, model);
+	} else if (view == VIEW_DASHBOARD) {
+		render_dashboard(c, model, font, pet);
+	} else if (view == VIEW_SESSION_PICKER) {
+		render_session_picker(c, model, font, pet);
+	} else {
+		render_pet(c, font, pet);
+	}
 }
 
 static void render_frame(struct canvas *c, enum app_view view,
@@ -3385,6 +4831,9 @@ static void render_frame(struct canvas *c, enum app_view view,
 		return;
 	}
 	render_app(c, view, model, term, font, kitty, pet);
+	/* No bottom-left pet overlay: action keys swap the view to VIEW_PET
+	 * (mascot centred, video-style header/footer); dashboard / picker /
+	 * terminal show data layouts without an extra mascot layer. */
 }
 
 static void usage(const char *argv0)
@@ -3396,14 +4845,22 @@ static void usage(const char *argv0)
 	printf("  --event-input PATH local button/encoder event FIFO for pet view\n");
 	printf("  --font PATH        preferred TrueType/OpenType font path\n");
 	printf("  --cell WxH         initial terminal cell size; one of 8x16, 10x20, 12x24, 16x32\n");
-	printf("  --ctrl PATH        runtime control FIFO; lines like \"cell 12 24\" change font size\n");
+	printf("  --ctrl PATH        runtime control FIFO; lines like \"cell 12 24\" or \"view terminal\"\n");
+	printf("  --ui-ctrl-out PATH ui-ctrl FIFO toward aikb_hid_input: emits \"view picker|terminal\", \"select N\", \"focus N\"\n");
 	printf("  --splash PATH      raw 960x412 0x00RRGGBB splash shown until first input byte\n");
+	printf("  --ui-shell PATH    raw 960x412 dashboard shell background\n");
 	printf("  --boot-anim PATH   AKIM container (scripts/make_boot_anim.py) played once before splash\n");
 	printf("  --wait-anim PATH   AKIM container with LOOP flag, replays until first input byte\n");
+	printf("  --pet-asset-root PATH directory containing pet AKIM files such as asking.akim\n");
+	printf("  --pet-scene SCENE  initial pet scene for dumps/tests\n");
+	printf("  --pet-pose POSE    initial pet pose: idle/thinking/happy/confused/sleepy\n");
+	printf("  --pet-progress N   initial pet progress, 0..100\n");
+	printf("  --pet-force-fallback draw the C fallback pet even if AKIM assets load\n");
 	printf("  --rotate MODE      auto, none, cw, ccw (default auto)\n");
 	printf("  --pixel-format FMT auto, fb, argb8888, abgr8888 (default auto)\n");
 	printf("  --alpha N          framebuffer alpha byte, 0..255 (default 255)\n");
 	printf("  --dump-ppm PATH    render one frame to a PPM file\n");
+	printf("  --pet-qa-dump PATH write pet character asset/bbox/color QA text\n");
 	printf("  --once             draw one framebuffer frame, hold briefly, and exit\n");
 	printf("  --hold MS          hold time for --once, 0..60000 (default 3000)\n");
 	printf("  --no-mock          start with an empty UI model\n");
@@ -3419,8 +4876,11 @@ int main(int argc, char **argv)
 	const char *ctrl_path = NULL;
 	const char *event_input_path = NULL;
 	const char *splash_path = NULL;
+	const char *ui_shell_path = NULL;
 	const char *boot_anim_path = NULL;
 	const char *wait_anim_path = NULL;
+	const char *pet_asset_root = NULL;
+	const char *pet_qa_dump_path = NULL;
 	enum rotation rotate = ROT_AUTO;
 	enum pixel_format pixel_format = PIXEL_FMT_AUTO;
 	enum app_view view = VIEW_TERMINAL;
@@ -3430,6 +4890,10 @@ int main(int argc, char **argv)
 	int once_hold_ms = 3000;
 	int initial_cell_w = g_cell_w;
 	int initial_cell_h = g_cell_h;
+	enum pet_scene initial_pet_scene = PET_SCENE_ASKING;
+	enum pet_pose initial_pet_pose = PET_POSE_THINKING;
+	int initial_pet_progress = 58;
+	bool initial_pet_pose_set = false;
 	struct canvas c = {
 		.w = UI_W,
 		.h = UI_H,
@@ -3469,14 +4933,39 @@ int main(int argc, char **argv)
 			}
 		} else if (!strcmp(argv[i], "--ctrl") && i + 1 < argc) {
 			ctrl_path = argv[++i];
+		} else if (!strcmp(argv[i], "--ui-ctrl-out") && i + 1 < argc) {
+			g_ui_ctrl_out_path = argv[++i];
 		} else if (!strcmp(argv[i], "--event-input") && i + 1 < argc) {
 			event_input_path = argv[++i];
 		} else if (!strcmp(argv[i], "--splash") && i + 1 < argc) {
 			splash_path = argv[++i];
+		} else if (!strcmp(argv[i], "--ui-shell") && i + 1 < argc) {
+			ui_shell_path = argv[++i];
 		} else if (!strcmp(argv[i], "--boot-anim") && i + 1 < argc) {
 			boot_anim_path = argv[++i];
 		} else if (!strcmp(argv[i], "--wait-anim") && i + 1 < argc) {
 			wait_anim_path = argv[++i];
+		} else if (!strcmp(argv[i], "--pet-asset-root") && i + 1 < argc) {
+			pet_asset_root = argv[++i];
+		} else if (!strcmp(argv[i], "--pet-scene") && i + 1 < argc) {
+			if (!parse_pet_scene(argv[++i], &initial_pet_scene)) {
+				usage(argv[0]);
+				return 2;
+			}
+		} else if (!strcmp(argv[i], "--pet-pose") && i + 1 < argc) {
+			if (!parse_pet_pose(argv[++i], &initial_pet_pose)) {
+				usage(argv[0]);
+				return 2;
+			}
+			initial_pet_pose_set = true;
+		} else if (!strcmp(argv[i], "--pet-progress") && i + 1 < argc) {
+			if (parse_int_arg(argv[++i], 0, 100,
+					  &initial_pet_progress) < 0) {
+				usage(argv[0]);
+				return 2;
+			}
+		} else if (!strcmp(argv[i], "--pet-force-fallback")) {
+			g_pet_force_fallback = true;
 		} else if (!strcmp(argv[i], "--rotate") && i + 1 < argc) {
 			rotate = parse_rotation(argv[++i]);
 		} else if (!strcmp(argv[i], "--pixel-format") && i + 1 < argc) {
@@ -3488,6 +4977,8 @@ int main(int argc, char **argv)
 			}
 		} else if (!strcmp(argv[i], "--dump-ppm") && i + 1 < argc) {
 			dump_path = argv[++i];
+		} else if (!strcmp(argv[i], "--pet-qa-dump") && i + 1 < argc) {
+			pet_qa_dump_path = argv[++i];
 		} else if (!strcmp(argv[i], "--once")) {
 			once = true;
 		} else if (!strcmp(argv[i], "--hold") && i + 1 < argc) {
@@ -3520,11 +5011,17 @@ int main(int argc, char **argv)
 
 	if (splash_path)
 		load_splash(splash_path);
+	if (ui_shell_path)
+		load_ui_shell(ui_shell_path);
 	if (boot_anim_path)
 		anim_load(&g_boot_anim, boot_anim_path);
 	if (wait_anim_path)
 		anim_load(&g_wait_anim, wait_anim_path);
-	pet_akim_load(&g_pet_asking_anim, PET_ASKING_AKIM_PATH);
+	if (pet_asset_root)
+		pet_set_asset_root(pet_asset_root);
+	for (int i = 0; i < PET_SCENE_COUNT; i++)
+		pet_akim_load(&g_pet_anims[i], pet_asset_manifest((enum pet_scene)i),
+			      &g_pet_anim_argb8888[i]);
 
 	g_cell_w = initial_cell_w;
 	g_cell_h = initial_cell_h;
@@ -3541,6 +5038,10 @@ int main(int argc, char **argv)
 	else
 		terminal_reset(&term);
 	pet_init(&pet);
+	pet_set_scene(&pet, initial_pet_scene, NULL);
+	if (initial_pet_pose_set)
+		pet_set_pose(&pet, initial_pet_pose);
+	pet.progress = initial_pet_progress;
 	if (!font_init(&font, font_path))
 		warnf("freetype font unavailable; falling back to built-in 8x16 glyphs");
 
@@ -3550,11 +5051,15 @@ int main(int argc, char **argv)
 	}
 
 	render_app(&c, view, &model, &term, &font, kitty, &pet);
+	if (pet_qa_dump_path && pet_write_qa_dump(pet_qa_dump_path, &c, &pet) < 0)
+		ret = 1;
 	if (dump_path) {
-		ret = write_ppm(dump_path, &c);
+		if (write_ppm(dump_path, &c) < 0)
+			ret = 1;
 		kitty_graphics_destroy(kitty);
 		font_destroy(&font);
-		anim_release(&g_pet_asking_anim);
+		for (int i = 0; i < PET_SCENE_COUNT; i++)
+			anim_release(&g_pet_anims[i]);
 		free(c.px);
 		return ret ? 1 : 0;
 	}
@@ -3665,14 +5170,13 @@ int main(int argc, char **argv)
 
 		if (poll(pfds, nfds, timeout) <= 0)
 			continue;
+		if (ctrl_idx >= 0 && (pfds[ctrl_idx].revents & POLLIN))
+			process_ctrl_fd(ctrl_fd, &font, &term, &view);
 		if (input_idx >= 0 && (pfds[input_idx].revents & POLLIN))
 			process_input_fd(input_fd, &model, &term, kitty, &pet,
 					 &view);
-		if (ctrl_idx >= 0 && (pfds[ctrl_idx].revents & POLLIN))
-			process_ctrl_fd(ctrl_fd, &font, &term);
-		if (event_idx >= 0 && (pfds[event_idx].revents & POLLIN) &&
-		    view == VIEW_PET)
-			process_event_fd(event_fd, &pet);
+		if (event_idx >= 0 && (pfds[event_idx].revents & POLLIN))
+			process_event_fd(event_fd, &pet, &view);
 		if (term.clear_graphics) {
 			kitty_graphics_clear(kitty);
 			term.clear_graphics = false;
@@ -3691,9 +5195,12 @@ int main(int argc, char **argv)
 	free(c.px);
 	free(g_splash);
 	g_splash = NULL;
+	free(g_ui_shell);
+	g_ui_shell = NULL;
 	g_show_splash = false;
 	anim_release(&g_boot_anim);
 	anim_release(&g_wait_anim);
-	anim_release(&g_pet_asking_anim);
+	for (int i = 0; i < PET_SCENE_COUNT; i++)
+		anim_release(&g_pet_anims[i]);
 	return ret;
 }
