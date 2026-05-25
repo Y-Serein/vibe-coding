@@ -70,11 +70,16 @@
 #define CMD_SESSION_FOCUS 0x05       /* B->H when board selects a sid */
 #define CMD_KEY_EVENT 0x10
 #define CMD_ENCODER_EVENT 0x11
+#define CMD_PERMISSION_RES 0x12      /* B->H: req_id(8B LE) + decision(allow/deny/always) */
 #define CMD_WINDOW_SWITCH 0x20       /* deprecated: board ignores */
 #define CMD_WINDOW_ACTIVATE 0x21     /* deprecated: board ignores */
 #define CMD_VT100_STREAM 0x30
 #define CMD_UI_SCALE_CHANGE 0x40
 #define CMD_STATUS_UPDATE 0x50
+#define CMD_TOKEN_USAGE 0x51    /* H->B: token in/out/cost_cents per sid (3x u64 LE) */
+#define CMD_TURN_APPEND 0x52    /* H->B: conversation turn chunk; role(1B) + text */
+#define CMD_PERMISSION_REQ 0x53 /* H->B: pending permission; req_id(8B) + tool_len(1B) + tool + args */
+#define CMD_AGENT_META 0x54     /* H->B: agent meta; kind(1B) + cwd_len(1B) + cwd + branch */
 #define CMD_FEEDBACK_EVENT 0x60
 #define CMD_ERROR 0xFF
 
@@ -167,6 +172,14 @@ enum board_view {
 static enum board_view g_view = BOARD_VIEW_TERMINAL;
 static uint16_t g_active_sid = 0;    /* terminal view: sid whose VT100 we render */
 static uint16_t g_selected_sid = 0;  /* picker view: sid currently highlighted */
+static uint64_t g_diag_vt100_rx_pkts;
+static uint64_t g_diag_vt100_rx_bytes;
+static uint64_t g_diag_vt100_fwd_pkts;
+static uint64_t g_diag_vt100_fwd_bytes;
+static uint64_t g_diag_vt100_drop_dead;
+static uint64_t g_diag_vt100_drop_sid;
+static uint64_t g_diag_vt100_write_retry;
+static uint64_t g_diag_vt100_write_fail;
 
 static const struct pin_def g_keys[] = {
 	{ "key0_P19", GPIO_BANK_E, 19, 0x030010d4u, 0x05027090u, 0x0502705cu },
@@ -698,6 +711,17 @@ static int send_session_focus(int hid_fd, uint16_t sid, bool debug)
 			       sid, NULL, 0, debug);
 }
 
+static int send_permission_response(int hid_fd, uint16_t sid, uint64_t req_id,
+				    uint8_t decision, bool debug)
+{
+	uint8_t payload[9];
+
+	memcpy(payload, &req_id, 8);
+	payload[8] = decision;
+	return send_hid_packet(hid_fd, REPORT_ID_HOST_BOUND, CMD_PERMISSION_RES,
+			       sid, payload, sizeof(payload), debug);
+}
+
 static int write_event_line(int *event_fd, const char *path, const char *line,
 			    bool debug)
 {
@@ -819,6 +843,8 @@ static int write_ctrl_line(int *ctrl_fd, const char *path, const char *line,
 	return 0;
 }
 
+static void sanitize_inline_text(char *buf, size_t len);
+
 /* Write a "session N state X" / "session N removed" line to the ctrl-out FIFO
  * so aikb_lcd_ui can mirror the board-side session table into its grid. */
 static void emit_session_state_line(int *ctrl_fd, const struct config *cfg,
@@ -836,6 +862,23 @@ static void emit_session_state_line(int *ctrl_fd, const struct config *cfg,
 				      cfg->debug);
 }
 
+static void emit_session_hint_line(int *ctrl_fd, const struct config *cfg,
+				   uint16_t sid)
+{
+	char hint[PLUGIN_HINT_MAX];
+	char line[PLUGIN_HINT_MAX + 32];
+	int n;
+
+	if (!cfg->ctrl_out_path || sid == 0 || !session_alive(sid))
+		return;
+	snprintf(hint, sizeof(hint), "%s", g_sessions[sid].plugin_hint);
+	sanitize_inline_text(hint, strlen(hint));
+	n = snprintf(line, sizeof(line), "session %u hint %s\n", sid, hint);
+	if (n > 0 && n < (int)sizeof(line))
+		(void)write_ctrl_line(ctrl_fd, cfg->ctrl_out_path, line,
+				      cfg->debug);
+}
+
 static void emit_session_removed_line(int *ctrl_fd, const struct config *cfg,
 				      uint16_t sid)
 {
@@ -845,6 +888,180 @@ static void emit_session_removed_line(int *ctrl_fd, const struct config *cfg,
 	if (!cfg->ctrl_out_path || sid == 0)
 		return;
 	n = snprintf(line, sizeof(line), "session %u removed\n", sid);
+	if (n > 0 && n < (int)sizeof(line))
+		(void)write_ctrl_line(ctrl_fd, cfg->ctrl_out_path, line,
+				      cfg->debug);
+}
+
+/* Sanitize free-text fields embedded in ctrl-out lines: aikb_lcd_ui parses
+ * one line at a time, so any CR/LF/TAB in user-supplied text must be folded
+ * to plain spaces before emission. Modifies buf in place. */
+static void sanitize_inline_text(char *buf, size_t len)
+{
+	size_t i;
+
+	for (i = 0; i < len && buf[i] != '\0'; i++) {
+		if (buf[i] == '\n' || buf[i] == '\r' || buf[i] == '\t')
+			buf[i] = ' ';
+	}
+}
+
+static const char *turn_role_name(uint8_t role)
+{
+	switch (role) {
+	case 0:
+		return "user";
+	case 1:
+		return "assistant";
+	case 2:
+		return "tool";
+	case 3:
+		return "system";
+	default:
+		return "unknown";
+	}
+}
+
+static const char *agent_kind_name(uint8_t kind)
+{
+	switch (kind) {
+	case 0:
+		return "claude";
+	case 1:
+		return "codex";
+	case 2:
+		return "vscode";
+	case 3:
+		return "cursor";
+	case 4:
+		return "browser";
+	default:
+		return "unknown";
+	}
+}
+
+/* TOKEN_USAGE payload: 3x uint64_t LE (input / output / cost_cents). */
+static void emit_token_line(int *ctrl_fd, const struct config *cfg,
+			    uint16_t sid, const uint8_t *payload, uint16_t plen)
+{
+	uint64_t input, output, cost;
+	char line[80];
+	int n;
+
+	if (!cfg->ctrl_out_path || sid == 0 || plen < 24)
+		return;
+	memcpy(&input, payload + 0, 8);
+	memcpy(&output, payload + 8, 8);
+	memcpy(&cost, payload + 16, 8);
+	n = snprintf(line, sizeof(line),
+		     "session %u token in=%llu out=%llu cost=%llu\n",
+		     sid, (unsigned long long)input,
+		     (unsigned long long)output, (unsigned long long)cost);
+	if (n > 0 && n < (int)sizeof(line))
+		(void)write_ctrl_line(ctrl_fd, cfg->ctrl_out_path, line,
+				      cfg->debug);
+}
+
+/* TURN_APPEND payload: role(1B) + utf-8 text chunk (≤ HID_MAX_PAYLOAD-1). */
+static void emit_turn_line(int *ctrl_fd, const struct config *cfg,
+			   uint16_t sid, const uint8_t *payload, uint16_t plen)
+{
+	uint8_t role;
+	char text[HID_MAX_PAYLOAD];
+	char line[HID_MAX_PAYLOAD + 48];
+	size_t tlen;
+	int n;
+
+	if (!cfg->ctrl_out_path || sid == 0 || plen < 1)
+		return;
+	role = payload[0];
+	tlen = (size_t)plen - 1;
+	if (tlen >= sizeof(text))
+		tlen = sizeof(text) - 1;
+	memcpy(text, payload + 1, tlen);
+	text[tlen] = '\0';
+	sanitize_inline_text(text, tlen);
+	n = snprintf(line, sizeof(line), "session %u turn role=%s text:%s\n",
+		     sid, turn_role_name(role), text);
+	if (n > 0 && n < (int)sizeof(line))
+		(void)write_ctrl_line(ctrl_fd, cfg->ctrl_out_path, line,
+				      cfg->debug);
+}
+
+/* PERMISSION_REQ payload: req_id(8B LE) + tool_len(1B) + tool + args_summary. */
+static void emit_permission_line(int *ctrl_fd, const struct config *cfg,
+				 uint16_t sid, const uint8_t *payload,
+				 uint16_t plen)
+{
+	uint64_t req_id;
+	uint8_t tool_len;
+	char tool[32];
+	char args[HID_MAX_PAYLOAD];
+	char line[HID_MAX_PAYLOAD + 80];
+	size_t alen;
+	int n;
+
+	if (!cfg->ctrl_out_path || sid == 0 || plen < 9)
+		return;
+	memcpy(&req_id, payload + 0, 8);
+	tool_len = payload[8];
+	if (tool_len > sizeof(tool) - 1)
+		tool_len = sizeof(tool) - 1;
+	if ((size_t)9 + tool_len > (size_t)plen)
+		return;
+	memcpy(tool, payload + 9, tool_len);
+	tool[tool_len] = '\0';
+	sanitize_inline_text(tool, tool_len);
+
+	alen = (size_t)plen - 9 - tool_len;
+	if (alen >= sizeof(args))
+		alen = sizeof(args) - 1;
+	memcpy(args, payload + 9 + tool_len, alen);
+	args[alen] = '\0';
+	sanitize_inline_text(args, alen);
+
+	n = snprintf(line, sizeof(line),
+		     "session %u permission reqid=%llu tool=%s args:%s\n",
+		     sid, (unsigned long long)req_id, tool, args);
+	if (n > 0 && n < (int)sizeof(line))
+		(void)write_ctrl_line(ctrl_fd, cfg->ctrl_out_path, line,
+				      cfg->debug);
+}
+
+/* AGENT_META payload: kind(1B) + cwd_len(1B) + cwd + branch. */
+static void emit_meta_line(int *ctrl_fd, const struct config *cfg,
+			   uint16_t sid, const uint8_t *payload, uint16_t plen)
+{
+	uint8_t kind;
+	uint8_t cwd_len;
+	char cwd[HID_MAX_PAYLOAD];
+	char branch[HID_MAX_PAYLOAD];
+	char line[HID_MAX_PAYLOAD + 64];
+	size_t blen;
+	int n;
+
+	if (!cfg->ctrl_out_path || sid == 0 || plen < 2)
+		return;
+	kind = payload[0];
+	cwd_len = payload[1];
+	if (cwd_len > sizeof(cwd) - 1)
+		cwd_len = sizeof(cwd) - 1;
+	if ((size_t)2 + cwd_len > (size_t)plen)
+		return;
+	memcpy(cwd, payload + 2, cwd_len);
+	cwd[cwd_len] = '\0';
+	sanitize_inline_text(cwd, cwd_len);
+
+	blen = (size_t)plen - 2 - cwd_len;
+	if (blen >= sizeof(branch))
+		blen = sizeof(branch) - 1;
+	memcpy(branch, payload + 2 + cwd_len, blen);
+	branch[blen] = '\0';
+	sanitize_inline_text(branch, blen);
+
+	n = snprintf(line, sizeof(line),
+		     "session %u meta kind=%s cwd=%s branch=%s\n",
+		     sid, agent_kind_name(kind), cwd, branch);
 	if (n > 0 && n < (int)sizeof(line))
 		(void)write_ctrl_line(ctrl_fd, cfg->ctrl_out_path, line,
 				      cfg->debug);
@@ -909,6 +1126,7 @@ static void handle_packet(int hid_fd, int *screen_fd, int *ctrl_fd,
 					      CMD_SESSION_RESPONSE, new_sid,
 					      &st, 1, cfg->debug);
 			emit_session_state_line(ctrl_fd, cfg, new_sid);
+			emit_session_hint_line(ctrl_fd, cfg, new_sid);
 		} else {
 			uint8_t st = SESSION_POOL_FULL;
 			(void)send_hid_packet(hid_fd, REPORT_ID_HOST_BOUND,
@@ -920,6 +1138,8 @@ static void handle_packet(int hid_fd, int *screen_fd, int *ctrl_fd,
 	}
 
 	case CMD_SESSION_HEARTBEAT:
+		if (sid == SESSION_BROADCAST)
+			break;
 		if (!session_alive(sid)) {
 			/* Host thinks this sid lives, but board has already freed
 			 * it. Tell host so it stops the heartbeat thread. */
@@ -940,8 +1160,18 @@ static void handle_packet(int hid_fd, int *screen_fd, int *ctrl_fd,
 		break;
 
 	case CMD_VT100_STREAM:
+		g_diag_vt100_rx_pkts++;
+		g_diag_vt100_rx_bytes += plen;
 		if (!session_alive(sid)) {
 			uint8_t st = SESSION_INVALID_S;
+			g_diag_vt100_drop_dead++;
+			if (cfg->debug)
+				fprintf(stderr,
+					"aikb_hid_input: rx vt100 sid=%u active=%u plen=%u drop=dead rx=%" PRIu64 "/%" PRIu64 " dead=%" PRIu64 "\n",
+					sid, g_active_sid, plen,
+					g_diag_vt100_rx_pkts,
+					g_diag_vt100_rx_bytes,
+					g_diag_vt100_drop_dead);
 			(void)send_hid_packet(hid_fd, REPORT_ID_HOST_BOUND,
 					      CMD_SESSION_INVALID, sid, &st, 1,
 					      cfg->debug);
@@ -949,11 +1179,38 @@ static void handle_packet(int hid_fd, int *screen_fd, int *ctrl_fd,
 		}
 		touch_session(sid, now);
 		/* Stream gate: only the focused window's bytes reach the screen. */
-		if (sid != g_active_sid)
+		if (sid != g_active_sid) {
+			g_diag_vt100_drop_sid++;
+			if (cfg->debug)
+				fprintf(stderr,
+					"aikb_hid_input: rx vt100 sid=%u active=%u plen=%u drop=inactive rx=%" PRIu64 "/%" PRIu64 " sid_drop=%" PRIu64 "\n",
+					sid, g_active_sid, plen,
+					g_diag_vt100_rx_pkts,
+					g_diag_vt100_rx_bytes,
+					g_diag_vt100_drop_sid);
 			break;
+		}
 		if (cfg->screen_out_path && plen > 0) {
-			(void)write_screen_bytes(screen_fd, cfg->screen_out_path,
-						 payload, plen, cfg->debug);
+			int rc = write_screen_bytes(screen_fd, cfg->screen_out_path,
+						    payload, plen, cfg->debug);
+			if (rc == 0) {
+				g_diag_vt100_fwd_pkts++;
+				g_diag_vt100_fwd_bytes += plen;
+			} else if (rc > 0) {
+				g_diag_vt100_write_retry++;
+			} else {
+				g_diag_vt100_write_fail++;
+			}
+			if (cfg->debug)
+				fprintf(stderr,
+					"aikb_hid_input: rx vt100 sid=%u active=%u plen=%u fwd_rc=%d rx=%" PRIu64 "/%" PRIu64 " fwd=%" PRIu64 "/%" PRIu64 " retry=%" PRIu64 " fail=%" PRIu64 "\n",
+					sid, g_active_sid, plen, rc,
+					g_diag_vt100_rx_pkts,
+					g_diag_vt100_rx_bytes,
+					g_diag_vt100_fwd_pkts,
+					g_diag_vt100_fwd_bytes,
+					g_diag_vt100_write_retry,
+					g_diag_vt100_write_fail);
 		}
 		break;
 
@@ -969,6 +1226,34 @@ static void handle_packet(int hid_fd, int *screen_fd, int *ctrl_fd,
 				emit_session_state_line(ctrl_fd, cfg, sid);
 			}
 		}
+		break;
+
+	case CMD_TOKEN_USAGE:
+		if (!session_alive(sid))
+			break;
+		touch_session(sid, now);
+		emit_token_line(ctrl_fd, cfg, sid, payload, plen);
+		break;
+
+	case CMD_TURN_APPEND:
+		if (!session_alive(sid))
+			break;
+		touch_session(sid, now);
+		emit_turn_line(ctrl_fd, cfg, sid, payload, plen);
+		break;
+
+	case CMD_PERMISSION_REQ:
+		if (!session_alive(sid))
+			break;
+		touch_session(sid, now);
+		emit_permission_line(ctrl_fd, cfg, sid, payload, plen);
+		break;
+
+	case CMD_AGENT_META:
+		if (!session_alive(sid))
+			break;
+		touch_session(sid, now);
+		emit_meta_line(ctrl_fd, cfg, sid, payload, plen);
 		break;
 
 	case CMD_UI_SCALE_CHANGE:
@@ -1071,6 +1356,9 @@ static void apply_ui_ctrl_line(int hid_fd, int *ctrl_fd,
 			       const struct config *cfg, const char *line)
 {
 	unsigned val;
+	unsigned long long req_id;
+	char decision_name[16];
+	uint8_t decision;
 
 	if (!line[0])
 		return;
@@ -1106,6 +1394,37 @@ static void apply_ui_ctrl_line(int hid_fd, int *ctrl_fd,
 		if (hid_fd >= 0)
 			(void)send_session_focus(hid_fd, (uint16_t)val,
 						 cfg->debug);
+		(void)ctrl_fd;
+		return;
+	}
+	if (sscanf(line, "permission %u reqid=%llu decision=%15s",
+		   &val, &req_id, decision_name) == 3) {
+		if (val == 0 || val > MAX_SESSIONS ||
+		    !g_sessions[val].used ||
+		    g_sessions[val].disconnected) {
+			if (cfg->debug)
+				fprintf(stderr,
+					"aikb_hid_input: permission %u rejected (not alive)\n",
+					val);
+			return;
+		}
+		if (!strcmp(decision_name, "allow"))
+			decision = 0;
+		else if (!strcmp(decision_name, "deny"))
+			decision = 1;
+		else if (!strcmp(decision_name, "always"))
+			decision = 2;
+		else {
+			if (cfg->debug)
+				fprintf(stderr,
+					"aikb_hid_input: unknown permission decision: %s\n",
+					decision_name);
+			return;
+		}
+		if (hid_fd >= 0)
+			(void)send_permission_response(hid_fd, (uint16_t)val,
+						       (uint64_t)req_id,
+						       decision, cfg->debug);
 		(void)ctrl_fd;
 		return;
 	}

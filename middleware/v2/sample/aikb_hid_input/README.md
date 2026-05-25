@@ -50,6 +50,10 @@ byte..63 = zero pad
 | 0x04 | `CMD_SESSION_HEARTBEAT` | empty; host must send one every 10s per live sid (`sid` field carries the target) |
 | 0x30 | `CMD_VT100_STREAM` | raw VT100 bytes — only forwarded to the screen FIFO when `sid == g_active_sid` (board-focused window) |
 | 0x50 | `CMD_STATUS_UPDATE` | `[state]` (1 byte `SessionState`: `CONNECTED/DISCONNECTED/RUN/WAIT/DONE/ERROR`); board stores it for the grid row |
+| 0x51 | `CMD_TOKEN_USAGE` | `[input:u64 LE][output:u64 LE][cost_cents:u64 LE]` (24 B); forwarded as `session N token in=X out=Y cost=Z` to `--ctrl-out` |
+| 0x52 | `CMD_TURN_APPEND` | `[role:u8][text:utf-8]` (role 0=user 1=assistant 2=tool 3=system); forwarded as `session N turn role=... text:...` |
+| 0x53 | `CMD_PERMISSION_REQ` | `[req_id:u64 LE][tool_len:u8][tool][args_summary]`; forwarded as `session N permission reqid=... tool=... args:...` |
+| 0x54 | `CMD_AGENT_META` | `[kind:u8][cwd_len:u8][cwd][branch]` (kind 0=claude 1=codex 2=vscode 3=cursor 4=browser); forwarded as `session N meta kind=... cwd=... branch=...` |
 | 0x40 | `CMD_UI_SCALE_CHANGE` | forwards `cell W H` to `aikb_lcd_ui --ctrl` |
 | 0x20 | `CMD_WINDOW_SWITCH` | **deprecated**: board owns its own UI now; firmware ignores it |
 | 0x21 | `CMD_WINDOW_ACTIVATE` | **deprecated**: board owns its own UI now; firmware ignores it |
@@ -63,6 +67,7 @@ byte..63 = zero pad
 | 0x05 | `CMD_SESSION_FOCUS` | empty; `sid` is the session the on-board picker confirmed. Host opens the VT100 stream gate so only this sid's bytes are sent back. |
 | 0x10 | `CMD_KEY_EVENT` | `[key_bits, encoder_pressed]` — bits 0..6 = newly pressed key0..key6 edges, bit7 reserved, byte1 bit0 = encoder switch press edge |
 | 0x11 | `CMD_ENCODER_EVENT` | `[delta:int8]` — left −1, right +1 |
+| 0x12 | `CMD_PERMISSION_RES` | `[req_id:u64 LE][decision:u8]` where decision is `0=allow`, `1=deny`, `2=always`; emitted when the picker approves/rejects a pending permission. |
 
 `CMD_KEY_EVENT` and `CMD_ENCODER_EVENT` always carry the **currently-displayed
 sid** (the board's `g_active_sid` while in the terminal view). Picker-view
@@ -108,6 +113,8 @@ view terminal        # board returned to the terminal view
 select N             # picker highlight moved to sid N
 focus N              # picker confirmed sid N — board emits CMD_SESSION_FOCUS
                      # and switches g_view back to BOARD_VIEW_TERMINAL
+permission N reqid=R decision=allow|deny|always
+                     # picker answered pending permission R for sid N
 ```
 
 The reverse direction (`--ctrl-out`, hid_input → lcd_ui) carries the existing
@@ -115,6 +122,7 @@ The reverse direction (`--ctrl-out`, hid_input → lcd_ui) carries the existing
 
 ```text
 session N state X    # X ∈ {connected, disconnected, run, wait, done, error}
+session N hint TEXT  # host label from CMD_REQUEST_SESSION, e.g. terminal profile
 session N removed    # entry was freed by the 60 s GC
 ```
 

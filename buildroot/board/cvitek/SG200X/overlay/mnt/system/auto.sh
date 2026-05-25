@@ -13,10 +13,10 @@ AIKB_PET_EVENTS="/tmp/aikb_pet_events.in"
 # Reverse-direction control FIFO: aikb_lcd_ui --ui-ctrl-out → aikb_hid_input
 # --ui-ctrl-in. Carries "view picker|terminal", "select N", "focus N".
 AIKB_UI_CTRL="/tmp/aikb_ui_ctrl.in"
-AIKB_LCD_SPLASH="/mnt/system/usr/share/aikb/splash.argb"
+AIKB_LCD_SPLASH=""
 AIKB_UI_SHELL="/mnt/system/usr/share/aikb/ui/session_shell.argb"
-AIKB_LCD_BOOT_ANIM="/mnt/system/usr/share/aikb/boot_anim.bin"
-AIKB_LCD_WAIT_ANIM="/mnt/system/usr/share/aikb/wait_cycle.bin"
+AIKB_LCD_BOOT_ANIM="/mnt/system/usr/share/aikb/boot/vedio_start.akim"
+AIKB_LCD_WAIT_ANIM=""
 
 prepare_aikb_lcd_input()
 {

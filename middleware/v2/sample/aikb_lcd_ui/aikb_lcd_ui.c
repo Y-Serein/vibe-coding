@@ -56,14 +56,19 @@
 #define TERM_PAD_Y 8
 #define TERM_STATUS_H 28
 /*
- * Cell geometry is runtime-tunable. Static cell[][] is sized for the smallest
- * preset; the active preset narrows g_cols/g_rows so out-of-band rows/cols stay
- * untouched. host CMD_UI_SCALE_CHANGE drives apply_cell_size().
+ * Cell geometry is runtime-tunable. The visible LCD grid is still capped by
+ * TERM_ROWS_VISIBLE_MAX, but the backing store is taller so fullscreen TUIs
+ * created for a large Windows Terminal can be viewed around the active cursor
+ * instead of showing only their blank top-left corner.
  */
 #define TERM_CELL_W_MIN 8
 #define TERM_CELL_H_MIN 16
-#define TERM_COLS_MAX ((UI_W - TERM_PAD_X * 2) / TERM_CELL_W_MIN)
-#define TERM_ROWS_MAX ((UI_H - TERM_STATUS_H - TERM_PAD_Y) / TERM_CELL_H_MIN)
+#define TERM_COLS_VISIBLE_MAX ((UI_W - TERM_PAD_X * 2) / TERM_CELL_W_MIN)
+#define TERM_COLS_MAX 200
+#define TERM_ROWS_VISIBLE_MAX ((UI_H - TERM_STATUS_H - TERM_PAD_Y) / TERM_CELL_H_MIN)
+#define TERM_ROWS_MAX 96
+#define TERM_SCROLLBACK_ROWS 128
+#define TERM_SCROLL_LINES_PER_EVENT 3
 #define TERM_MAX_ARGS 8
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
@@ -166,6 +171,8 @@ enum term_state {
 	TERM_ESC,
 	TERM_CSI,
 	TERM_OSC,
+	TERM_ST_STRING,
+	TERM_STRING_ESC,
 };
 
 struct canvas {
@@ -283,6 +290,13 @@ static int find_cell_preset(int w, int h)
 
 struct terminal {
 	struct term_cell cell[TERM_ROWS_MAX][TERM_COLS_MAX];
+	struct term_cell scrollback[TERM_SCROLLBACK_ROWS][TERM_COLS_MAX];
+	int rows;
+	int cols;
+	int viewport_top;
+	int scrollback_start;
+	int scrollback_count;
+	int scrollback_offset;
 	int row;
 	int col;
 	int saved_row;
@@ -303,6 +317,13 @@ struct terminal {
 	int utf8_need;
 	int utf8_seen;
 	bool clear_graphics;
+	bool fullscreen_mode;
+	bool pending_full_clear;
+	bool pending_scrollback_clear;
+	uint64_t diag_bytes;
+	uint64_t diag_printable;
+	uint64_t diag_full_clears;
+	uint64_t diag_scrollback_rows;
 };
 
 #if AIKB_USE_FREETYPE
@@ -363,10 +384,43 @@ enum board_session_state {
 	BSS_DONE,
 	BSS_ERROR,
 };
+/* Per-session token/turn/permission/meta state pushed from host (M4.2).
+ * Strings are bounded so the struct stays under ~280B per slot;
+ * truncation is done in aikb_hid_input's ctrl-out writer, not here. */
+struct board_session_token {
+	uint64_t input;
+	uint64_t output;
+	uint64_t cost_cents;
+};
+
+struct board_session_turn {
+	char role[12];
+	char text[64];
+	uint64_t updated_ms;
+};
+
+struct board_session_perm {
+	uint64_t req_id;
+	char tool[24];
+	char args[64];
+	bool active;
+};
+
+struct board_session_meta {
+	char kind[12];
+	char hint[48];
+	char cwd[64];
+	char branch[24];
+};
+
 struct board_session {
 	bool used;
 	uint16_t sid;
 	enum board_session_state state;
+	struct board_session_token token;
+	struct board_session_turn turn;
+	struct board_session_perm perm;
+	struct board_session_meta meta;
 };
 static struct board_session g_board_sessions[MAX_BOARD_SESSIONS];
 static uint16_t g_lcd_selected_sid;   /* current highlight in picker */
@@ -723,6 +777,35 @@ static const uint32_t ansi_bright[8] = {
 	0x81a1c1, 0xc89bc0, 0x8fcedf, 0xffffff,
 };
 
+static uint32_t ansi_256_color(int idx)
+{
+	static const uint8_t cube[6] = {0, 95, 135, 175, 215, 255};
+	int r;
+	int g;
+	int b;
+
+	if (idx < 0)
+		idx = 0;
+	if (idx < 8)
+		return ansi_normal[idx];
+	if (idx < 16)
+		return ansi_bright[idx - 8];
+	if (idx >= 16 && idx <= 231) {
+		idx -= 16;
+		r = idx / 36;
+		g = (idx / 6) % 6;
+		b = idx % 6;
+		return ((uint32_t)cube[r] << 16) |
+		       ((uint32_t)cube[g] << 8) |
+		       (uint32_t)cube[b];
+	}
+	if (idx > 255)
+		idx = 255;
+	idx -= 232;
+	r = 8 + idx * 10;
+	return ((uint32_t)r << 16) | ((uint32_t)r << 8) | (uint32_t)r;
+}
+
 static uint32_t blend_rgb(uint32_t dst, uint32_t src, uint8_t alpha)
 {
 	uint32_t dr = (dst >> 16) & 0xff;
@@ -779,17 +862,145 @@ static struct term_cell term_blank_cell(const struct terminal *t)
 	return cell;
 }
 
+static struct term_cell term_clear_cell(void)
+{
+	struct term_cell cell;
+
+	cell.ch = ' ';
+	cell.fg = TERM_DEFAULT_FG;
+	cell.bg = TERM_DEFAULT_BG;
+	cell.flags = 0;
+	return cell;
+}
+
+static int terminal_cols(const struct terminal *t)
+{
+	int cols = t && t->cols > 0 ? t->cols : TERM_COLS_MAX;
+
+	if (cols > TERM_COLS_MAX)
+		cols = TERM_COLS_MAX;
+	if (cols < 1)
+		cols = 1;
+	return cols;
+}
+
 static void terminal_clear_rows(struct terminal *t, int start, int end)
 {
-	struct term_cell blank = term_blank_cell(t);
+	struct term_cell blank = term_clear_cell();
+	int cols = terminal_cols(t);
 
 	if (start < 0)
 		start = 0;
-	if (end >= g_rows)
-		end = g_rows - 1;
+	if (end >= t->rows)
+		end = t->rows - 1;
 	for (int y = start; y <= end; y++)
-		for (int x = 0; x < g_cols; x++)
+		for (int x = 0; x < cols; x++)
 			t->cell[y][x] = blank;
+}
+
+static void terminal_clear_scrollback(struct terminal *t)
+{
+	t->scrollback_start = 0;
+	t->scrollback_count = 0;
+	t->scrollback_offset = 0;
+}
+
+static void terminal_clamp_scrollback(struct terminal *t)
+{
+	int max_offset = t->scrollback_count + t->viewport_top;
+
+	if (max_offset < 0)
+		max_offset = 0;
+	if (t->scrollback_offset > max_offset)
+		t->scrollback_offset = max_offset;
+	if (t->scrollback_offset < 0)
+		t->scrollback_offset = 0;
+}
+
+static void terminal_push_scrollback_row(struct terminal *t,
+					 const struct term_cell *row)
+{
+	int slot;
+
+	if (TERM_SCROLLBACK_ROWS <= 0 || !row)
+		return;
+	if (t->scrollback_count < TERM_SCROLLBACK_ROWS) {
+		slot = (t->scrollback_start + t->scrollback_count) %
+		       TERM_SCROLLBACK_ROWS;
+		t->scrollback_count++;
+	} else {
+		slot = t->scrollback_start;
+		t->scrollback_start =
+			(t->scrollback_start + 1) % TERM_SCROLLBACK_ROWS;
+	}
+	memcpy(t->scrollback[slot], row, sizeof(t->scrollback[slot]));
+	t->diag_scrollback_rows++;
+	if (t->scrollback_offset > 0)
+		t->scrollback_offset++;
+	terminal_clamp_scrollback(t);
+}
+
+static void terminal_scroll_view(struct terminal *t, int dir)
+{
+	if (dir == 0)
+		return;
+	t->scrollback_offset += dir * TERM_SCROLL_LINES_PER_EVENT;
+	terminal_clamp_scrollback(t);
+}
+
+static void terminal_update_viewport(struct terminal *t)
+{
+	int max_top = t->rows - g_rows;
+
+	if (t->fullscreen_mode) {
+		t->viewport_top = 0;
+		return;
+	}
+	if (max_top < 0)
+		max_top = 0;
+	if (t->row < t->viewport_top)
+		t->viewport_top = t->row;
+	else if (t->row >= t->viewport_top + g_rows)
+		t->viewport_top = t->row - g_rows + 1;
+	if (t->viewport_top > max_top)
+		t->viewport_top = max_top;
+	if (t->viewport_top < 0)
+		t->viewport_top = 0;
+	terminal_clamp_scrollback(t);
+}
+
+static void terminal_ensure_row(struct terminal *t, int row)
+{
+	int old_rows;
+
+	if (row < 0)
+		return;
+	if (row >= TERM_ROWS_MAX)
+		row = TERM_ROWS_MAX - 1;
+	if (t->rows <= 0)
+		t->rows = g_rows;
+	if (row < t->rows)
+		return;
+	old_rows = t->rows;
+	t->rows = row + 1;
+	terminal_clear_rows(t, old_rows, t->rows - 1);
+	if (t->scroll_bottom < old_rows - 1)
+		return;
+	t->scroll_bottom = t->rows - 1;
+}
+
+static void terminal_apply_pending_full_clear(struct terminal *t)
+{
+	if (!t->pending_full_clear)
+		return;
+	t->pending_full_clear = false;
+	terminal_clear_rows(t, 0, t->rows - 1);
+	if (t->pending_scrollback_clear) {
+		terminal_clear_scrollback(t);
+		t->pending_scrollback_clear = false;
+	}
+	t->clear_graphics = true;
+	t->diag_full_clears++;
 }
 
 static void terminal_reset(struct terminal *t)
@@ -797,44 +1008,56 @@ static void terminal_reset(struct terminal *t)
 	memset(t, 0, sizeof(*t));
 	t->fg = TERM_DEFAULT_FG;
 	t->bg = TERM_DEFAULT_BG;
+	t->rows = g_rows;
+	t->cols = TERM_COLS_MAX;
+	t->viewport_top = 0;
 	t->scroll_top = 0;
-	t->scroll_bottom = g_rows - 1;
+	t->scroll_bottom = t->rows - 1;
 	t->state = TERM_GROUND;
 	t->clear_graphics = true;
-	terminal_clear_rows(t, 0, g_rows - 1);
+	t->fullscreen_mode = false;
+	t->pending_full_clear = false;
+	t->pending_scrollback_clear = false;
+	terminal_clear_rows(t, 0, t->rows - 1);
+	terminal_clear_scrollback(t);
 }
 
 static void terminal_scroll_up(struct terminal *t, int top, int bottom, int n)
 {
-	struct term_cell blank = term_blank_cell(t);
+	struct term_cell blank = term_clear_cell();
+	int cols = terminal_cols(t);
 
 	if (n <= 0)
 		return;
 	if (top < 0)
 		top = 0;
-	if (bottom >= g_rows)
-		bottom = g_rows - 1;
+	if (bottom >= t->rows)
+		bottom = t->rows - 1;
 	if (top > bottom)
 		return;
 	if (n > bottom - top + 1)
 		n = bottom - top + 1;
+	if (top == 0 && bottom == t->rows - 1)
+		for (int y = 0; y < n; y++)
+			terminal_push_scrollback_row(t, t->cell[y]);
 	for (int y = top; y <= bottom - n; y++)
 		memcpy(t->cell[y], t->cell[y + n], sizeof(t->cell[y]));
 	for (int y = bottom - n + 1; y <= bottom; y++)
-		for (int x = 0; x < g_cols; x++)
+		for (int x = 0; x < cols; x++)
 			t->cell[y][x] = blank;
 }
 
 static void terminal_scroll_down(struct terminal *t, int top, int bottom, int n)
 {
-	struct term_cell blank = term_blank_cell(t);
+	struct term_cell blank = term_clear_cell();
+	int cols = terminal_cols(t);
 
 	if (n <= 0)
 		return;
 	if (top < 0)
 		top = 0;
-	if (bottom >= g_rows)
-		bottom = g_rows - 1;
+	if (bottom >= t->rows)
+		bottom = t->rows - 1;
 	if (top > bottom)
 		return;
 	if (n > bottom - top + 1)
@@ -842,7 +1065,7 @@ static void terminal_scroll_down(struct terminal *t, int top, int bottom, int n)
 	for (int y = bottom; y >= top + n; y--)
 		memcpy(t->cell[y], t->cell[y - n], sizeof(t->cell[y]));
 	for (int y = top; y < top + n; y++)
-		for (int x = 0; x < g_cols; x++)
+		for (int x = 0; x < cols; x++)
 			t->cell[y][x] = blank;
 }
 
@@ -850,13 +1073,15 @@ static void terminal_newline(struct terminal *t)
 {
 	if (t->row == t->scroll_bottom)
 		terminal_scroll_up(t, t->scroll_top, t->scroll_bottom, 1);
-	else if (t->row < g_rows - 1)
+	else if (t->row < t->rows - 1)
 		t->row++;
+	terminal_update_viewport(t);
 }
 
 static void terminal_put_cp(struct terminal *t, uint32_t cp)
 {
 	int width;
+	int cols;
 	struct term_cell cell;
 
 	if (cp == '\n') {
@@ -882,13 +1107,19 @@ static void terminal_put_cp(struct terminal *t, uint32_t cp)
 	}
 	if (cp < 0x20 || cp == 0x7f)
 		return;
+	if (cp != ' ')
+		terminal_apply_pending_full_clear(t);
 
 	width = term_cp_width(cp);
 	if (width <= 0)
 		return;
-	if (t->col + width > g_cols) {
+	t->diag_printable++;
+	terminal_ensure_row(t, t->row);
+	cols = terminal_cols(t);
+	if (t->col + width > cols) {
 		t->col = 0;
 		terminal_newline(t);
+		terminal_ensure_row(t, t->row);
 	}
 
 	cell.ch = cp;
@@ -897,7 +1128,7 @@ static void terminal_put_cp(struct terminal *t, uint32_t cp)
 	cell.flags = (t->bold ? TC_BOLD : 0) | (t->inverse ? TC_INVERSE : 0) |
 		     (width == 2 ? TC_WIDE : 0);
 	t->cell[t->row][t->col] = cell;
-	if (width == 2 && t->col + 1 < g_cols) {
+	if (width == 2 && t->col + 1 < cols) {
 		struct term_cell trail = cell;
 
 		trail.ch = ' ';
@@ -905,7 +1136,7 @@ static void terminal_put_cp(struct terminal *t, uint32_t cp)
 		t->cell[t->row][t->col + 1] = trail;
 	}
 	t->col += width;
-	if (t->col >= g_cols) {
+	if (t->col >= cols) {
 		t->col = 0;
 		terminal_newline(t);
 	}
@@ -916,6 +1147,67 @@ static int terminal_arg(const struct terminal *t, int idx, int fallback)
 	if (idx >= t->arg_count || t->args[idx] == 0)
 		return fallback;
 	return t->args[idx];
+}
+
+static void terminal_clamp_cursor(struct terminal *t)
+{
+	int cols = terminal_cols(t);
+
+	if (t->row < 0)
+		t->row = 0;
+	if (t->row >= TERM_ROWS_MAX)
+		t->row = TERM_ROWS_MAX - 1;
+	terminal_ensure_row(t, t->row);
+	if (t->row >= t->rows)
+		t->row = t->rows - 1;
+	if (t->col < 0)
+		t->col = 0;
+	if (t->col >= cols)
+		t->col = cols - 1;
+	terminal_update_viewport(t);
+}
+
+static void terminal_erase_chars(struct terminal *t, int n)
+{
+	struct term_cell blank = term_blank_cell(t);
+	int cols = terminal_cols(t);
+
+	if (n <= 0)
+		n = 1;
+	if (t->col + n > cols)
+		n = cols - t->col;
+	for (int x = 0; x < n; x++)
+		t->cell[t->row][t->col + x] = blank;
+}
+
+static void terminal_insert_chars(struct terminal *t, int n)
+{
+	struct term_cell blank = term_blank_cell(t);
+	int cols = terminal_cols(t);
+
+	if (n <= 0)
+		n = 1;
+	if (n > cols - t->col)
+		n = cols - t->col;
+	for (int x = cols - 1; x >= t->col + n; x--)
+		t->cell[t->row][x] = t->cell[t->row][x - n];
+	for (int x = 0; x < n; x++)
+		t->cell[t->row][t->col + x] = blank;
+}
+
+static void terminal_delete_chars(struct terminal *t, int n)
+{
+	struct term_cell blank = term_blank_cell(t);
+	int cols = terminal_cols(t);
+
+	if (n <= 0)
+		n = 1;
+	if (n > cols - t->col)
+		n = cols - t->col;
+	for (int x = t->col; x < cols - n; x++)
+		t->cell[t->row][x] = t->cell[t->row][x + n];
+	for (int x = cols - n; x < cols; x++)
+		t->cell[t->row][x] = blank;
 }
 
 static void terminal_set_sgr(struct terminal *t)
@@ -966,8 +1258,28 @@ static void terminal_set_sgr(struct terminal *t)
 			else
 				t->bg = color;
 			i += 4;
+		} else if ((n == 38 || n == 48) && i + 2 < t->arg_count &&
+			   t->args[i + 1] == 5) {
+			uint32_t color = ansi_256_color(t->args[i + 2]);
+
+			if (n == 38)
+				t->fg = color;
+			else
+				t->bg = color;
+			i += 2;
 		}
 	}
+}
+
+static bool terminal_has_private_mode(const struct terminal *t, int mode)
+{
+	if (!t->private_mode)
+		return false;
+	for (int i = 0; i < t->arg_count; i++) {
+		if (t->args[i] == mode)
+			return true;
+	}
+	return false;
 }
 
 static void terminal_csi_dispatch(struct terminal *t, uint8_t final)
@@ -975,76 +1287,117 @@ static void terminal_csi_dispatch(struct terminal *t, uint8_t final)
 	int n;
 
 	switch (final) {
+	case '@':
+		terminal_insert_chars(t, terminal_arg(t, 0, 1));
+		break;
 	case 'A':
 		t->row -= terminal_arg(t, 0, 1);
-		if (t->row < 0)
-			t->row = 0;
+		terminal_clamp_cursor(t);
 		break;
 	case 'B':
+	case 'e':
 		t->row += terminal_arg(t, 0, 1);
-		if (t->row >= g_rows)
-			t->row = g_rows - 1;
+		terminal_clamp_cursor(t);
 		break;
 	case 'C':
+	case 'a':
 		t->col += terminal_arg(t, 0, 1);
-		if (t->col >= g_cols)
-			t->col = g_cols - 1;
+		terminal_clamp_cursor(t);
 		break;
 	case 'D':
 		t->col -= terminal_arg(t, 0, 1);
-		if (t->col < 0)
-			t->col = 0;
+		terminal_clamp_cursor(t);
+		break;
+	case 'E':
+		t->row += terminal_arg(t, 0, 1);
+		t->col = 0;
+		terminal_clamp_cursor(t);
+		break;
+	case 'F':
+		t->row -= terminal_arg(t, 0, 1);
+		t->col = 0;
+		terminal_clamp_cursor(t);
+		break;
+	case 'G':
+	case '`':
+		t->col = terminal_arg(t, 0, 1) - 1;
+		terminal_clamp_cursor(t);
+		break;
+	case 'I':
+		t->col += terminal_arg(t, 0, 1) * 8;
+		terminal_clamp_cursor(t);
+		break;
+	case 'Z':
+		t->col -= terminal_arg(t, 0, 1) * 8;
+		terminal_clamp_cursor(t);
 		break;
 	case 'H':
 	case 'f':
 		t->row = terminal_arg(t, 0, 1) - 1;
 		t->col = terminal_arg(t, 1, 1) - 1;
-		if (t->row < 0)
-			t->row = 0;
-		if (t->row >= g_rows)
-			t->row = g_rows - 1;
-		if (t->col < 0)
-			t->col = 0;
-		if (t->col >= g_cols)
-			t->col = g_cols - 1;
+		terminal_clamp_cursor(t);
 		break;
 	case 'J':
 		n = terminal_arg(t, 0, 0);
 		if (n == 2 || n == 3) {
-			terminal_clear_rows(t, 0, g_rows - 1);
+			t->pending_full_clear = true;
+			if (n == 3)
+				t->pending_scrollback_clear = true;
 			t->row = 0;
 			t->col = 0;
-			t->clear_graphics = true;
+			t->viewport_top = 0;
+			terminal_clamp_scrollback(t);
 		} else if (n == 0) {
 			struct term_cell blank = term_blank_cell(t);
+			int cols = terminal_cols(t);
 
-			for (int x = t->col; x < g_cols; x++)
+			for (int x = t->col; x < cols; x++)
 				t->cell[t->row][x] = blank;
-			terminal_clear_rows(t, t->row + 1, g_rows - 1);
+			terminal_clear_rows(t, t->row + 1, t->rows - 1);
 		} else if (n == 1) {
 			struct term_cell blank = term_blank_cell(t);
+			int cols = terminal_cols(t);
 
 			terminal_clear_rows(t, 0, t->row - 1);
-			for (int x = 0; x <= t->col && x < g_cols; x++)
+			for (int x = 0; x <= t->col && x < cols; x++)
 				t->cell[t->row][x] = blank;
 		}
 		break;
 	case 'K': {
 		struct term_cell blank = term_blank_cell(t);
+		int cols = terminal_cols(t);
 
 		n = terminal_arg(t, 0, 0);
 		if (n == 2) {
-			for (int x = 0; x < g_cols; x++)
+			for (int x = 0; x < cols; x++)
 				t->cell[t->row][x] = blank;
 		} else if (n == 1) {
-			for (int x = 0; x <= t->col && x < g_cols; x++)
+			for (int x = 0; x <= t->col && x < cols; x++)
 				t->cell[t->row][x] = blank;
 		} else {
-			for (int x = t->col; x < g_cols; x++)
+			for (int x = t->col; x < cols; x++)
 				t->cell[t->row][x] = blank;
 		}
 		break;
 	}
+	case 'P':
+		terminal_delete_chars(t, terminal_arg(t, 0, 1));
+		break;
+	case 'S':
+		terminal_scroll_up(t, t->scroll_top, t->scroll_bottom,
+				   terminal_arg(t, 0, 1));
+		break;
+	case 'T':
+		terminal_scroll_down(t, t->scroll_top, t->scroll_bottom,
+				     terminal_arg(t, 0, 1));
+		break;
+	case 'X':
+		terminal_erase_chars(t, terminal_arg(t, 0, 1));
+		break;
+	case 'd':
+		t->row = terminal_arg(t, 0, 1) - 1;
+		terminal_clamp_cursor(t);
+		break;
 	case 'L':
 		terminal_scroll_down(t, t->row, t->scroll_bottom,
 				     terminal_arg(t, 0, 1));
@@ -1056,20 +1409,41 @@ static void terminal_csi_dispatch(struct terminal *t, uint8_t final)
 	case 'm':
 		terminal_set_sgr(t);
 		break;
+	case 'b':
+	case 'c':
+	case 'g':
+	case 'n':
+	case 'p':
+	case 'q':
+		break;
+	case 'h':
+	case 'l':
+		/* DEC private modes such as ?25 and ?1049 are display modes.
+		 * The framebuffer view does not need to model them; treating
+		 * them as no-ops keeps fullscreen TUIs from derailing parsing. */
+		if (terminal_has_private_mode(t, 47) ||
+		    terminal_has_private_mode(t, 1047) ||
+		    terminal_has_private_mode(t, 1049)) {
+			t->fullscreen_mode = final == 'h';
+			t->viewport_top = 0;
+		}
+		break;
 	case 'r':
 		if (t->arg_count >= 2 && t->args[0] < t->args[1]) {
 			t->scroll_top = terminal_arg(t, 0, 1) - 1;
-			t->scroll_bottom = terminal_arg(t, 1, g_rows) - 1;
+			t->scroll_bottom = terminal_arg(t, 1, t->rows) - 1;
 			if (t->scroll_top < 0)
 				t->scroll_top = 0;
-			if (t->scroll_bottom >= g_rows)
-				t->scroll_bottom = g_rows - 1;
+			terminal_ensure_row(t, t->scroll_bottom);
+			if (t->scroll_bottom >= t->rows)
+				t->scroll_bottom = t->rows - 1;
 		} else {
 			t->scroll_top = 0;
-			t->scroll_bottom = g_rows - 1;
+			t->scroll_bottom = t->rows - 1;
 		}
 		t->row = t->scroll_top;
 		t->col = 0;
+		terminal_clamp_cursor(t);
 		break;
 	case 's':
 		t->saved_row = t->row;
@@ -1078,6 +1452,7 @@ static void terminal_csi_dispatch(struct terminal *t, uint8_t final)
 	case 'u':
 		t->row = t->saved_row;
 		t->col = t->saved_col;
+		terminal_clamp_cursor(t);
 		break;
 	default:
 		break;
@@ -1109,6 +1484,8 @@ static void terminal_process_ascii(struct terminal *t, uint8_t ch)
 			t->state = TERM_CSI;
 		} else if (ch == ']') {
 			t->state = TERM_OSC;
+		} else if (ch == 'P' || ch == 'X' || ch == '^' || ch == '_') {
+			t->state = TERM_ST_STRING;
 		} else if (ch == '7') {
 			t->saved_row = t->row;
 			t->saved_col = t->col;
@@ -1146,7 +1523,7 @@ static void terminal_process_ascii(struct terminal *t, uint8_t ch)
 			t->args[t->arg_count - 1] =
 				t->args[t->arg_count - 1] * 10 + ch - '0';
 			t->arg_active = true;
-		} else if (ch == ';') {
+		} else if (ch == ';' || ch == ':') {
 			if (t->arg_count == 0)
 				t->arg_count = 1;
 			if (t->arg_count < TERM_MAX_ARGS)
@@ -1158,10 +1535,17 @@ static void terminal_process_ascii(struct terminal *t, uint8_t ch)
 		}
 		return;
 	case TERM_OSC:
+	case TERM_ST_STRING:
 		if (ch == 0x07)
 			t->state = TERM_GROUND;
 		else if (ch == 0x1b)
-			t->state = TERM_ESC;
+			t->state = TERM_STRING_ESC;
+		return;
+	case TERM_STRING_ESC:
+		if (ch == '\\')
+			t->state = TERM_GROUND;
+		else
+			t->state = TERM_ST_STRING;
 		return;
 	}
 }
@@ -1176,6 +1560,7 @@ static void terminal_process_cp(struct terminal *t, uint32_t cp)
 
 static void terminal_process_byte(struct terminal *t, uint8_t b)
 {
+	t->diag_bytes++;
 	if (t->utf8_need) {
 		if ((b & 0xc0) == 0x80) {
 			t->utf8_cp = (t->utf8_cp << 6) | (uint32_t)(b & 0x3f);
@@ -1387,10 +1772,10 @@ static void recompute_term_geom(void)
 {
 	g_cols = (UI_W - TERM_PAD_X * 2) / g_cell_w;
 	g_rows = (UI_H - TERM_STATUS_H - TERM_PAD_Y) / g_cell_h;
-	if (g_cols > TERM_COLS_MAX)
-		g_cols = TERM_COLS_MAX;
-	if (g_rows > TERM_ROWS_MAX)
-		g_rows = TERM_ROWS_MAX;
+	if (g_cols > TERM_COLS_VISIBLE_MAX)
+		g_cols = TERM_COLS_VISIBLE_MAX;
+	if (g_rows > TERM_ROWS_VISIBLE_MAX)
+		g_rows = TERM_ROWS_VISIBLE_MAX;
 	if (g_cols < 1)
 		g_cols = 1;
 	if (g_rows < 1)
@@ -1425,13 +1810,17 @@ static void apply_cell_size(struct font_ctx *font, struct terminal *t,
 	(void)font;
 #endif
 
-	if (t->row >= g_rows)
-		t->row = g_rows - 1;
-	if (t->col >= g_cols)
-		t->col = g_cols - 1;
+	t->rows = g_rows;
+	t->cols = TERM_COLS_MAX;
+	t->viewport_top = 0;
+	if (t->row >= t->rows)
+		t->row = t->rows - 1;
+	if (t->col >= t->cols)
+		t->col = t->cols - 1;
 	t->scroll_top = 0;
-	t->scroll_bottom = g_rows - 1;
-	terminal_clear_rows(t, 0, g_rows - 1);
+	t->scroll_bottom = t->rows - 1;
+	terminal_clear_rows(t, 0, t->rows - 1);
+	terminal_clear_scrollback(t);
 	t->clear_graphics = true;
 }
 
@@ -1575,28 +1964,183 @@ static void draw_powerline_segment(struct canvas *c, int *x, int y, int h,
 	*x += 14;
 }
 
+static const struct board_session *terminal_active_session(void)
+{
+	if (g_lcd_active_sid == 0)
+		return NULL;
+	for (int i = 0; i < MAX_BOARD_SESSIONS; i++) {
+		if (g_board_sessions[i].used &&
+		    g_board_sessions[i].sid == g_lcd_active_sid)
+			return &g_board_sessions[i];
+	}
+	return NULL;
+}
+
+static const char *terminal_session_kind_label(const struct board_session *s)
+{
+	if (!s)
+		return "No SID";
+	if (streq_ci(s->meta.kind, "claude"))
+		return "Claude";
+	if (streq_ci(s->meta.kind, "codex"))
+		return "Codex";
+	if (streq_ci(s->meta.kind, "vscode"))
+		return "VS Code";
+	if (streq_ci(s->meta.kind, "cursor"))
+		return "Cursor";
+	if (streq_ci(s->meta.kind, "browser"))
+		return "Browser";
+	if (streq_ci(s->meta.kind, "terminal") ||
+	    strstr(s->meta.hint, "Terminal"))
+		return "Terminal";
+	return "Session";
+}
+
+static void terminal_status_segment(char *buf, size_t buf_sz)
+{
+	const struct board_session *s = terminal_active_session();
+
+	if (!s) {
+		snprintf(buf, buf_sz, " No SID ");
+		return;
+	}
+	snprintf(buf, buf_sz, " %s #%u ", terminal_session_kind_label(s),
+		 s->sid);
+}
+
+static bool terminal_row_has_text(const struct terminal *term, int row)
+{
+	int cols = terminal_cols(term);
+
+	if (row < 0 || row >= term->rows)
+		return false;
+	for (int col = 0; col < cols; col++) {
+		const struct term_cell *cell = &term->cell[row][col];
+
+		if ((cell->flags & TC_TRAIL) == 0 && cell->ch != ' ')
+			return true;
+	}
+	return false;
+}
+
+static const struct term_cell *terminal_virtual_row(const struct terminal *term,
+						    int row)
+{
+	int idx;
+
+	if (row < 0)
+		return NULL;
+	if (row < term->scrollback_count) {
+		idx = (term->scrollback_start + row) % TERM_SCROLLBACK_ROWS;
+		return term->scrollback[idx];
+	}
+	row -= term->scrollback_count;
+	if (row >= term->rows)
+		return NULL;
+	return term->cell[row];
+}
+
+static int terminal_non_empty_cells(const struct terminal *term)
+{
+	int count = 0;
+	int cols = terminal_cols(term);
+
+	for (int row = 0; row < term->rows; row++) {
+		for (int col = 0; col < cols; col++) {
+			const struct term_cell *cell = &term->cell[row][col];
+
+			if ((cell->flags & TC_TRAIL) == 0 && cell->ch != ' ')
+				count++;
+		}
+	}
+	return count;
+}
+
+static bool terminal_viewport_has_text(const struct terminal *term, int top)
+{
+	for (int row = 0; row < g_rows; row++) {
+		if (terminal_row_has_text(term, top + row))
+			return true;
+	}
+	return false;
+}
+
+static int terminal_effective_viewport_top(const struct terminal *term)
+{
+	int top = term->viewport_top;
+	int max_top = term->rows - g_rows;
+
+	if (max_top < 0)
+		max_top = 0;
+	if (top < 0)
+		top = 0;
+	if (top > max_top)
+		top = max_top;
+	if (terminal_viewport_has_text(term, top))
+		return top;
+	for (int row = 0; row < term->rows; row++) {
+		if (!terminal_row_has_text(term, row))
+			continue;
+		top = row;
+		if (top > max_top)
+			top = max_top;
+		return top;
+	}
+	return term->viewport_top;
+}
+
+static int terminal_virtual_view_top(const struct terminal *term)
+{
+	int total_rows = term->scrollback_count + term->rows;
+	int max_top = total_rows - g_rows;
+	int live_top;
+	int top;
+
+	if (max_top < 0)
+		max_top = 0;
+	live_top = term->scrollback_count + terminal_effective_viewport_top(term);
+	if (live_top > max_top)
+		live_top = max_top;
+	top = live_top - term->scrollback_offset;
+	if (top < 0)
+		top = 0;
+	if (top > max_top)
+		top = max_top;
+	return top;
+}
+
 static void render_terminal(struct canvas *c, const struct terminal *term,
 			    struct font_ctx *font,
 			    const struct kitty_graphics *kitty)
 {
 	char time_buf[16];
+	char session_buf[32];
 	int status_y = UI_H - TERM_STATUS_H;
+	int view_top = terminal_virtual_view_top(term);
+	int cursor_row = term->scrollback_count + term->row;
 	int x = 0;
 	time_t now = time(NULL);
 	struct tm tm_now;
 
 	canvas_clear(c, TERM_DEFAULT_BG);
 	for (int row = 0; row < g_rows; row++) {
+		int src_row = view_top + row;
+		const struct term_cell *cells = terminal_virtual_row(term, src_row);
+
+		if (!cells)
+			break;
 		for (int col = 0; col < g_cols; col++) {
-			draw_terminal_cell(c, font, &term->cell[row][col],
+			draw_terminal_cell(c, font, &cells[col],
 					   TERM_PAD_X + col * g_cell_w,
 					   TERM_PAD_Y + row * g_cell_h);
 		}
 	}
 	kitty_graphics_render(kitty, c->w, c->h, c->px);
-	if ((now & 1) == 0) {
+	if ((now & 1) == 0 &&
+	    cursor_row >= view_top &&
+	    cursor_row < view_top + g_rows) {
 		int cx = TERM_PAD_X + term->col * g_cell_w;
-		int cy = TERM_PAD_Y + term->row * g_cell_h;
+		int cy = TERM_PAD_Y + (cursor_row - view_top) * g_cell_h;
 
 		fill_rect(c, cx, cy + g_cell_h - 3, g_cell_w, 2,
 			  0x9cdcfe);
@@ -1607,8 +2151,18 @@ static void render_terminal(struct canvas *c, const struct terminal *term,
 			       TERM_STATUS_BLUE, TERM_STATUS_GREEN, " AIKB ");
 	draw_powerline_segment(c, &x, status_y, TERM_STATUS_H,
 			       TERM_STATUS_GREEN, TERM_STATUS_AMBER, " VT100 ");
+	terminal_status_segment(session_buf, sizeof(session_buf));
 	draw_powerline_segment(c, &x, status_y, TERM_STATUS_H,
-			       TERM_STATUS_AMBER, TERM_STATUS_BG, " Claude ");
+			       TERM_STATUS_AMBER, TERM_STATUS_BG, session_buf);
+	if (term->scrollback_offset > 0) {
+		char scroll_buf[24];
+
+		snprintf(scroll_buf, sizeof(scroll_buf), " -%d ",
+			 term->scrollback_offset);
+		draw_powerline_segment(c, &x, status_y, TERM_STATUS_H,
+				       TERM_STATUS_AMBER, TERM_STATUS_BG,
+				       scroll_buf);
+	}
 	localtime_r(&now, &tm_now);
 	snprintf(time_buf, sizeof(time_buf), "%02d:%02d", tm_now.tm_hour,
 		 tm_now.tm_min);
@@ -3075,6 +3629,9 @@ static void board_session_upsert(uint16_t sid, enum board_session_state state)
 	g_board_sessions[idx].used = true;
 	g_board_sessions[idx].sid = sid;
 	g_board_sessions[idx].state = state;
+	if (state != BSS_WAIT)
+		memset(&g_board_sessions[idx].perm, 0,
+		       sizeof(g_board_sessions[idx].perm));
 }
 
 static void board_session_remove(uint16_t sid)
@@ -3082,12 +3639,98 @@ static void board_session_remove(uint16_t sid)
 	int idx = board_session_find_idx(sid);
 	if (idx < 0)
 		return;
-	g_board_sessions[idx].used = false;
-	g_board_sessions[idx].sid = 0;
+	memset(&g_board_sessions[idx], 0, sizeof(g_board_sessions[idx]));
 	if (g_lcd_selected_sid == sid)
 		g_lcd_selected_sid = 0;
 	if (g_lcd_active_sid == sid)
 		g_lcd_active_sid = 0;
+}
+
+static void board_session_update_token(uint16_t sid, uint64_t input,
+				       uint64_t output, uint64_t cost_cents)
+{
+	int idx = board_session_find_idx(sid);
+	if (idx < 0)
+		return;
+	g_board_sessions[idx].token.input = input;
+	g_board_sessions[idx].token.output = output;
+	g_board_sessions[idx].token.cost_cents = cost_cents;
+}
+
+static void board_session_update_turn(uint16_t sid, const char *role,
+				      const char *text)
+{
+	int idx = board_session_find_idx(sid);
+	if (idx < 0)
+		return;
+	snprintf(g_board_sessions[idx].turn.role,
+		 sizeof(g_board_sessions[idx].turn.role), "%s", role ? role : "");
+	snprintf(g_board_sessions[idx].turn.text,
+		 sizeof(g_board_sessions[idx].turn.text), "%s", text ? text : "");
+	g_board_sessions[idx].turn.updated_ms = monotonic_now_ms();
+}
+
+static void board_session_update_perm(uint16_t sid, uint64_t req_id,
+				      const char *tool, const char *args)
+{
+	int idx = board_session_find_idx(sid);
+	if (idx < 0)
+		return;
+	g_board_sessions[idx].perm.req_id = req_id;
+	snprintf(g_board_sessions[idx].perm.tool,
+		 sizeof(g_board_sessions[idx].perm.tool), "%s", tool ? tool : "");
+	snprintf(g_board_sessions[idx].perm.args,
+		 sizeof(g_board_sessions[idx].perm.args), "%s", args ? args : "");
+	g_board_sessions[idx].perm.active = true;
+}
+
+static void board_session_clear_perm(uint16_t sid, uint64_t req_id)
+{
+	int idx = board_session_find_idx(sid);
+	if (idx < 0)
+		return;
+	if (g_board_sessions[idx].perm.req_id != req_id)
+		return;
+	memset(&g_board_sessions[idx].perm, 0,
+	       sizeof(g_board_sessions[idx].perm));
+}
+
+static void board_session_update_meta(uint16_t sid, const char *kind,
+				      const char *cwd, const char *branch)
+{
+	int idx = board_session_find_idx(sid);
+	if (idx < 0)
+		return;
+	snprintf(g_board_sessions[idx].meta.kind,
+		 sizeof(g_board_sessions[idx].meta.kind), "%s", kind ? kind : "");
+	snprintf(g_board_sessions[idx].meta.cwd,
+		 sizeof(g_board_sessions[idx].meta.cwd), "%s", cwd ? cwd : "");
+	snprintf(g_board_sessions[idx].meta.branch,
+		 sizeof(g_board_sessions[idx].meta.branch), "%s",
+		 branch ? branch : "");
+}
+
+static void board_session_update_hint(uint16_t sid, const char *hint)
+{
+	int idx = board_session_find_idx(sid);
+	if (idx < 0)
+		return;
+	safe_copy(g_board_sessions[idx].meta.hint,
+		  sizeof(g_board_sessions[idx].meta.hint), hint);
+}
+
+static const char *path_tail(const char *path)
+{
+	const char *slash;
+	const char *backslash;
+
+	if (!path || !path[0])
+		return "";
+	slash = strrchr(path, '/');
+	backslash = strrchr(path, '\\');
+	if (!slash || (backslash && backslash > slash))
+		slash = backslash;
+	return slash ? slash + 1 : path;
 }
 
 /* Return next live sid in iteration order, or 0 if there are none. */
@@ -3193,6 +3836,15 @@ static void ui_ctrl_emit_focus(uint16_t sid)
 	ui_ctrl_emit(line);
 }
 
+static void ui_ctrl_emit_permission(uint16_t sid, uint64_t req_id,
+				    const char *decision)
+{
+	char line[80];
+	snprintf(line, sizeof(line), "permission %u reqid=%llu decision=%s\n",
+		 sid, (unsigned long long)req_id, decision);
+	ui_ctrl_emit(line);
+}
+
 /* Picker has its own chrome: top label "SESSION" + clock + live count, bottom
  * shows encoder/confirm/reject hints. Deliberately does not reuse
  * draw_pet_header so the pet-scene label (ASKING/UPDATING/...) cannot leak
@@ -3219,7 +3871,8 @@ static void draw_picker_header(struct canvas *c, struct font_ctx *font,
 	hline(c, 22, 55, UI_W - 44, C_GRUVBOX_DARK1);
 }
 
-static void draw_picker_footer(struct canvas *c, struct font_ctx *font)
+static void draw_picker_footer(struct canvas *c, struct font_ctx *font,
+			       bool permission_mode)
 {
 	hline(c, 22, 344, UI_W - 44, C_GRUVBOX_LINE);
 	hline(c, 22, 345, UI_W - 44, C_GRUVBOX_DARK1);
@@ -3229,14 +3882,18 @@ static void draw_picker_footer(struct canvas *c, struct font_ctx *font)
 			   C_GRUVBOX_TEXT);
 	draw_pet_font_text(c, font, 332, 360, "|", 12, 2, C_GRUVBOX_MUTED);
 	draw_pet_down_icon(c, 392, 362, C_GRUVBOX_YELLOW);
-	draw_pet_font_text(c, font, 432, 360, "confirm focus", 12, 2,
-			   C_GRUVBOX_TEXT);
+	draw_pet_font_text(c, font, 432, 360,
+			   permission_mode ? "confirm allow" : "confirm focus",
+			   12, 2, C_GRUVBOX_TEXT);
 	draw_pet_font_text(c, font, 690, 360, "|", 12, 2, C_GRUVBOX_MUTED);
-	draw_pet_font_text(c, font, 742, 360, "reject = back", 12, 2,
+	draw_pet_font_text(c, font, 742, 360,
+			   permission_mode ? "reject deny" : "reject = back",
+			   12, 2,
 			   C_GRUVBOX_TEXT);
 }
 
-/* Picker view: KEY 2 (SESSION) jumps here. Renders sid + state only. The
+/* Picker view: KEY 2 (SESSION) jumps here. Renders sid + state plus compact
+ * host-pushed agent metadata. The
  * picker_idx member of ui_model is no longer used — selection lives in
  * g_lcd_selected_sid, and the list comes from g_board_sessions[]. */
 static void render_session_picker(struct canvas *c, const struct ui_model *m,
@@ -3245,24 +3902,19 @@ static void render_session_picker(struct canvas *c, const struct ui_model *m,
 {
 	uint64_t now_ms = monotonic_now_ms();
 	int seconds = (int)((now_ms - p->start_time_ms) / 1000u);
-	uint16_t sids[MAX_BOARD_SESSIONS];
-	int states[MAX_BOARD_SESSIONS];
+	struct board_session *rows[MAX_BOARD_SESSIONS];
 	int count = 0;
 
 	(void)m;
 
 	for (int i = 0; i < MAX_BOARD_SESSIONS; i++) {
-		if (g_board_sessions[i].used) {
-			sids[count] = g_board_sessions[i].sid;
-			states[count] = (int)g_board_sessions[i].state;
-			count++;
-		}
+		if (g_board_sessions[i].used)
+			rows[count++] = &g_board_sessions[i];
 	}
 
 	canvas_clear(c, C_GRUVBOX_BG);
 	fill_rect(c, 0, 0, UI_W, UI_H, 0x141312);
 	draw_picker_header(c, font, seconds, count);
-	draw_picker_footer(c, font);
 
 	const char *banner = "[ SELECT SESSION ]";
 	int bw = text_w(banner, 2);
@@ -3277,11 +3929,12 @@ static void render_session_picker(struct canvas *c, const struct ui_model *m,
 
 	int picker_idx = 0;
 	for (int i = 0; i < count; i++) {
-		if (sids[i] == g_lcd_selected_sid) {
+		if (rows[i]->sid == g_lcd_selected_sid) {
 			picker_idx = i;
 			break;
 		}
 	}
+	draw_picker_footer(c, font, rows[picker_idx]->perm.active);
 
 	const int rows_visible = 3;
 	int start = picker_idx - rows_visible / 2;
@@ -3297,25 +3950,66 @@ static void render_session_picker(struct canvas *c, const struct ui_model *m,
 		int idx = start + i;
 		int row_y = 130 + i * 60;
 		bool sel = (idx == picker_idx);
+		const struct board_session *bs = rows[idx];
 		char sid_label[24];
+		char meta_label[160];
+		char detail_label[144];
 		const char *state_label =
-			board_session_state_str((enum board_session_state)states[idx]);
+			board_session_state_str(bs->state);
 		uint32_t state_color = sel ? C_GRUVBOX_YELLOW : C_GRUVBOX_MUTED;
-		if ((enum board_session_state)states[idx] == BSS_DISCONNECTED ||
-		    (enum board_session_state)states[idx] == BSS_ERROR)
+		if (bs->state == BSS_DISCONNECTED || bs->state == BSS_ERROR)
 			state_color = sel ? C_GRUVBOX_RED : 0x8a3a25;
 
-		snprintf(sid_label, sizeof(sid_label), "SID %u", sids[idx]);
+		snprintf(sid_label, sizeof(sid_label), "SID %u", bs->sid);
+		if (bs->meta.hint[0] || bs->meta.kind[0] ||
+		    bs->meta.cwd[0] || bs->meta.branch[0]) {
+			const char *kind = bs->meta.kind[0] ? bs->meta.kind : "agent";
+			const char *name = bs->meta.hint[0] ? bs->meta.hint : kind;
+			const char *cwd = path_tail(bs->meta.cwd);
+			if (bs->meta.branch[0] && cwd[0])
+				snprintf(meta_label, sizeof(meta_label), "%s  %s  %s",
+					 name, cwd, bs->meta.branch);
+			else if (cwd[0])
+				snprintf(meta_label, sizeof(meta_label), "%s  %s",
+					 name, cwd);
+			else
+				snprintf(meta_label, sizeof(meta_label), "%s", name);
+		} else {
+			snprintf(meta_label, sizeof(meta_label), "waiting for agent meta");
+		}
+
+		if (bs->perm.active) {
+			snprintf(detail_label, sizeof(detail_label), "PERM #%llu %s %s",
+				 (unsigned long long)bs->perm.req_id,
+				 bs->perm.tool, bs->perm.args);
+		} else if (bs->turn.text[0]) {
+			snprintf(detail_label, sizeof(detail_label), "%s: %s",
+				 bs->turn.role[0] ? bs->turn.role : "turn",
+				 bs->turn.text);
+		} else if (bs->token.input || bs->token.output || bs->token.cost_cents) {
+			snprintf(detail_label, sizeof(detail_label),
+				 "TOK in=%llu out=%llu cost=%llu",
+				 (unsigned long long)bs->token.input,
+				 (unsigned long long)bs->token.output,
+				 (unsigned long long)bs->token.cost_cents);
+		} else {
+			snprintf(detail_label, sizeof(detail_label), "no activity yet");
+		}
 
 		if (sel) {
-			fill_rect(c, 60, row_y - 8, UI_W - 120, 48, 0x1a0e02);
+			fill_rect(c, 60, row_y - 10, UI_W - 120, 54, 0x1a0e02);
 			stroke_round_rect(c, 60, row_y - 8,
 					  UI_W - 120, 48, 6, C_GRUVBOX_YELLOW);
 		}
-		draw_text_fit(c, 96, row_y, 360, sid_label, 2,
+		draw_text_fit(c, 96, row_y, 132, sid_label, 2,
 			      sel ? C_GRUVBOX_YELLOW : C_GRUVBOX_TEXT);
-		draw_text_fit(c, 540, row_y, 320, state_label, 2,
+		draw_text_fit(c, 246, row_y + 1, 420, meta_label, 1,
+			      sel ? C_GRUVBOX_TEXT : C_GRUVBOX_MUTED);
+		draw_text_fit(c, 728, row_y, 132, state_label, 2,
 			      state_color);
+		draw_text_fit(c, 246, row_y + 23, 560, detail_label, 1,
+			      bs->perm.active ? C_GRUVBOX_RED :
+			      (sel ? C_GRUVBOX_YELLOW : C_GRUVBOX_MUTED));
 	}
 }
 
@@ -4414,6 +5108,21 @@ static bool pet_input_is_command(const char *buf, ssize_t len)
 	return i + 4 <= len && !memcmp(buf + i, "PET ", 4);
 }
 
+static const char *app_view_name(enum app_view view)
+{
+	switch (view) {
+	case VIEW_TERMINAL:
+		return "terminal";
+	case VIEW_DASHBOARD:
+		return "dashboard";
+	case VIEW_PET:
+		return "pet";
+	case VIEW_SESSION_PICKER:
+		return "picker";
+	}
+	return "unknown";
+}
+
 static void feed_terminal_bytes(struct terminal *term, struct kitty_graphics *kitty,
 				const char *buf, ssize_t len)
 {
@@ -4439,6 +5148,10 @@ static void process_input_fd(int fd, struct ui_model *m, struct terminal *term,
 {
 	static char buf[LINE_BUF];
 	static size_t len;
+	static uint64_t diag_input_reads;
+	static uint64_t diag_input_bytes;
+	static uint64_t diag_pet_drop_reads;
+	static uint64_t diag_pet_drop_bytes;
 	char tmp[256];
 	ssize_t rd;
 
@@ -4452,15 +5165,47 @@ static void process_input_fd(int fd, struct ui_model *m, struct terminal *term,
 		}
 		if (rd == 0)
 			return;
-		if (*view == VIEW_PET && !pet_input_is_command(tmp, rd))
+		diag_input_reads++;
+		diag_input_bytes += (uint64_t)rd;
+		if (*view == VIEW_TERMINAL) {
+			int before_cells = terminal_non_empty_cells(term);
+			uint64_t before_printable = term->diag_printable;
+			uint64_t before_clears = term->diag_full_clears;
+
+			feed_terminal_bytes(term, kitty, tmp, rd);
+			warnf("diag input view=terminal bytes=%zd reads=%llu total_bytes=%llu state=%d row=%d col=%d viewport=%d effective=%d scroll_offset=%d history=%d cells=%d->%d printable_delta=%llu printable_total=%llu clears_delta=%llu clears_total=%llu has_data=%d",
+			      rd,
+			      (unsigned long long)diag_input_reads,
+			      (unsigned long long)diag_input_bytes,
+			      term->state, term->row, term->col,
+			      term->viewport_top,
+			      terminal_effective_viewport_top(term),
+			      term->scrollback_offset,
+			      term->scrollback_count,
+			      before_cells, terminal_non_empty_cells(term),
+			      (unsigned long long)(term->diag_printable -
+						   before_printable),
+			      (unsigned long long)term->diag_printable,
+			      (unsigned long long)(term->diag_full_clears -
+						   before_clears),
+			      (unsigned long long)term->diag_full_clears,
+			      g_terminal_has_data ? 1 : 0);
 			continue;
+		}
+		if (*view == VIEW_PET && !pet_input_is_command(tmp, rd)) {
+			diag_pet_drop_reads++;
+			diag_pet_drop_bytes += (uint64_t)rd;
+			warnf("diag input view=%s bytes=%zd action=drop_non_pet drops=%llu drop_bytes=%llu total_reads=%llu total_bytes=%llu",
+			      app_view_name(*view), rd,
+			      (unsigned long long)diag_pet_drop_reads,
+			      (unsigned long long)diag_pet_drop_bytes,
+			      (unsigned long long)diag_input_reads,
+			      (unsigned long long)diag_input_bytes);
+			continue;
+		}
 		for (ssize_t i = 0; i < rd; i++) {
 			char ch = tmp[i];
 
-			if (*view == VIEW_TERMINAL) {
-				feed_terminal_bytes(term, kitty, &ch, 1);
-				continue;
-			}
 			if (ch == '\r')
 				continue;
 			if (ch == '\n') {
@@ -4481,7 +5226,8 @@ static void process_input_fd(int fd, struct ui_model *m, struct terminal *term,
 	}
 }
 
-static void process_event_fd(int fd, struct pet_state *pet, enum app_view *view)
+static void process_event_fd(int fd, struct pet_state *pet, struct terminal *term,
+			     enum app_view *view)
 {
 	static char buf[LINE_BUF];
 	static size_t len;
@@ -4532,7 +5278,27 @@ static void process_event_fd(int fd, struct pet_state *pet, enum app_view *view)
 							board_session_step(g_lcd_selected_sid, dir);
 						ui_ctrl_emit_select(g_lcd_selected_sid);
 					}
+				} else if (*view == VIEW_TERMINAL && term) {
+					int dir = 0;
+					if (!strncmp(buf, "ENC +", 5))
+						dir = +1;
+					else if (!strncmp(buf, "ENC -", 5))
+						dir = -1;
+					terminal_scroll_view(term, dir);
+					warnf("diag terminal scroll dir=%d offset=%d history=%d viewport=%d",
+					      dir, term->scrollback_offset,
+					      term->scrollback_count,
+					      term->viewport_top);
 				}
+				len = 0;
+				continue;
+			}
+
+			if (*view == VIEW_TERMINAL && term &&
+			    streq_ci(buf, "ENC_BTN DOWN")) {
+				term->scrollback_offset = 0;
+				warnf("diag terminal scroll bottom history=%d viewport=%d",
+				      term->scrollback_count, term->viewport_top);
 				len = 0;
 				continue;
 			}
@@ -4544,13 +5310,48 @@ static void process_event_fd(int fd, struct pet_state *pet, enum app_view *view)
 			 * handler below (pet + UPDATING scene). */
 			if (*view == VIEW_SESSION_PICKER &&
 			    g_lcd_selected_sid != 0 &&
+			    streq_ci(buf, "KEY 0 DOWN")) {
+				int idx = board_session_find_idx(g_lcd_selected_sid);
+				if (idx >= 0 && g_board_sessions[idx].perm.active) {
+					uint64_t req_id =
+						g_board_sessions[idx].perm.req_id;
+					ui_ctrl_emit_permission(g_lcd_selected_sid,
+								req_id, "deny");
+					board_session_clear_perm(g_lcd_selected_sid,
+								 req_id);
+					len = 0;
+					continue;
+				}
+			}
+			if (*view == VIEW_SESSION_PICKER &&
+			    g_lcd_selected_sid != 0 &&
+			    (streq_ci(buf, "ENC_BTN DOWN") ||
+			     streq_ci(buf, "KEY 6 DOWN"))) {
+				int idx = board_session_find_idx(g_lcd_selected_sid);
+				if (idx >= 0 && g_board_sessions[idx].perm.active) {
+					uint64_t req_id =
+						g_board_sessions[idx].perm.req_id;
+					ui_ctrl_emit_permission(g_lcd_selected_sid,
+								req_id, "allow");
+					board_session_clear_perm(g_lcd_selected_sid,
+								 req_id);
+					len = 0;
+					continue;
+				}
+			}
+			if (*view == VIEW_SESSION_PICKER &&
+			    g_lcd_selected_sid != 0 &&
 			    (streq_ci(buf, "ENC_BTN DOWN") ||
 			     streq_ci(buf, "KEY 6 DOWN"))) {
 				ui_ctrl_emit_focus(g_lcd_selected_sid);
 				g_lcd_active_sid = g_lcd_selected_sid;
+				if (term)
+					terminal_reset(term);
 				*view = VIEW_TERMINAL;
 				ui_ctrl_emit_view("terminal");
 				release_intro_surfaces();
+				warnf("diag picker focus sid=%u view=%s",
+				      g_lcd_active_sid, app_view_name(*view));
 				len = 0;
 				continue;
 			}
@@ -4655,6 +5456,11 @@ static int parse_view(const char *s, enum app_view *out)
 		*out = VIEW_PET;
 		return 0;
 	}
+	if (streq_ci(s, "picker") || streq_ci(s, "session") ||
+	    streq_ci(s, "sessions")) {
+		*out = VIEW_SESSION_PICKER;
+		return 0;
+	}
 	return -1;
 }
 
@@ -4697,12 +5503,122 @@ static int parse_cell_size(const char *s, int *out_w, int *out_h)
 	return 0;
 }
 
+static void copy_range(char *dst, size_t dst_sz, const char *begin,
+		       const char *end)
+{
+	size_t n;
+
+	if (!dst_sz)
+		return;
+	if (!begin)
+		begin = "";
+	if (!end || end < begin)
+		end = begin + strlen(begin);
+	while (end > begin && isspace((unsigned char)end[-1]))
+		end--;
+	while (*begin && begin < end && isspace((unsigned char)*begin))
+		begin++;
+	n = (size_t)(end - begin);
+	if (n >= dst_sz)
+		n = dst_sz - 1;
+	memcpy(dst, begin, n);
+	dst[n] = '\0';
+}
+
+static bool process_session_ctrl_line(const char *line)
+{
+	unsigned sid_val;
+	int rest_off = 0;
+	const char *rest;
+
+	if (sscanf(line, "session %u %n", &sid_val, &rest_off) != 1 ||
+	    sid_val == 0 || rest_off <= 0)
+		return false;
+	rest = line + rest_off;
+
+	if (!strncmp(rest, "state ", 6)) {
+		enum board_session_state st;
+		char state_name[24];
+
+		if (sscanf(rest + 6, "%23s", state_name) == 1 &&
+		    board_session_state_from_name(state_name, &st))
+			board_session_upsert((uint16_t)sid_val, st);
+		return true;
+	}
+	if (!strncmp(rest, "removed", 7)) {
+		board_session_remove((uint16_t)sid_val);
+		return true;
+	}
+	if (!strncmp(rest, "hint ", 5)) {
+		board_session_update_hint((uint16_t)sid_val, rest + 5);
+		return true;
+	}
+	if (!strncmp(rest, "token ", 6)) {
+		unsigned long long input, output, cost;
+
+		if (sscanf(rest + 6, "in=%llu out=%llu cost=%llu",
+			   &input, &output, &cost) == 3) {
+			board_session_update_token((uint16_t)sid_val,
+						   (uint64_t)input,
+						   (uint64_t)output,
+						   (uint64_t)cost);
+		}
+		return true;
+	}
+	if (!strncmp(rest, "turn ", 5)) {
+		char role[sizeof(g_board_sessions[0].turn.role)];
+		int text_off = 0;
+
+		if (sscanf(rest + 5, "role=%11s text:%n", role, &text_off) == 1 &&
+		    text_off > 0) {
+			board_session_update_turn((uint16_t)sid_val, role,
+						  rest + 5 + text_off);
+		}
+		return true;
+	}
+	if (!strncmp(rest, "permission ", 11)) {
+		unsigned long long req_id;
+		char tool[sizeof(g_board_sessions[0].perm.tool)];
+		int args_off = 0;
+
+		if (sscanf(rest + 11, "reqid=%llu tool=%23s args:%n",
+			   &req_id, tool, &args_off) == 2 && args_off > 0) {
+			board_session_update_perm((uint16_t)sid_val,
+						  (uint64_t)req_id, tool,
+						  rest + 11 + args_off);
+		}
+		return true;
+	}
+	if (!strncmp(rest, "meta ", 5)) {
+		const char *kind_begin = strstr(rest, "kind=");
+		const char *cwd_begin = strstr(rest, " cwd=");
+		const char *branch_begin = strstr(rest, " branch=");
+		char kind[sizeof(g_board_sessions[0].meta.kind)];
+		char cwd[sizeof(g_board_sessions[0].meta.cwd)];
+		char branch[sizeof(g_board_sessions[0].meta.branch)];
+
+		if (kind_begin && cwd_begin && branch_begin &&
+		    kind_begin < cwd_begin && cwd_begin < branch_begin) {
+			kind_begin += 5;
+			cwd_begin += 5;
+			branch_begin += 8;
+			copy_range(kind, sizeof(kind), kind_begin, cwd_begin - 5);
+			copy_range(cwd, sizeof(cwd), cwd_begin, branch_begin - 8);
+			copy_range(branch, sizeof(branch), branch_begin, NULL);
+			board_session_update_meta((uint16_t)sid_val, kind, cwd,
+						  branch);
+		}
+		return true;
+	}
+	return false;
+}
+
 static void process_ctrl_fd(int fd, struct font_ctx *font, struct terminal *t,
 			    enum app_view *view)
 {
-	static char buf[64];
+	static char buf[LINE_BUF];
 	static size_t len;
-	char tmp[64];
+	char tmp[128];
 	ssize_t rd;
 
 	for (;;) {
@@ -4724,8 +5640,6 @@ static void process_ctrl_fd(int fd, struct font_ctx *font, struct terminal *t,
 				int w;
 				int h;
 				enum app_view next_view;
-				unsigned sid_val;
-				char state_name[24];
 
 				buf[len] = '\0';
 				if (len > 0 &&
@@ -4736,16 +5650,10 @@ static void process_ctrl_fd(int fd, struct font_ctx *font, struct terminal *t,
 					 parse_view(buf + 5, &next_view) == 0) {
 					*view = next_view;
 					release_intro_surfaces();
-				} else if (sscanf(buf, "session %u state %23s",
-						   &sid_val, state_name) == 2 &&
-					   sid_val != 0) {
-					enum board_session_state st;
-					if (board_session_state_from_name(state_name, &st))
-						board_session_upsert((uint16_t)sid_val, st);
-				} else if (sscanf(buf, "session %u removed",
-						   &sid_val) == 1 &&
-					   sid_val != 0) {
-					board_session_remove((uint16_t)sid_val);
+					warnf("diag ctrl view=%s",
+					      app_view_name(*view));
+				} else {
+					(void)process_session_ctrl_line(buf);
 				}
 				len = 0;
 			} else if (len + 1 < sizeof(buf)) {
@@ -4841,7 +5749,7 @@ static void usage(const char *argv0)
 	printf("Usage: %s [options]\n", argv0);
 	printf("  --fb PATH          framebuffer path (default /dev/fb0)\n");
 	printf("  --input PATH       terminal bytes or newline JSON input, '-' for stdin\n");
-	printf("  --view MODE        terminal/vt100, dashboard/json, or pet (default terminal)\n");
+	printf("  --view MODE        terminal/vt100, dashboard/json, pet, or picker (default terminal)\n");
 	printf("  --event-input PATH local button/encoder event FIFO for pet view\n");
 	printf("  --font PATH        preferred TrueType/OpenType font path\n");
 	printf("  --cell WxH         initial terminal cell size; one of 8x16, 10x20, 12x24, 16x32\n");
@@ -5050,6 +5958,15 @@ int main(int argc, char **argv)
 		term.clear_graphics = false;
 	}
 
+	if (dump_path && ctrl_path) {
+		ctrl_fd = open_input(ctrl_path);
+		if (ctrl_fd >= 0) {
+			process_ctrl_fd(ctrl_fd, &font, &term, &view);
+			if (ctrl_fd != STDIN_FILENO)
+				close(ctrl_fd);
+			ctrl_fd = -1;
+		}
+	}
 	render_app(&c, view, &model, &term, &font, kitty, &pet);
 	if (pet_qa_dump_path && pet_write_qa_dump(pet_qa_dump_path, &c, &pet) < 0)
 		ret = 1;
@@ -5176,7 +6093,7 @@ int main(int argc, char **argv)
 			process_input_fd(input_fd, &model, &term, kitty, &pet,
 					 &view);
 		if (event_idx >= 0 && (pfds[event_idx].revents & POLLIN))
-			process_event_fd(event_fd, &pet, &view);
+			process_event_fd(event_fd, &pet, &term, &view);
 		if (term.clear_graphics) {
 			kitty_graphics_clear(kitty);
 			term.clear_graphics = false;

@@ -70,6 +70,8 @@ When started with `--ctrl`, the control FIFO accepts:
 - `view terminal|dashboard|pet` — switch the active renderer without restarting.
 - `session N state X` — board-side session table update from `aikb_hid_input`;
   `N` is the sid, `X` ∈ `{connected, disconnected, run, wait, done, error}`.
+- `session N hint TEXT` — short host-provided session label from
+  `CMD_REQUEST_SESSION`; used in the picker and terminal status bar.
 - `session N removed` — drop sid `N` from the board-side table.
 
 When started with `--ui-ctrl-out PATH`, the renderer drives the picker state
@@ -82,14 +84,18 @@ machine on `aikb_hid_input` by emitting lines on that FIFO:
 - `focus N` — the user pressed `CONFIRM` / encoder switch on sid `N`;
   `aikb_hid_input` then emits one `CMD_SESSION_FOCUS(N)` to the host and sets
   its `g_active_sid` to `N` so the VT100 stream gate opens.
+- `permission N reqid=R decision=allow|deny|always` — the highlighted sid had
+  an active pending permission and the picker sent the user's decision back
+  through `aikb_hid_input`.
 
 Key bindings in the session picker:
 
 - `SESSION` (KEY 2) — enter the picker. No-op while already in the picker.
 - `Encoder ±1` — move the highlight through live sessions.
-- `CONFIRM` (KEY 6) or encoder push — focus the highlighted sid and switch back
-  to the terminal view.
-- `REJECT` (KEY 0) — exit the picker without changing focus.
+- `CONFIRM` (KEY 6) or encoder push — if the highlighted sid has a pending
+  permission, allow it; otherwise focus the sid and switch back to terminal.
+- `REJECT` (KEY 0) — if the highlighted sid has a pending permission, deny it;
+  otherwise exit the picker without changing focus.
 - All other keys in the picker are eaten board-locally: nothing is forwarded to
   the host while the picker is open.
 
