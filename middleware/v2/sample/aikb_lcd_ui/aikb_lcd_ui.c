@@ -67,7 +67,7 @@
 #define TERM_COLS_MAX 200
 #define TERM_ROWS_VISIBLE_MAX ((UI_H - TERM_STATUS_H - TERM_PAD_Y) / TERM_CELL_H_MIN)
 #define TERM_ROWS_MAX 96
-#define TERM_SCROLLBACK_ROWS 128
+#define TERM_SCROLLBACK_ROWS 1024
 #define TERM_SCROLL_LINES_PER_EVENT 3
 #define TERM_MAX_ARGS 8
 #ifndef ARRAY_SIZE
@@ -115,12 +115,11 @@ enum pet_scene {
 	PET_SCENE_COUNT,
 };
 
-/* Per-key UI action: when aikb_hid_input emits "KEY N DOWN", show the
- * matching label and pick the pet scene that should decorate the next host
+/* Per-key UI action: when aikb_hid_input emits "KEY N DOWN", keep the
+ * matching title and pick the pet scene that should decorate the next host
  * panel. Order is HID bit index, which mirrors aikb_hid_input's "KEY N"
  * naming (KEY 0 = bit 0). Encoder push is host-owned and is intentionally
  * not listed here, so it cannot locally flip VOICE into ASKING. */
-#define KEY_OVERLAY_DURATION_MS 8000u
 struct key_action {
 	const char       *event_line;
 	const char       *label;
@@ -135,13 +134,6 @@ static const struct key_action KEY_ACTIONS[] = {
 	{"KEY 5 DOWN",   "MULTI",   PET_SCENE_ASKING},
 	{"KEY 6 DOWN",   "CONFIRM", PET_SCENE_UPDATING},
 };
-
-struct key_overlay {
-	char     label[16];
-	uint64_t expires_at_ms;
-	bool     active;
-};
-static struct key_overlay g_key_overlay;
 
 /* Set true the first time the host pushes any terminal byte. Used by the
  * terminal view to fall back to a "WAITING FOR HOST TERMINAL STREAM" hint
@@ -222,13 +214,15 @@ static uint32_t *g_ui_shell;
  * sequence repeat forever; otherwise it plays once and the slot is released.
  *
  * Render priority: g_boot_anim (one-shot, plays first) > g_wait_anim (loops,
- * picks up after boot anim ends) > splash fallback > terminal/dashboard.
+ * picks up after boot anim ends) > idle sleep > splash fallback >
+ * terminal/dashboard.
  * Host bytes alone do not release these animations; a board key or explicit
  * view change does, so the host cannot steal the startup/sleep surface.
  */
 #define ANIM_MAGIC_STR  "AKIM"
 #define ANIM_FLAG_LOOP  0x1u
 #define PET_AKIM_FLAG_ARGB8888 0x2u
+#define IDLE_SLEEP_TIMEOUT_MS (180u * 1000u)
 #ifndef PET_ASKING_AKIM_PATH
 #define PET_ASKING_AKIM_PATH "/mnt/system/usr/share/aikb/pet/asking.akim"
 #endif
@@ -267,6 +261,7 @@ struct anim_state {
 };
 static struct anim_state g_boot_anim = { .label = "boot-anim" };
 static struct anim_state g_wait_anim = { .label = "wait-anim" };
+static struct anim_state g_idle_sleep_anim = { .label = "idle-sleep" };
 static struct anim_state g_pet_anims[PET_SCENE_COUNT] = {
 	[PET_SCENE_ASKING] = { .label = "pet-asking" },
 	[PET_SCENE_UPDATING] = { .label = "pet-updating" },
@@ -278,6 +273,8 @@ static bool g_pet_anim_argb8888[PET_SCENE_COUNT];
 static char g_pet_asset_root[256];
 static char g_pet_asset_paths[PET_SCENE_COUNT][256];
 static bool g_pet_force_fallback;
+static uint64_t g_last_local_input_ms;
+static bool g_idle_sleep_active;
 
 static int find_cell_preset(int w, int h)
 {
@@ -441,6 +438,7 @@ struct pet_state {
 	uint32_t frame_index;
 	uint64_t start_time_ms;
 	uint64_t last_interaction_ms;
+	char title[16];
 	char message[128];
 	int energy;
 	int affection;
@@ -482,7 +480,6 @@ static const uint32_t C_GRUVBOX_TEXT = 0xfbf1c7;
 static const uint32_t C_GRUVBOX_MUTED = 0xbdae93;
 static const uint32_t C_GRUVBOX_YELLOW = 0xfabd2f;
 static const uint32_t C_GRUVBOX_BLUE = 0x83a598;
-static const uint32_t C_GRUVBOX_GREEN = 0xb8bb26;
 static const uint32_t C_GRUVBOX_RED = 0xfb4934;
 
 static void on_signal(int sig)
@@ -708,40 +705,6 @@ static void draw_text_right(struct canvas *c, int right, int y, const char *s,
 			    int scale, uint32_t color)
 {
 	draw_text(c, right - text_w(s, scale), y, s, scale, color);
-}
-
-static void key_overlay_show(const char *label)
-{
-	size_t n = strlen(label);
-	if (n >= sizeof(g_key_overlay.label))
-		n = sizeof(g_key_overlay.label) - 1;
-	memcpy(g_key_overlay.label, label, n);
-	g_key_overlay.label[n] = '\0';
-	g_key_overlay.expires_at_ms = monotonic_now_ms() + KEY_OVERLAY_DURATION_MS;
-	g_key_overlay.active = true;
-}
-
-static bool key_overlay_active(void)
-{
-	if (!g_key_overlay.active)
-		return false;
-	if (monotonic_now_ms() >= g_key_overlay.expires_at_ms) {
-		g_key_overlay.active = false;
-		return false;
-	}
-	return true;
-}
-
-/* Active key-overlay label, or NULL when no key was pressed recently.
- * Used by render_dashboard / render_session_picker to swap their header
- * title for the last key name (e.g. "REJECT" / "VOICE" / "MODEL") so
- * users see key feedback in the existing title slot, without a separate
- * overlay chip cluttering the screen. */
-static const char *key_overlay_label(void)
-{
-	if (!key_overlay_active())
-		return NULL;
-	return g_key_overlay.label;
 }
 
 static void uppercase_copy(char *dst, size_t dst_sz, const char *src)
@@ -2331,7 +2294,7 @@ static const char *pet_scene_default_message(enum pet_scene scene)
 {
 	switch (scene) {
 	case PET_SCENE_UPDATING:
-		return "DOWNLOADING...";
+		return "agent task is running";
 	case PET_SCENE_LISTENING:
 		return "tiny dino is listening to your words";
 	case PET_SCENE_FAULT:
@@ -2349,14 +2312,27 @@ static void pet_set_message(struct pet_state *p, const char *msg)
 	safe_copy(p->message, sizeof(p->message), msg);
 }
 
+static void pet_set_title(struct pet_state *p, const char *title)
+{
+	safe_copy(p->title, sizeof(p->title), title);
+}
+
 static void pet_set_scene(struct pet_state *p, enum pet_scene scene,
 			  const char *msg)
 {
 	p->scene = scene;
 	p->mood = pet_mood_from_scene(scene);
 	pet_set_pose(p, pet_pose_from_scene(scene));
+	pet_set_title(p, NULL);
 	pet_set_message(p, msg ? msg : pet_scene_default_message(p->scene));
 	p->last_interaction_ms = monotonic_now_ms();
+}
+
+static void pet_set_scene_title(struct pet_state *p, enum pet_scene scene,
+				const char *title, const char *msg)
+{
+	pet_set_scene(p, scene, msg);
+	pet_set_title(p, title);
 }
 
 static void pet_set_mood(struct pet_state *p, enum pet_mood mood,
@@ -2365,6 +2341,7 @@ static void pet_set_mood(struct pet_state *p, enum pet_mood mood,
 	p->mood = mood;
 	p->scene = pet_scene_from_mood(mood);
 	pet_set_pose(p, pet_pose_from_scene(p->scene));
+	pet_set_title(p, NULL);
 	pet_set_message(p, msg ? msg : pet_scene_default_message(p->scene));
 }
 
@@ -2642,26 +2619,6 @@ static void draw_pet_down_icon(struct canvas *c, int x, int y, uint32_t color)
 		"....#####....",
 		".....###.....",
 		"......#......",
-	};
-
-	draw_pet_icon_map(c, x, y, map, (int)(sizeof(map) / sizeof(map[0])),
-			  false, color);
-}
-
-static void draw_pet_menu_icon(struct canvas *c, int x, int y, uint32_t color)
-{
-	static const char *const map[] = {
-		".###########.",
-		"#############",
-		".###########.",
-		".............",
-		".###########.",
-		"#############",
-		".###########.",
-		".............",
-		".###########.",
-		"#############",
-		".###########.",
 	};
 
 	draw_pet_icon_map(c, x, y, map, (int)(sizeof(map) / sizeof(map[0])),
@@ -3159,9 +3116,9 @@ static const char *pet_header_left(enum pet_scene scene)
 {
 	switch (scene) {
 	case PET_SCENE_UPDATING:
-		return "UPDATING";
+		return "RUN";
 	case PET_SCENE_LISTENING:
-		return "LISTEN";
+		return "VOICE";
 	case PET_SCENE_FAULT:
 		return "FAULT";
 	case PET_SCENE_STANDBY:
@@ -3176,14 +3133,14 @@ static const char *pet_header_state(enum pet_scene scene)
 {
 	switch (scene) {
 	case PET_SCENE_UPDATING:
-		return "UPDATING";
+		return "RUN";
 	case PET_SCENE_LISTENING:
-		return "LISTEN";
+		return "VOICE";
 	case PET_SCENE_STANDBY:
 		return "STANDBY";
 	case PET_SCENE_ASKING:
 	default:
-		return "IDLE";
+		return "ASKING";
 	}
 }
 
@@ -3191,7 +3148,7 @@ static const char *pet_scene_title(enum pet_scene scene)
 {
 	switch (scene) {
 	case PET_SCENE_UPDATING:
-		return "[ OTA FIRMWARE UPDATE ]";
+		return "[ RUNNING ]";
 	case PET_SCENE_LISTENING:
 		return "[ VOICE INPUT ]";
 	case PET_SCENE_FAULT:
@@ -3206,12 +3163,15 @@ static const char *pet_scene_title(enum pet_scene scene)
 
 static int pet_scene_title_scale(enum pet_scene scene)
 {
-	return scene == PET_SCENE_UPDATING ? 2 : 3;
+	(void)scene;
+	return 3;
 }
 
 static const char *pet_footer_hint(enum pet_scene scene)
 {
 	switch (scene) {
+	case PET_SCENE_UPDATING:
+		return "agent task is running";
 	case PET_SCENE_LISTENING:
 		return "speak now";
 	case PET_SCENE_FAULT:
@@ -3219,18 +3179,6 @@ static const char *pet_footer_hint(enum pet_scene scene)
 	default:
 		return "press any key";
 	}
-}
-
-static void draw_pet_progress_bar(struct canvas *c, int x, int y, int w, int h,
-				  int value, uint32_t color)
-{
-	int fill;
-
-	value = pet_clamp_pct(value);
-	stroke_rect(c, x, y, w, h, C_GRUVBOX_LINE);
-	fill_rect(c, x + 3, y + 3, w - 6, h - 6, C_GRUVBOX_DARK0);
-	fill = (w - 8) * value / 100;
-	fill_rect(c, x + 4, y + 4, fill, h - 8, color);
 }
 
 static void draw_pet_scene_visual(struct canvas *c, const struct pet_state *p,
@@ -3249,13 +3197,12 @@ static void draw_pet_scene_visual(struct canvas *c, const struct pet_state *p,
 }
 
 static void draw_pet_header(struct canvas *c, struct font_ctx *font,
-			    enum pet_scene scene, int seconds)
+			    const struct pet_state *p, int seconds)
 {
+	enum pet_scene scene = p->scene;
 	char time_buf[16];
-	const char *left = key_overlay_label();
+	const char *left = p->title[0] ? p->title : pet_header_left(scene);
 
-	if (!left)
-		left = pet_header_left(scene);
 	draw_pet_font_text(c, font, 22, 16, left, 12, 2, C_GRUVBOX_YELLOW);
 	snprintf(time_buf, sizeof(time_buf), "%02d:%02d:%02d", seconds / 3600,
 		 (seconds / 60) % 60, seconds % 60);
@@ -3291,20 +3238,16 @@ static void draw_pet_footer(struct canvas *c, struct font_ctx *font,
 
 	hline(c, 22, 344, UI_W - 44, C_GRUVBOX_LINE);
 	hline(c, 22, 345, UI_W - 44, C_GRUVBOX_DARK1);
-	draw_pet_rotate_icon(c, 42, 362, false, C_GRUVBOX_YELLOW);
-	draw_pet_rotate_icon(c, 88, 362, true, C_GRUVBOX_YELLOW);
-	draw_pet_font_text(c, font, 140, 360, "rotate view", 12, 2,
+	draw_pet_font_text(c, font, 58, 360, "ROTATE VIEW", 12, 2,
 			   C_GRUVBOX_TEXT);
-	draw_pet_font_text(c, font, 332, 360, "|", 12, 2,
+	draw_pet_font_text(c, font, 326, 360, "|", 12, 2,
 			   C_GRUVBOX_MUTED);
-	draw_pet_down_icon(c, 392, 362, C_GRUVBOX_YELLOW);
-	draw_pet_font_text(c, font, 432, 360, hint, 12, 2,
-			   C_GRUVBOX_TEXT);
-	draw_pet_font_text(c, font, 662, 360, "|", 12, 2,
+	draw_pet_font_center(c, font, UI_W / 2, 360, hint, 12, 2,
+			     C_GRUVBOX_TEXT);
+	draw_pet_font_text(c, font, 690, 360, "|", 12, 2,
 			   C_GRUVBOX_MUTED);
-	draw_pet_font_text(c, font, 742, 360, "menu", 12, 2,
+	draw_pet_font_text(c, font, 798, 360, "MENU", 12, 2,
 			    C_GRUVBOX_TEXT);
-	draw_pet_menu_icon(c, 822, 365, C_GRUVBOX_YELLOW);
 }
 
 static void render_pet(struct canvas *c, struct font_ctx *font,
@@ -3314,13 +3257,12 @@ static void render_pet(struct canvas *c, struct font_ctx *font,
 	uint32_t elapsed = (uint32_t)(now_ms - p->start_time_ms);
 	uint32_t frame = elapsed / 83u;
 	int seconds = (int)(elapsed / 1000u);
-	const char *message;
 
 	p->frame_index = frame;
 	pet_update_animation(p, now_ms);
 
 	draw_pet_background(c, frame);
-	draw_pet_header(c, font, p->scene, seconds);
+	draw_pet_header(c, font, p, seconds);
 	draw_pet_scene_visual(c, p, frame);
 
 	hline(c, 326, 258, 308, C_DIM);
@@ -3329,16 +3271,6 @@ static void render_pet(struct canvas *c, struct font_ctx *font,
 			     16, pet_scene_title_scale(p->scene),
 			     p->scene == PET_SCENE_FAULT ?
 			     C_GRUVBOX_RED : C_GRUVBOX_YELLOW);
-	message = p->message[0] ? p->message :
-		  pet_scene_default_message(p->scene);
-	if (p->scene == PET_SCENE_UPDATING) {
-		draw_pet_progress_bar(c, 330, 303, 300, 18, p->progress,
-				      C_GRUVBOX_GREEN);
-		draw_pet_bullet(c, 282, 326, 10, C_GRUVBOX_YELLOW);
-		draw_pet_font_center(c, font, UI_W / 2, 318, message, 12, 1,
-				     C_GRUVBOX_TEXT);
-		draw_pet_bullet(c, 670, 326, 10, C_GRUVBOX_YELLOW);
-	}
 
 	draw_pet_footer(c, font, p->scene);
 }
@@ -3536,11 +3468,11 @@ static void render_dashboard(struct canvas *c, const struct ui_model *m,
 	int seconds = (int)((now_ms - p->start_time_ms) / 1000u);
 
 	/* Solid black canvas + video-style header / footer (same look the
-	 * source mp4s use): left "ASKING/STANDBY/..." label, right
-	 * IDLE+clock+temp, golden rules top and bottom, three-icon footer. */
+	 * source mp4s use): persistent title, status+clock+temp, and
+	 * minimal footer actions. */
 	canvas_clear(c, C_GRUVBOX_BG);
 	fill_rect(c, 0, 0, UI_W, UI_H, 0x141312);
-	draw_pet_header(c, font, p->scene, seconds);
+	draw_pet_header(c, font, p, seconds);
 	draw_pet_footer(c, font, p->scene);
 
 	/* Body band lives between the header and footer rules (~y=60..340). */
@@ -3622,13 +3554,19 @@ static bool board_session_state_from_name(const char *name,
 static void board_session_upsert(uint16_t sid, enum board_session_state state)
 {
 	int idx = board_session_find_idx(sid);
-	if (idx < 0)
+	bool is_new = false;
+
+	if (idx < 0) {
 		idx = board_session_alloc_idx();
+		is_new = true;
+	}
 	if (idx < 0)
 		return;
 	g_board_sessions[idx].used = true;
 	g_board_sessions[idx].sid = sid;
 	g_board_sessions[idx].state = state;
+	if (is_new)
+		g_lcd_selected_sid = sid;
 	if (state != BSS_WAIT)
 		memset(&g_board_sessions[idx].perm, 0,
 		       sizeof(g_board_sessions[idx].perm));
@@ -4800,6 +4738,45 @@ static void release_intro_surfaces(void)
 		g_show_splash = false;
 }
 
+static bool view_allows_idle_sleep(enum app_view view)
+{
+	return view != VIEW_SESSION_PICKER && view != VIEW_TERMINAL;
+}
+
+static void idle_sleep_touch(void)
+{
+	g_last_local_input_ms = monotonic_now_ms();
+	g_idle_sleep_active = false;
+	if (g_idle_sleep_anim.base) {
+		g_idle_sleep_anim.frame_idx = 0;
+		g_idle_sleep_anim.active = true;
+		clock_gettime(CLOCK_MONOTONIC, &g_idle_sleep_anim.started_at);
+	}
+}
+
+static void idle_sleep_update(enum app_view view)
+{
+	uint64_t now;
+
+	if (!view_allows_idle_sleep(view) || !g_idle_sleep_anim.base) {
+		g_idle_sleep_active = false;
+		return;
+	}
+	now = monotonic_now_ms();
+	if (g_last_local_input_ms == 0)
+		g_last_local_input_ms = now;
+	if (now - g_last_local_input_ms < IDLE_SLEEP_TIMEOUT_MS) {
+		g_idle_sleep_active = false;
+		return;
+	}
+	if (!g_idle_sleep_active) {
+		g_idle_sleep_active = true;
+		g_idle_sleep_anim.frame_idx = 0;
+		g_idle_sleep_anim.active = true;
+		clock_gettime(CLOCK_MONOTONIC, &g_idle_sleep_anim.started_at);
+	}
+}
+
 static int anim_load(struct anim_state *a, const char *path)
 {
 	struct stat st;
@@ -5261,6 +5238,7 @@ static void process_event_fd(int fd, struct pet_state *pet, struct terminal *ter
 			if (len == 0) {
 				continue;
 			}
+			idle_sleep_touch();
 
 			/* Encoder rotation: in picker view, step the highlighted
 			 * sid and tell aikb_hid_input via ui-ctrl-out. In any
@@ -5407,9 +5385,8 @@ static void process_event_fd(int fd, struct pet_state *pet, struct terminal *ter
 					ui_ctrl_emit_view("terminal");
 				}
 				*view = VIEW_PET;
-				key_overlay_show(act->label);
-				pet->scene = act->scene;
-				pet->last_interaction_ms = monotonic_now_ms();
+				pet_set_scene_title(pet, act->scene,
+						    act->label, NULL);
 				release_intro_surfaces();
 				break;
 			}
@@ -5734,6 +5711,11 @@ static void render_frame(struct canvas *c, enum app_view view,
 		anim_blit(&g_wait_anim, c);
 		return;
 	}
+	if (g_idle_sleep_active && g_idle_sleep_anim.active &&
+	    g_idle_sleep_anim.base) {
+		anim_blit(&g_idle_sleep_anim, c);
+		return;
+	}
 	if (g_show_splash && g_splash) {
 		memcpy(c->px, g_splash, SPLASH_BYTES);
 		return;
@@ -5759,6 +5741,7 @@ static void usage(const char *argv0)
 	printf("  --ui-shell PATH    raw 960x412 dashboard shell background\n");
 	printf("  --boot-anim PATH   AKIM container (scripts/make_boot_anim.py) played once before splash\n");
 	printf("  --wait-anim PATH   AKIM container with LOOP flag, replays until first input byte\n");
+	printf("  --sleep-anim PATH  AKIM container shown after 3 minutes without local keys outside session views\n");
 	printf("  --pet-asset-root PATH directory containing pet AKIM files such as asking.akim\n");
 	printf("  --pet-scene SCENE  initial pet scene for dumps/tests\n");
 	printf("  --pet-pose POSE    initial pet pose: idle/thinking/happy/confused/sleepy\n");
@@ -5787,6 +5770,7 @@ int main(int argc, char **argv)
 	const char *ui_shell_path = NULL;
 	const char *boot_anim_path = NULL;
 	const char *wait_anim_path = NULL;
+	const char *sleep_anim_path = NULL;
 	const char *pet_asset_root = NULL;
 	const char *pet_qa_dump_path = NULL;
 	enum rotation rotate = ROT_AUTO;
@@ -5853,6 +5837,8 @@ int main(int argc, char **argv)
 			boot_anim_path = argv[++i];
 		} else if (!strcmp(argv[i], "--wait-anim") && i + 1 < argc) {
 			wait_anim_path = argv[++i];
+		} else if (!strcmp(argv[i], "--sleep-anim") && i + 1 < argc) {
+			sleep_anim_path = argv[++i];
 		} else if (!strcmp(argv[i], "--pet-asset-root") && i + 1 < argc) {
 			pet_asset_root = argv[++i];
 		} else if (!strcmp(argv[i], "--pet-scene") && i + 1 < argc) {
@@ -5925,6 +5911,8 @@ int main(int argc, char **argv)
 		anim_load(&g_boot_anim, boot_anim_path);
 	if (wait_anim_path)
 		anim_load(&g_wait_anim, wait_anim_path);
+	if (sleep_anim_path)
+		anim_load(&g_idle_sleep_anim, sleep_anim_path);
 	if (pet_asset_root)
 		pet_set_asset_root(pet_asset_root);
 	for (int i = 0; i < PET_SCENE_COUNT; i++)
@@ -5950,6 +5938,7 @@ int main(int argc, char **argv)
 	if (initial_pet_pose_set)
 		pet_set_pose(&pet, initial_pet_pose);
 	pet.progress = initial_pet_progress;
+	g_last_local_input_ms = monotonic_now_ms();
 	if (!font_init(&font, font_path))
 		warnf("freetype font unavailable; falling back to built-in 8x16 glyphs");
 
@@ -5975,6 +5964,7 @@ int main(int argc, char **argv)
 			ret = 1;
 		kitty_graphics_destroy(kitty);
 		font_destroy(&font);
+		anim_release(&g_idle_sleep_anim);
 		for (int i = 0; i < PET_SCENE_COUNT; i++)
 			anim_release(&g_pet_anims[i]);
 		free(c.px);
@@ -6019,6 +6009,7 @@ int main(int argc, char **argv)
 		int timeout = 1000;
 		time_t now;
 
+		idle_sleep_update(view);
 		if (g_boot_anim.active) {
 			long ms = anim_advance(&g_boot_anim);
 			if (!g_boot_anim.active && g_wait_anim.active)
@@ -6029,6 +6020,11 @@ int main(int argc, char **argv)
 		}
 		if (g_wait_anim.active) {
 			long ms = anim_advance(&g_wait_anim);
+			if (ms > 0 && ms < timeout)
+				timeout = (int)ms;
+		}
+		if (g_idle_sleep_active && g_idle_sleep_anim.active) {
+			long ms = anim_advance(&g_idle_sleep_anim);
 			if (ms > 0 && ms < timeout)
 				timeout = (int)ms;
 		}
@@ -6117,6 +6113,7 @@ int main(int argc, char **argv)
 	g_show_splash = false;
 	anim_release(&g_boot_anim);
 	anim_release(&g_wait_anim);
+	anim_release(&g_idle_sleep_anim);
 	for (int i = 0; i < PET_SCENE_COUNT; i++)
 		anim_release(&g_pet_anims[i]);
 	return ret;

@@ -15,8 +15,9 @@ AIKB_PET_EVENTS="/tmp/aikb_pet_events.in"
 AIKB_UI_CTRL="/tmp/aikb_ui_ctrl.in"
 AIKB_LCD_SPLASH=""
 AIKB_UI_SHELL="/mnt/system/usr/share/aikb/ui/session_shell.argb"
-AIKB_LCD_BOOT_ANIM="/mnt/system/usr/share/aikb/boot/vedio_start.akim"
+AIKB_LCD_BOOT_ANIM=""
 AIKB_LCD_WAIT_ANIM=""
+AIKB_LCD_SLEEP_ANIM="/mnt/system/usr/share/aikb/boot/vedio_sleep.akim"
 
 prepare_aikb_lcd_input()
 {
@@ -147,6 +148,8 @@ start_aikb_lcd_ui()
    [ -f "${AIKB_LCD_BOOT_ANIM}" ] && LCD_BOOT_ANIM_ARG="--boot-anim ${AIKB_LCD_BOOT_ANIM}"
    LCD_WAIT_ANIM_ARG=""
    [ -f "${AIKB_LCD_WAIT_ANIM}" ] && LCD_WAIT_ANIM_ARG="--wait-anim ${AIKB_LCD_WAIT_ANIM}"
+   LCD_SLEEP_ANIM_ARG=""
+   [ -f "${AIKB_LCD_SLEEP_ANIM}" ] && LCD_SLEEP_ANIM_ARG="--sleep-anim ${AIKB_LCD_SLEEP_ANIM}"
 
    # Pass the event FIFO to every view for immediate key-label feedback.
    # Default to pet because dashboard is unused now that the host stopped
@@ -154,7 +157,7 @@ start_aikb_lcd_ui()
    LCD_VIEW="${AIKB_VIEW:-pet}"
    LCD_EVENT_ARG="--event-input ${AIKB_PET_EVENTS}"
 
-   "${LCD_UI}" --fb /dev/fb0 --input "${AIKB_LCD_INPUT}" --ctrl "${AIKB_LCD_CTRL}" --ui-ctrl-out "${AIKB_UI_CTRL}" ${LCD_EVENT_ARG} ${LCD_BOOT_ANIM_ARG} ${LCD_WAIT_ANIM_ARG} ${LCD_SPLASH_ARG} ${LCD_UI_SHELL_ARG} --rotate auto --view "${LCD_VIEW}" --no-mock >> "${LCD_LOG}" 2>&1 &
+   "${LCD_UI}" --fb /dev/fb0 --input "${AIKB_LCD_INPUT}" --ctrl "${AIKB_LCD_CTRL}" --ui-ctrl-out "${AIKB_UI_CTRL}" ${LCD_EVENT_ARG} ${LCD_BOOT_ANIM_ARG} ${LCD_WAIT_ANIM_ARG} ${LCD_SLEEP_ANIM_ARG} ${LCD_SPLASH_ARG} ${LCD_UI_SHELL_ARG} --rotate auto --view "${LCD_VIEW}" --no-mock >> "${LCD_LOG}" 2>&1 &
    LCD_PID=$!
    sleep 1
    if kill -0 "${LCD_PID}" >/dev/null 2>&1; then

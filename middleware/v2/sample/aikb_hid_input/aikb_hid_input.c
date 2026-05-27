@@ -1125,6 +1125,7 @@ static void handle_packet(int hid_fd, int *screen_fd, int *ctrl_fd,
 			(void)send_hid_packet(hid_fd, REPORT_ID_HOST_BOUND,
 					      CMD_SESSION_RESPONSE, new_sid,
 					      &st, 1, cfg->debug);
+			g_selected_sid = new_sid;
 			emit_session_state_line(ctrl_fd, cfg, new_sid);
 			emit_session_hint_line(ctrl_fd, cfg, new_sid);
 		} else {
