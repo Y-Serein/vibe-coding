@@ -94,3 +94,9 @@ arch/*/include/generated/
 node_modules/
 dist/
 build_artifact/
+
+# AIKB local/generated board assets
+# Large AKIM videos are kept outside Git history; place them locally before
+# packing rootfs when needed.
+/buildroot/board/cvitek/SG200X/overlay/mnt/system/usr/share/aikb/boot/*.akim
+*.d
