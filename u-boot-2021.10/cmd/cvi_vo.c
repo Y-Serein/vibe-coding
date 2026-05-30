@@ -510,7 +510,9 @@ static void dsi_panel_init(void)
 	u8 prepare = panel_desc.hs_timing_cfg->prepare;
 	u8 zero = panel_desc.hs_timing_cfg->zero;
 	u8 trail = panel_desc.hs_timing_cfg->trail;
-	bool is_gc9503 = !strcmp(panel_desc.panel_name, "GC9503-CXW034-412x960");
+	bool is_gc9503_old = !strcmp(panel_desc.panel_name, "GC9503-CXW034-412x960");
+	bool is_gc9503_boe = !strcmp(panel_desc.panel_name, "GC9503CV-BOE-QV034-412x960");
+	bool is_gc9503 = is_gc9503_old || is_gc9503_boe;
 	printf("Init panel %s\n", panel_desc.panel_name);
 	if (is_gc9503)
 		gc9503_reset_display_blocks();
@@ -786,6 +788,12 @@ static int do_startvo(struct cmd_tbl *cmdtp, int flag, int argc, char * const ar
 			panel_desc.hs_timing_cfg = &hs_timing_cfg_gc9503_cxw034_412x960;
 			panel_desc.dsi_init_cmds = dsi_init_cmds_gc9503_cxw034_412x960;
 			panel_desc.dsi_init_cmds_size = ARRAY_SIZE(dsi_init_cmds_gc9503_cxw034_412x960);
+		} else if (strcmp(panel_name,"gc9503cv_boe_qv034") == 0) {
+			panel_desc.panel_name = "GC9503CV-BOE-QV034-412x960";
+			panel_desc.dev_cfg = &dev_cfg_gc9503cv_boe_qv034_412x960;
+			panel_desc.hs_timing_cfg = &hs_timing_cfg_gc9503cv_boe_qv034_412x960;
+			panel_desc.dsi_init_cmds = dsi_init_cmds_gc9503cv_boe_qv034_412x960;
+			panel_desc.dsi_init_cmds_size = ARRAY_SIZE(dsi_init_cmds_gc9503cv_boe_qv034_412x960);
 		} else {
 			printf("panel %s not found\n\r", panel_name);
 		}
@@ -870,7 +878,8 @@ static int do_startvl(struct cmd_tbl *cmdtp, int flag, int argc, char * const ar
 		return CMD_RET_USAGE;
 
 	if (panel_desc.panel_name &&
-	    !strcmp(panel_desc.panel_name, "GC9503-CXW034-412x960")) {
+	    (!strcmp(panel_desc.panel_name, "GC9503-CXW034-412x960") ||
+	     !strcmp(panel_desc.panel_name, "GC9503CV-BOE-QV034-412x960"))) {
 		printf("GC9503 startvl: keep Vibe Coding splash\n");
 		return CMD_RET_SUCCESS;
 	}

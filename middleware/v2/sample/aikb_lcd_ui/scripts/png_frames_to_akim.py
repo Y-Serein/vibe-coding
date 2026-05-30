@@ -22,6 +22,8 @@ import struct
 import sys
 import zlib
 
+from akim_common import strip_matte_edges
+
 
 PNG_SIG = b"\x89PNG\r\n\x1a\n"
 AKIM_MAGIC = b"AKIM"
@@ -140,6 +142,11 @@ def main():
     ap.add_argument("--frame-delay-ms", type=int, default=120)
     ap.add_argument("--width", type=int)
     ap.add_argument("--height", type=int)
+    ap.add_argument("--matte-edge-threshold", type=int, default=64,
+                    help="clear dark pixels touching transparent edges; "
+                         "0 disables, default 64")
+    ap.add_argument("--matte-edge-passes", type=int, default=5,
+                    help="edge-matte cleanup passes; default 5")
     ap.add_argument("--no-loop", action="store_true")
     ap.add_argument(
         "--argb8888",
@@ -150,6 +157,10 @@ def main():
 
     if args.frame_delay_ms <= 0:
         raise SystemExit("--frame-delay-ms must be positive")
+    if args.matte_edge_threshold < 0 or args.matte_edge_threshold > 255:
+        raise SystemExit("--matte-edge-threshold must be 0..255")
+    if args.matte_edge_passes < 0:
+        raise SystemExit("--matte-edge-passes must be >= 0")
 
     frames = []
     width = args.width
@@ -162,6 +173,13 @@ def main():
             height = h
         if w != width or h != height:
             raise SystemExit(f"{src}: {w}x{h} != expected {width}x{height}")
+        rgba = strip_matte_edges(
+            rgba,
+            width,
+            height,
+            threshold=args.matte_edge_threshold,
+            passes=args.matte_edge_passes,
+        )
         if args.argb8888:
             buf = bytearray(rgba)
             for i in range(0, len(buf), 4):
@@ -193,7 +211,8 @@ def main():
 
     print(
         f"wrote {args.out}: {len(frames)} frames, {width}x{height}, "
-        f"{args.frame_delay_ms}ms, flags=0x{flags:x}, "
+        f"{args.frame_delay_ms}ms, matte_edge<={args.matte_edge_threshold}"
+        f"x{args.matte_edge_passes}, flags=0x{flags:x}, "
         f"{os.path.getsize(args.out)} bytes",
         file=sys.stderr,
     )

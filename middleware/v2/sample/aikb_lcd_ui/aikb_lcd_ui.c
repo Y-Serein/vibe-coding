@@ -473,7 +473,6 @@ static const uint32_t C_DIM = 0x5d421d;
 static const uint32_t C_GREEN = 0x46c800;
 static const uint32_t C_RED = 0xff4b2e;
 static const uint32_t C_GRUVBOX_BG = 0x1d2021;
-static const uint32_t C_GRUVBOX_DARK0 = 0x282828;
 static const uint32_t C_GRUVBOX_DARK1 = 0x3c3836;
 static const uint32_t C_GRUVBOX_LINE = 0xebdbb2;
 static const uint32_t C_GRUVBOX_TEXT = 0xfbf1c7;
@@ -2504,26 +2503,13 @@ static void pet_apply_event_line(struct pet_state *p, const char *line)
 
 static void draw_pet_background(struct canvas *c, uint32_t frame)
 {
-	canvas_clear(c, C_GRUVBOX_BG);
-	fill_rect(c, 0, 0, UI_W, UI_H, 0x151514);
-	for (int y = 0; y < UI_H; y += 4)
-		fill_rect(c, 0, y, UI_W, 1, 0x0d0d0c);
-	for (int y = 0; y < UI_H; y += 6) {
-		for (int x = (y * 13 + (int)frame) & 31; x < UI_W; x += 64) {
-			uint32_t n = ((uint32_t)x * 1103515245u) ^
-				     ((uint32_t)y * 2654435761u) ^ frame;
-			if ((n & 7u) == 0)
-				put_px(c, x, y, C_GRUVBOX_DARK0);
-		}
-	}
-	for (int i = 0; i < 44; i++) {
-		uint32_t shade = i < 24 ? 0x0b0b0a : 0x11100e;
+	(void)frame;
 
-		hline(c, i, i, UI_W - i * 2, shade);
-		hline(c, i, UI_H - 1 - i, UI_W - i * 2, shade);
-		vline(c, i, i, UI_H - i * 2, shade);
-		vline(c, UI_W - 1 - i, i, UI_H - i * 2, shade);
-	}
+	canvas_clear(c, 0x151514);
+	fill_rect(c, 0, 0, UI_W, 56, 0x10100f);
+	fill_rect(c, 0, 346, UI_W, UI_H - 346, 0x10100f);
+	fill_rect(c, 0, 0, 4, UI_H, 0x0b0b0a);
+	fill_rect(c, UI_W - 4, 0, 4, UI_H, 0x0b0b0a);
 }
 
 static void draw_pet_bullet(struct canvas *c, int x, int y, int size,

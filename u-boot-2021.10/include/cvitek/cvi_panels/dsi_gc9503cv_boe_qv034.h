@@ -1,0 +1,162 @@
+/* SPDX-License-Identifier: GPL-2.0+ */
+
+#ifndef _MIPI_TX_PARAM_GC9503CV_BOE_QV034_H_
+#define _MIPI_TX_PARAM_GC9503CV_BOE_QV034_H_
+
+#ifndef __UBOOT__
+#include <linux/vo_mipi_tx.h>
+#include <linux/cvi_comm_mipi_tx.h>
+#else
+#include <cvi_mipi.h>
+#endif
+
+/*
+ * BOE QV034KQ8-N80-3QP0 + GC9503CV 3.4 inch panel.
+ * The vendor porch was too narrow on Linux handoff, so keep the conservative
+ * 412x960 porch used by the stable GC9503_CXW034 path.
+ * Board lane/reset/backlight wiring is the same as GC9503_CXW034.
+ */
+#define GC9503CV_BOE_QV034_VACT	960
+#define GC9503CV_BOE_QV034_VSA	10
+#define GC9503CV_BOE_QV034_VBP	20
+#define GC9503CV_BOE_QV034_VFP	20
+
+#define GC9503CV_BOE_QV034_HACT	412
+#define GC9503CV_BOE_QV034_HSA	10
+#define GC9503CV_BOE_QV034_HBP	50
+#define GC9503CV_BOE_QV034_HFP	50
+#define GC9503CV_BOE_QV034_FPS	60
+
+#define GC9503CV_BOE_QV034_PIXEL_CLK(x) ((x##_VACT + x##_VSA + x##_VBP + x##_VFP) \
+	* (x##_HACT + x##_HSA + x##_HBP + x##_HFP) * x##_FPS / 1000)
+
+struct combo_dev_cfg_s dev_cfg_gc9503cv_boe_qv034_412x960 = {
+	.devno = 0,
+	/*
+	 * Adapter schematic:
+	 * MIPI_TX0_P/N -> panel DSI data0 P/N
+	 * MIPI_TX1_P/N -> panel DSI data1 P/N
+	 * MIPI_TX2_P/N -> panel DSI clock P/N
+	 */
+	.lane_id = {MIPI_TX_LANE_0, MIPI_TX_LANE_1, MIPI_TX_LANE_CLK, -1, -1},
+	.lane_pn_swap = {false, false, false, false, false},
+	.output_mode = OUTPUT_MODE_DSI_VIDEO,
+	.video_mode = BURST_MODE,
+	.output_format = OUT_FORMAT_RGB_24_BIT,
+	.sync_info = {
+		.vid_hsa_pixels = GC9503CV_BOE_QV034_HSA,
+		.vid_hbp_pixels = GC9503CV_BOE_QV034_HBP,
+		.vid_hfp_pixels = GC9503CV_BOE_QV034_HFP,
+		.vid_hline_pixels = GC9503CV_BOE_QV034_HACT,
+		.vid_vsa_lines = GC9503CV_BOE_QV034_VSA,
+		.vid_vbp_lines = GC9503CV_BOE_QV034_VBP,
+		.vid_vfp_lines = GC9503CV_BOE_QV034_VFP,
+		.vid_active_lines = GC9503CV_BOE_QV034_VACT,
+		.vid_vsa_pos_polarity = true,
+		.vid_hsa_pos_polarity = false,
+	},
+	.pixel_clk = GC9503CV_BOE_QV034_PIXEL_CLK(GC9503CV_BOE_QV034),
+};
+
+const struct hs_settle_s hs_timing_cfg_gc9503cv_boe_qv034_412x960 = {
+	.prepare = 6,
+	.zero = 32,
+	.trail = 1,
+};
+
+#ifndef CVI_U8
+#define CVI_U8 unsigned char
+#endif
+
+static CVI_U8 data_gc9503cv_boe_qv034_0[] = {0xF0,0x55,0xAA,0x52,0x08,0x00};
+static CVI_U8 data_gc9503cv_boe_qv034_1[] = {0xF6,0x5A,0x87};
+static CVI_U8 data_gc9503cv_boe_qv034_2[] = {0xC1,0x3F};
+static CVI_U8 data_gc9503cv_boe_qv034_3[] = {0xCD,0x25};
+static CVI_U8 data_gc9503cv_boe_qv034_4[] = {0xC9,0x10};
+static CVI_U8 data_gc9503cv_boe_qv034_5[] = {0xF8,0x8A};
+static CVI_U8 data_gc9503cv_boe_qv034_6[] = {0xAC,0x45};
+static CVI_U8 data_gc9503cv_boe_qv034_7[] = {0xA7,0x47};
+static CVI_U8 data_gc9503cv_boe_qv034_8[] = {0xA0,0x77};
+static CVI_U8 data_gc9503cv_boe_qv034_9[] = {0x86,0x99,0xA3,0xA3,0x31};
+static CVI_U8 data_gc9503cv_boe_qv034_10[] = {0xFA,0x08,0x08,0x00,0x04};
+static CVI_U8 data_gc9503cv_boe_qv034_11[] = {0xA3,0x6E};
+static CVI_U8 data_gc9503cv_boe_qv034_12[] = {0xFD,0x28,0x3C,0x00};
+static CVI_U8 data_gc9503cv_boe_qv034_13[] = {0x9A,0x64};
+static CVI_U8 data_gc9503cv_boe_qv034_14[] = {0x9B,0x4E};
+static CVI_U8 data_gc9503cv_boe_qv034_15[] = {0x82,0x20,0x20};
+static CVI_U8 data_gc9503cv_boe_qv034_16[] = {0x80,0x43};
+static CVI_U8 data_gc9503cv_boe_qv034_17[] = {0xB1,0x10};
+static CVI_U8 data_gc9503cv_boe_qv034_18[] = {0x7A,0x0F,0x13};
+static CVI_U8 data_gc9503cv_boe_qv034_19[] = {0x7B,0x0F,0x13};
+static CVI_U8 data_gc9503cv_boe_qv034_20[] = {0x6D,0x1E,0x1E,0x1E,0x1E,0x1E,0x10,0x0E,0x0C,0x0A,0x1D,0x04,0x02,0x05,0x1E,0x1E,0x1E,0x1E,0x1E,0x1E,0x05,0x01,0x03,0x1D,0x09,0x0B,0x0D,0x0F,0x1E,0x1E,0x1E,0x1E,0x1E};
+static CVI_U8 data_gc9503cv_boe_qv034_21[] = {0x64,0x38,0x04,0x03,0xc4,0x03,0x03,0x38,0x03,0x03,0xc5,0x03,0x03,0x3A,0x7A,0x3A,0x7A};
+static CVI_U8 data_gc9503cv_boe_qv034_22[] = {0x65,0x38,0x02,0x03,0xc6,0x03,0x03,0x38,0x01,0x03,0xc7,0x03,0x03,0x3A,0x7A,0x3A,0x7A};
+static CVI_U8 data_gc9503cv_boe_qv034_23[] = {0x66,0x38,0x08,0x03,0xC0,0x03,0x03,0x38,0x07,0x03,0xc1,0x03,0x03,0x3A,0x7A,0x3A,0x7A};
+static CVI_U8 data_gc9503cv_boe_qv034_24[] = {0x67,0x38,0x06,0x03,0xc2,0x03,0x03,0x38,0x05,0x03,0xc3,0x03,0x03,0x3A,0x7A,0x3A,0x7A};
+static CVI_U8 data_gc9503cv_boe_qv034_25[] = {0x60,0x38,0x0D,0x3A,0x7A,0x38,0x0C,0x3A,0x7A};
+static CVI_U8 data_gc9503cv_boe_qv034_26[] = {0x61,0x38,0x09,0x3A,0x7A,0x38,0x08,0x3A,0x7A};
+static CVI_U8 data_gc9503cv_boe_qv034_27[] = {0x62,0x33,0xC4,0x3A,0x7A,0x18,0x02,0x3A,0x7A};
+static CVI_U8 data_gc9503cv_boe_qv034_28[] = {0x69,0x14,0x22,0x14,0x22,0x44,0x22,0x08};
+static CVI_U8 data_gc9503cv_boe_qv034_29[] = {0x6B,0x07};
+static CVI_U8 data_gc9503cv_boe_qv034_30[] = {0xD1,0x00,0x00,0x00,0x17,0x00,0x39,0x00,0x55,0x00,0x6C,0x00,0x92,0x00,0xB5,0x00,0xE3,0x01,0x11,0x01,0x59,0x01,0x93,0x01,0xEF,0x02,0x37,0x02,0x39,0x02,0x7A,0x02,0xBB,0x02,0xE7,0x03,0x20,0x03,0x48,0x03,0x85,0x03,0x94,0x03,0xA6,0x03,0xB2,0x03,0xCF,0x03,0xEF,0x03,0xFF};
+static CVI_U8 data_gc9503cv_boe_qv034_31[] = {0xD2,0x00,0x00,0x00,0x17,0x00,0x39,0x00,0x55,0x00,0x6C,0x00,0x92,0x00,0xB5,0x00,0xE3,0x01,0x11,0x01,0x59,0x01,0x93,0x01,0xEF,0x02,0x37,0x02,0x39,0x02,0x7A,0x02,0xBB,0x02,0xE7,0x03,0x20,0x03,0x48,0x03,0x85,0x03,0x94,0x03,0xA6,0x03,0xB2,0x03,0xCF,0x03,0xEF,0x03,0xFF};
+static CVI_U8 data_gc9503cv_boe_qv034_32[] = {0xD3,0x00,0x00,0x00,0x17,0x00,0x39,0x00,0x55,0x00,0x6C,0x00,0x92,0x00,0xB5,0x00,0xE3,0x01,0x11,0x01,0x59,0x01,0x93,0x01,0xEF,0x02,0x37,0x02,0x39,0x02,0x7A,0x02,0xBB,0x02,0xE7,0x03,0x20,0x03,0x48,0x03,0x85,0x03,0x94,0x03,0xA6,0x03,0xB2,0x03,0xCF,0x03,0xEF,0x03,0xFF};
+static CVI_U8 data_gc9503cv_boe_qv034_33[] = {0xD4,0x00,0x17,0x00,0x1F,0x00,0x42,0x00,0x5B,0x00,0x72,0x00,0x97,0x00,0xB5,0x00,0xE3,0x01,0x11,0x01,0x59,0x01,0x93,0x01,0xEF,0x02,0x37,0x02,0x39,0x02,0x7A,0x02,0xBB,0x02,0xE7,0x03,0x20,0x03,0x48,0x03,0x85,0x03,0x94,0x03,0xA6,0x03,0xB2,0x03,0xCF,0x03,0xEF,0x03,0xFF};
+static CVI_U8 data_gc9503cv_boe_qv034_34[] = {0xD5,0x00,0x17,0x00,0x1F,0x00,0x42,0x00,0x5B,0x00,0x72,0x00,0x97,0x00,0xB5,0x00,0xE3,0x01,0x11,0x01,0x59,0x01,0x93,0x01,0xEF,0x02,0x37,0x02,0x39,0x02,0x7A,0x02,0xBB,0x02,0xE7,0x03,0x20,0x03,0x48,0x03,0x85,0x03,0x94,0x03,0xA6,0x03,0xB2,0x03,0xCF,0x03,0xEF,0x03,0xFF};
+static CVI_U8 data_gc9503cv_boe_qv034_35[] = {0xD6,0x00,0x17,0x00,0x1F,0x00,0x42,0x00,0x5B,0x00,0x72,0x00,0x97,0x00,0xB5,0x00,0xE3,0x01,0x11,0x01,0x59,0x01,0x93,0x01,0xEF,0x02,0x37,0x02,0x39,0x02,0x7A,0x02,0xBB,0x02,0xE7,0x03,0x20,0x03,0x48,0x03,0x85,0x03,0x94,0x03,0xA6,0x03,0xB2,0x03,0xCF,0x03,0xEF,0x03,0xFF};
+static CVI_U8 data_gc9503cv_boe_qv034_sleep_out[] = {0x11};
+static CVI_U8 data_gc9503cv_boe_qv034_display_on[] = {0x29};
+
+#define TYPE1_DCS_SHORT_WRITE 0x05
+#define TYPE2_DCS_SHORT_WRITE 0x15
+/*
+ * The vendor GC9503SSD sequence wraps these private register writes in
+ * SSD_SEND(); Cvitek's other vendor-panel ports use MIPI generic long
+ * packets for the same style of private payloads.
+ */
+#define TYPE3_DCS_LONG_WRITE_GC9503 0x29
+
+const struct dsc_instr dsi_init_cmds_gc9503cv_boe_qv034_412x960[] = {
+	{.delay = 0, .data_type = TYPE3_DCS_LONG_WRITE_GC9503, .size = 6, .data = data_gc9503cv_boe_qv034_0 },
+	{.delay = 0, .data_type = TYPE3_DCS_LONG_WRITE_GC9503, .size = 3, .data = data_gc9503cv_boe_qv034_1 },
+	{.delay = 0, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_gc9503cv_boe_qv034_2 },
+	{.delay = 0, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_gc9503cv_boe_qv034_3 },
+	{.delay = 0, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_gc9503cv_boe_qv034_4 },
+	{.delay = 0, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_gc9503cv_boe_qv034_5 },
+	{.delay = 0, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_gc9503cv_boe_qv034_6 },
+	{.delay = 0, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_gc9503cv_boe_qv034_7 },
+	{.delay = 0, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_gc9503cv_boe_qv034_8 },
+	{.delay = 0, .data_type = TYPE3_DCS_LONG_WRITE_GC9503, .size = 5, .data = data_gc9503cv_boe_qv034_9 },
+	{.delay = 0, .data_type = TYPE3_DCS_LONG_WRITE_GC9503, .size = 5, .data = data_gc9503cv_boe_qv034_10 },
+	{.delay = 0, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_gc9503cv_boe_qv034_11 },
+	{.delay = 0, .data_type = TYPE3_DCS_LONG_WRITE_GC9503, .size = 4, .data = data_gc9503cv_boe_qv034_12 },
+	{.delay = 0, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_gc9503cv_boe_qv034_13 },
+	{.delay = 0, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_gc9503cv_boe_qv034_14 },
+	{.delay = 0, .data_type = TYPE3_DCS_LONG_WRITE_GC9503, .size = 3, .data = data_gc9503cv_boe_qv034_15 },
+	{.delay = 0, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_gc9503cv_boe_qv034_16 },
+	{.delay = 0, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_gc9503cv_boe_qv034_17 },
+	{.delay = 0, .data_type = TYPE3_DCS_LONG_WRITE_GC9503, .size = 3, .data = data_gc9503cv_boe_qv034_18 },
+	{.delay = 0, .data_type = TYPE3_DCS_LONG_WRITE_GC9503, .size = 3, .data = data_gc9503cv_boe_qv034_19 },
+	{.delay = 0, .data_type = TYPE3_DCS_LONG_WRITE_GC9503, .size = 33, .data = data_gc9503cv_boe_qv034_20 },
+	{.delay = 0, .data_type = TYPE3_DCS_LONG_WRITE_GC9503, .size = 17, .data = data_gc9503cv_boe_qv034_21 },
+	{.delay = 0, .data_type = TYPE3_DCS_LONG_WRITE_GC9503, .size = 17, .data = data_gc9503cv_boe_qv034_22 },
+	{.delay = 0, .data_type = TYPE3_DCS_LONG_WRITE_GC9503, .size = 17, .data = data_gc9503cv_boe_qv034_23 },
+	{.delay = 0, .data_type = TYPE3_DCS_LONG_WRITE_GC9503, .size = 17, .data = data_gc9503cv_boe_qv034_24 },
+	{.delay = 0, .data_type = TYPE3_DCS_LONG_WRITE_GC9503, .size = 9, .data = data_gc9503cv_boe_qv034_25 },
+	{.delay = 0, .data_type = TYPE3_DCS_LONG_WRITE_GC9503, .size = 9, .data = data_gc9503cv_boe_qv034_26 },
+	{.delay = 0, .data_type = TYPE3_DCS_LONG_WRITE_GC9503, .size = 9, .data = data_gc9503cv_boe_qv034_27 },
+	{.delay = 0, .data_type = TYPE3_DCS_LONG_WRITE_GC9503, .size = 8, .data = data_gc9503cv_boe_qv034_28 },
+	{.delay = 0, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_gc9503cv_boe_qv034_29 },
+	{.delay = 0, .data_type = TYPE3_DCS_LONG_WRITE_GC9503, .size = 53, .data = data_gc9503cv_boe_qv034_30 },
+	{.delay = 0, .data_type = TYPE3_DCS_LONG_WRITE_GC9503, .size = 53, .data = data_gc9503cv_boe_qv034_31 },
+	{.delay = 0, .data_type = TYPE3_DCS_LONG_WRITE_GC9503, .size = 53, .data = data_gc9503cv_boe_qv034_32 },
+	{.delay = 0, .data_type = TYPE3_DCS_LONG_WRITE_GC9503, .size = 53, .data = data_gc9503cv_boe_qv034_33 },
+	{.delay = 0, .data_type = TYPE3_DCS_LONG_WRITE_GC9503, .size = 53, .data = data_gc9503cv_boe_qv034_34 },
+	{.delay = 0, .data_type = TYPE3_DCS_LONG_WRITE_GC9503, .size = 53, .data = data_gc9503cv_boe_qv034_35 },
+	{.delay = 120, .data_type = TYPE1_DCS_SHORT_WRITE, .size = 1, .data = data_gc9503cv_boe_qv034_sleep_out },
+	{.delay = 120, .data_type = TYPE1_DCS_SHORT_WRITE, .size = 1, .data = data_gc9503cv_boe_qv034_display_on },
+};
+
+#else
+#error "_MIPI_TX_PARAM_GC9503CV_BOE_QV034_H_ multi-delcaration!!"
+#endif

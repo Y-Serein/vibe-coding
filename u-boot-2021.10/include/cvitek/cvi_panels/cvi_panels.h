@@ -34,6 +34,7 @@ struct panel_desc_s {
 #include "dsi_d240si31.h"
 #include "dsi_st7701_d310t9362v1.h"
 #include "dsi_gc9503_cxw034.h"
+#include "dsi_gc9503cv_boe_qv034.h"
 
 #ifdef MIPI_PANEL_HX8394
 #include "dsi_hx8394_evb.h"
@@ -199,6 +200,14 @@ static struct panel_desc_s panel_desc = {
 	.hs_timing_cfg = &hs_timing_cfg_gc9503_cxw034_412x960,
 	.dsi_init_cmds = dsi_init_cmds_gc9503_cxw034_412x960,
 	.dsi_init_cmds_size = ARRAY_SIZE(dsi_init_cmds_gc9503_cxw034_412x960)
+};
+#elif defined(MIPI_PANEL_GC9503CV_BOE_QV034)
+static struct panel_desc_s panel_desc = {
+	.panel_name = "GC9503CV-BOE-QV034-412x960",
+	.dev_cfg = &dev_cfg_gc9503cv_boe_qv034_412x960,
+	.hs_timing_cfg = &hs_timing_cfg_gc9503cv_boe_qv034_412x960,
+	.dsi_init_cmds = dsi_init_cmds_gc9503cv_boe_qv034_412x960,
+	.dsi_init_cmds_size = ARRAY_SIZE(dsi_init_cmds_gc9503cv_boe_qv034_412x960)
 };
 #elif defined(MIPI_PANEL_ZCT2133V1)
 static struct panel_desc_s panel_desc = {

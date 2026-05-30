@@ -22,6 +22,7 @@ from akim_common import (
     crop_rgba,
     read_png_rgba,
     resize_rgba_nearest,
+    strip_matte_edges,
     write_akim,
     write_png_rgba,
 )
@@ -213,7 +214,16 @@ def build_akim(frames, roi, args):
         if w != src_w or h != src_h:
             raise SystemExit(f"{path}: {w}x{h} differs from {src_w}x{src_h}")
         cropped = crop_rgba(w, h, rgba, roi)
-        packed.append(resize_rgba_nearest(roi[2], roi[3], cropped, out_w, out_h))
+        packed_frame = resize_rgba_nearest(roi[2], roi[3], cropped, out_w, out_h)
+        packed.append(
+            strip_matte_edges(
+                packed_frame,
+                out_w,
+                out_h,
+                threshold=args.matte_edge_threshold,
+                passes=args.matte_edge_passes,
+            )
+        )
         print(f"frame {idx:03d}: {path}", file=sys.stderr)
 
     write_akim(
@@ -227,7 +237,8 @@ def build_akim(frames, roi, args):
     )
     print(
         f"wrote {args.out}: {len(packed)} frames, {out_w}x{out_h}, "
-        f"{delay_ms}ms, ARGB8888",
+        f"{delay_ms}ms, matte_edge<={args.matte_edge_threshold}"
+        f"x{args.matte_edge_passes}, ARGB8888",
         file=sys.stderr,
     )
 
@@ -245,6 +256,11 @@ def main():
     ap.add_argument("--duration-sec", type=float)
     ap.add_argument("--width", type=int, help="output AKIM frame width")
     ap.add_argument("--height", type=int, help="output AKIM frame height")
+    ap.add_argument("--matte-edge-threshold", type=int, default=64,
+                    help="clear dark pixels touching transparent edges; "
+                         "0 disables, default 64")
+    ap.add_argument("--matte-edge-passes", type=int, default=5,
+                    help="edge-matte cleanup passes; default 5")
     ap.add_argument("--no-loop", action="store_true")
     ap.add_argument("--max-preview-frames", type=int, default=12)
     ap.add_argument("--preview-tile-width", type=int, default=320)
@@ -257,6 +273,10 @@ def main():
         raise SystemExit("--start-sec must be >= 0")
     if args.fps <= 0:
         raise SystemExit("--fps must be positive")
+    if args.matte_edge_threshold < 0 or args.matte_edge_threshold > 255:
+        raise SystemExit("--matte-edge-threshold must be 0..255")
+    if args.matte_edge_passes < 0:
+        raise SystemExit("--matte-edge-passes must be >= 0")
     if args.duration_sec is not None and args.duration_sec <= 0:
         raise SystemExit("--duration-sec must be positive")
     if args.max_preview_frames <= 0:

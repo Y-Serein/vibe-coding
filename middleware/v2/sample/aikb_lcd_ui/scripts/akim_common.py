@@ -175,6 +175,34 @@ def rgba_to_bgra(rgba):
     return bytes(out)
 
 
+def strip_matte_edges(rgba, width, height, threshold=64, passes=5):
+    if threshold <= 0 or passes <= 0:
+        return rgba
+    out = bytearray(rgba)
+    for _pass in range(passes):
+        marks = []
+        for y in range(height):
+            for x in range(width):
+                off = (y * width + x) * 4
+                if not out[off + 3]:
+                    continue
+                if max(out[off], out[off + 1], out[off + 2]) > threshold:
+                    continue
+                touches_alpha = False
+                for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                    if 0 <= nx < width and 0 <= ny < height:
+                        if out[(ny * width + nx) * 4 + 3] == 0:
+                            touches_alpha = True
+                            break
+                if touches_alpha:
+                    marks.append(off)
+        if not marks:
+            break
+        for off in marks:
+            out[off + 3] = 0
+    return bytes(out)
+
+
 def write_akim(path, width, height, frames_rgba, frame_delay_ms,
                loop=True, argb8888=True):
     if not frames_rgba:

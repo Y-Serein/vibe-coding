@@ -18,6 +18,7 @@ AIKB_UI_SHELL="/mnt/system/usr/share/aikb/ui/session_shell.argb"
 AIKB_LCD_BOOT_ANIM=""
 AIKB_LCD_WAIT_ANIM=""
 AIKB_LCD_SLEEP_ANIM="/mnt/system/usr/share/aikb/boot/vedio_sleep.akim"
+AIKB_MIPI_PANEL_DEFAULT="GC9503CV_BOE_QV034"
 
 prepare_aikb_lcd_input()
 {
@@ -56,6 +57,63 @@ stop_aikb_fb_keeper()
       kill "$(cat /tmp/aikb_fb_keeper.pid)" >/dev/null 2>&1 || true
       rm -f /tmp/aikb_fb_keeper.pid
    fi
+}
+
+get_aikb_mipi_panel()
+{
+   PANEL="${AIKB_MIPI_PANEL:-}"
+   if [ -z "${PANEL}" ]; then
+      if [ -e /boot/board ]; then
+         PANEL="$(grep '^panel=' /boot/board | cut -d '=' -f 2)"
+      elif [ -e /boot/uEnv.txt ]; then
+         PANEL="$(grep '^panel=' /boot/uEnv.txt | cut -d '=' -f 2)"
+      fi
+   fi
+
+   case "${PANEL}" in
+      GC9503_CXW034|gc9503_cxw034|cxw034|old)
+         echo "GC9503_CXW034"
+         ;;
+      ""|GC9503CV_BOE_QV034|gc9503cv_boe_qv034|boe_qv034|qv034|boe|new)
+         echo "${AIKB_MIPI_PANEL_DEFAULT}"
+         ;;
+      *)
+         echo "${PANEL}"
+         ;;
+   esac
+}
+
+init_aikb_mipi_panel()
+{
+   LCD_LOG="${1:-/tmp/aikb_lcd_ui.log}"
+   DSI_TOOL="/mnt/system/usr/bin/sample_dsi"
+   MIPI_TX_KO="/mnt/system/ko/soph_mipi_tx.ko"
+   PANEL="$(get_aikb_mipi_panel)"
+
+   if [ ! -x "${DSI_TOOL}" ]; then
+      echo "$(date '+%H:%M:%S') sample_dsi not executable: ${DSI_TOOL}" >> "${LCD_LOG}"
+      return 0
+   fi
+
+   if [ ! -e /dev/mipi-tx ]; then
+      if ! grep -q '^soph_mipi_tx ' /proc/modules 2>/dev/null &&
+         [ -f "${MIPI_TX_KO}" ]; then
+         echo "$(date '+%H:%M:%S') load soph_mipi_tx for /dev/mipi-tx" >> "${LCD_LOG}"
+         insmod "${MIPI_TX_KO}" >> "${LCD_LOG}" 2>&1 || true
+      fi
+   fi
+
+   if [ ! -e /dev/mipi-tx ]; then
+      echo "$(date '+%H:%M:%S') /dev/mipi-tx not ready; skip sample_dsi" >> "${LCD_LOG}"
+      return 0
+   fi
+
+   echo "$(date '+%H:%M:%S') init mipi panel: ${PANEL}" >> "${LCD_LOG}"
+   "${DSI_TOOL}" --panel="${PANEL}" >> "${LCD_LOG}" 2>&1
+   DSI_RET=$?
+   echo "$(date '+%H:%M:%S') sample_dsi ret=${DSI_RET}" >> "${LCD_LOG}"
+   sleep 1
+   return 0
 }
 
 start_aikb_hid_input()
@@ -136,6 +194,7 @@ start_aikb_lcd_ui()
       cat /proc/modules >> "${LCD_LOG}" 2>&1
       return 0
    fi
+   init_aikb_mipi_panel "${LCD_LOG}"
    start_aikb_fb_keeper
 
    echo "$(date '+%H:%M:%S') start aikb_lcd_ui; fb=$(cat /proc/fb 2>/dev/null)" >> "${LCD_LOG}"

@@ -36,6 +36,7 @@ typedef struct _optionExt_ {
 
 typedef enum {
 	DSI_PANEL_GC9503_CXW034,
+	DSI_PANEL_GC9503CV_BOE_QV034,
 	DSI_PANEL_3AML069LP01G,
 	DSI_PANEL_GM8775C,
 	DSI_PANEL_HX8394_EVB,
@@ -98,6 +99,7 @@ static optionExt long_option_ext[] = {
 
 static char *s_panel_model_type_arr[] = {
 	"GC9503_CXW034",
+	"GC9503CV_BOE_QV034",
 	"3AML069LP01G",
 	"GM8775C",
 	"HX8394_EVB",
@@ -410,6 +412,14 @@ void SAMPLE_SET_PANEL_DESC(void)
 		g_panel_desc.stdsicfg.hs_timing_cfg = &hs_timing_cfg_gc9503_cxw034_412x960;
 		g_panel_desc.stdsicfg.dsi_init_cmds = dsi_init_cmds_gc9503_cxw034_412x960;
 		g_panel_desc.stdsicfg.dsi_init_cmds_size = ARRAY_SIZE(dsi_init_cmds_gc9503_cxw034_412x960);
+		break;
+	case DSI_PANEL_GC9503CV_BOE_QV034:
+		g_panel_desc.panel_mode = "GC9503CV_BOE_QV034";
+		g_panel_desc.panel_type = PANEL_MODE_DSI;
+		g_panel_desc.stdsicfg.dev_cfg = &dev_cfg_gc9503cv_boe_qv034_412x960;
+		g_panel_desc.stdsicfg.hs_timing_cfg = &hs_timing_cfg_gc9503cv_boe_qv034_412x960;
+		g_panel_desc.stdsicfg.dsi_init_cmds = dsi_init_cmds_gc9503cv_boe_qv034_412x960;
+		g_panel_desc.stdsicfg.dsi_init_cmds_size = ARRAY_SIZE(dsi_init_cmds_gc9503cv_boe_qv034_412x960);
 		break;
 	case DSI_PANEL_ILI9881C:
 		g_panel_desc.panel_type = PANEL_MODE_DSI;

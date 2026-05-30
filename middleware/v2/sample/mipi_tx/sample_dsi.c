@@ -39,6 +39,7 @@ typedef enum
 {
 	DSI_PANEL_ZCT2133V1,
 	DSI_PANEL_GC9503_CXW034,
+	DSI_PANEL_GC9503CV_BOE_QV034,
 	DSI_PANEL_3AML069LP01G,
 	DSI_PANEL_GM8775C,
 	DSI_PANEL_HX8394_EVB,
@@ -108,6 +109,7 @@ static optionExt long_option_ext[] = {
 static const char* s_panel_model_type_arr[] = {
 	"ZCT2133V1",
 	"GC9503_CXW034",
+	"GC9503CV_BOE_QV034",
 	"3AML069LP01G",
 	"GM8775C",
 	"HX8394_EVB",
@@ -446,6 +448,13 @@ void SAMPLE_MIPI_SET_PANEL_DESC()
 			g_panel_desc.hs_timing_cfg = &hs_timing_cfg_gc9503_cxw034_412x960;
 			g_panel_desc.dsi_init_cmds = dsi_init_cmds_gc9503_cxw034_412x960;
 			g_panel_desc.dsi_init_cmds_size = ARRAY_SIZE(dsi_init_cmds_gc9503_cxw034_412x960);
+			break;
+		case DSI_PANEL_GC9503CV_BOE_QV034:
+			g_panel_desc.panel_name = "GC9503CV-BOE-QV034-412x960";
+			g_panel_desc.dev_cfg = &dev_cfg_gc9503cv_boe_qv034_412x960;
+			g_panel_desc.hs_timing_cfg = &hs_timing_cfg_gc9503cv_boe_qv034_412x960;
+			g_panel_desc.dsi_init_cmds = dsi_init_cmds_gc9503cv_boe_qv034_412x960;
+			g_panel_desc.dsi_init_cmds_size = ARRAY_SIZE(dsi_init_cmds_gc9503cv_boe_qv034_412x960);
 			break;
 		case DSI_PANEL_HX8399_1080P:
 			g_panel_desc.panel_name = "HX8399_1080x1920";

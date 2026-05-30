@@ -3,6 +3,7 @@
 		"mipi" : [
 			"zct2133v1",
 			"gc9503_cxw034",
+			"gc9503cv_boe_qv034",
 			"hx8394",
 			"ili9881c",
 			"ili9881d",
