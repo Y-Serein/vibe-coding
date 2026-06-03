@@ -19,6 +19,7 @@ AIKB_LCD_BOOT_ANIM=""
 AIKB_LCD_WAIT_ANIM=""
 AIKB_LCD_SLEEP_ANIM="/mnt/system/usr/share/aikb/boot/vedio_sleep.akim"
 AIKB_MIPI_PANEL_DEFAULT="GC9503CV_BOE_QV034"
+AIKB_MIPI_REINIT="${AIKB_MIPI_REINIT:-0}"
 
 prepare_aikb_lcd_input()
 {
@@ -59,6 +60,12 @@ stop_aikb_fb_keeper()
    fi
 }
 
+clear_aikb_fb_black()
+{
+	LOG_PATH="${1:-/tmp/aikb_lcd_ui.log}"
+	echo "$(date '+%H:%M:%S') skip raw fb zero clear; aikb_lcd_ui owns opaque clear" >> "${LOG_PATH}"
+}
+
 get_aikb_mipi_panel()
 {
    PANEL="${AIKB_MIPI_PANEL:-}"
@@ -90,6 +97,15 @@ init_aikb_mipi_panel()
    MIPI_TX_KO="/mnt/system/ko/soph_mipi_tx.ko"
    PANEL="$(get_aikb_mipi_panel)"
 
+   case "${AIKB_MIPI_REINIT}" in
+      1|yes|true|force)
+         ;;
+      *)
+         echo "$(date '+%H:%M:%S') skip sample_dsi reinit; set AIKB_MIPI_REINIT=1 to force" >> "${LCD_LOG}"
+         return 0
+         ;;
+   esac
+
    if [ ! -x "${DSI_TOOL}" ]; then
       echo "$(date '+%H:%M:%S') sample_dsi not executable: ${DSI_TOOL}" >> "${LCD_LOG}"
       return 0
@@ -109,10 +125,11 @@ init_aikb_mipi_panel()
    fi
 
    echo "$(date '+%H:%M:%S') init mipi panel: ${PANEL}" >> "${LCD_LOG}"
+   clear_aikb_fb_black "${LCD_LOG}"
    "${DSI_TOOL}" --panel="${PANEL}" >> "${LCD_LOG}" 2>&1
    DSI_RET=$?
    echo "$(date '+%H:%M:%S') sample_dsi ret=${DSI_RET}" >> "${LCD_LOG}"
-   sleep 1
+   clear_aikb_fb_black "${LCD_LOG}"
    return 0
 }
 
@@ -194,8 +211,8 @@ start_aikb_lcd_ui()
       cat /proc/modules >> "${LCD_LOG}" 2>&1
       return 0
    fi
+   clear_aikb_fb_black "${LCD_LOG}"
    init_aikb_mipi_panel "${LCD_LOG}"
-   start_aikb_fb_keeper
 
    echo "$(date '+%H:%M:%S') start aikb_lcd_ui; fb=$(cat /proc/fb 2>/dev/null)" >> "${LCD_LOG}"
 
@@ -221,6 +238,7 @@ start_aikb_lcd_ui()
    sleep 1
    if kill -0 "${LCD_PID}" >/dev/null 2>&1; then
       echo "$(date '+%H:%M:%S') aikb_lcd_ui pid=${LCD_PID}" >> "${LCD_LOG}"
+      start_aikb_fb_keeper
    else
       echo "$(date '+%H:%M:%S') aikb_lcd_ui exited during startup" >> "${LCD_LOG}"
    fi

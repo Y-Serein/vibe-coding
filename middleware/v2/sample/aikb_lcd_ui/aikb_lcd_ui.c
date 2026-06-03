@@ -216,6 +216,8 @@ static uint32_t *g_ui_shell;
  * Render priority: g_boot_anim (one-shot, plays first) > g_wait_anim (loops,
  * picks up after boot anim ends) > idle sleep > splash fallback >
  * terminal/dashboard.
+ * Product boot with only --sleep-anim and no splash/boot/wait animation starts
+ * in idle sleep immediately; local key input releases it.
  * Host bytes alone do not release these animations; a board key or explicit
  * view change does, so the host cannot steal the startup/sleep surface.
  */
@@ -270,6 +272,7 @@ static struct anim_state g_pet_anims[PET_SCENE_COUNT] = {
 	[PET_SCENE_STANDBY] = { .label = "pet-standby" },
 };
 static bool g_pet_anim_argb8888[PET_SCENE_COUNT];
+static bool g_pet_anim_load_attempted[PET_SCENE_COUNT];
 static char g_pet_asset_root[256];
 static char g_pet_asset_paths[PET_SCENE_COUNT][256];
 static bool g_pet_force_fallback;
@@ -450,11 +453,15 @@ struct fb_target {
 	int fd;
 	uint8_t *mem;
 	size_t size;
+	size_t page_size;
 	struct fb_var_screeninfo var;
 	struct fb_fix_screeninfo fix;
 	enum rotation rotate;
 	enum pixel_format pixel_format;
 	uint8_t alpha;
+	bool double_buffer;
+	unsigned int draw_page;
+	unsigned int display_page;
 	bool warned_msync;
 	bool warned_pan;
 };
@@ -2505,7 +2512,7 @@ static void draw_pet_background(struct canvas *c, uint32_t frame)
 {
 	(void)frame;
 
-	canvas_clear(c, 0x151514);
+	canvas_clear(c, 0x10100f);
 	fill_rect(c, 0, 0, UI_W, 56, 0x10100f);
 	fill_rect(c, 0, 346, UI_W, UI_H - 346, 0x10100f);
 	fill_rect(c, 0, 0, 4, UI_H, 0x0b0b0a);
@@ -2765,6 +2772,25 @@ static const struct pet_scene_asset_manifest *pet_asset_manifest(enum pet_scene 
 	return &PET_ASSET_MANIFEST[scene];
 }
 
+static int pet_akim_load(struct anim_state *a,
+			 const struct pet_scene_asset_manifest *manifest,
+			 bool *argb8888);
+static bool pet_akim_ensure_loaded(enum pet_scene scene)
+{
+	struct anim_state *a;
+
+	if (scene < 0 || scene >= PET_SCENE_COUNT)
+		return false;
+	a = &g_pet_anims[scene];
+	if (a->active && a->base)
+		return true;
+	if (g_pet_anim_load_attempted[scene])
+		return false;
+	g_pet_anim_load_attempted[scene] = true;
+	return pet_akim_load(a, pet_asset_manifest(scene),
+			     &g_pet_anim_argb8888[scene]) == 0;
+}
+
 static const char *pet_scene_name(enum pet_scene scene);
 static const char *pet_pose_name(enum pet_pose pose);
 
@@ -2986,6 +3012,8 @@ static bool draw_pet_scene_akim(struct canvas *c, enum pet_scene scene,
 
 	if (scene < 0 || scene >= PET_SCENE_COUNT)
 		return false;
+	if (!pet_akim_ensure_loaded(scene))
+		return false;
 	a = &g_pet_anims[scene];
 	if (!a->active || !a->frame_count || !a->frame_delay_ms)
 		return false;
@@ -3017,6 +3045,8 @@ static bool pet_render_character_akim(struct canvas *c,
 	uint32_t count;
 	uint32_t local;
 
+	if (!pet_akim_ensure_loaded(PET_SCENE_ASKING))
+		return false;
 	if (!a->active || !a->frame_count || !a->frame_delay_ms)
 		return false;
 	if (p->anim.pose >= PET_POSE_COUNT)
@@ -4266,16 +4296,86 @@ static uint32_t sample_canvas(const struct canvas *c, int dst_x, int dst_y,
 	return c->px[sy * c->w + sx];
 }
 
+static uint8_t *fb_draw_base(struct fb_target *fb)
+{
+	return fb->mem + (size_t)fb->draw_page * fb->page_size;
+}
+
 static void fb_refresh(struct fb_target *fb)
 {
+	if (fb->double_buffer)
+		fb->var.yoffset = fb->draw_page * fb->var.yres;
 	if (msync(fb->mem, fb->size, MS_SYNC) < 0 && !fb->warned_msync) {
 		warnf("msync framebuffer failed: %s", strerror(errno));
 		fb->warned_msync = true;
 	}
-	if (ioctl(fb->fd, FBIOPAN_DISPLAY, &fb->var) < 0 && !fb->warned_pan) {
-		warnf("FBIOPAN_DISPLAY failed: %s", strerror(errno));
-		fb->warned_pan = true;
+	if (ioctl(fb->fd, FBIOPAN_DISPLAY, &fb->var) < 0) {
+		if (!fb->warned_pan) {
+			warnf("FBIOPAN_DISPLAY failed: %s", strerror(errno));
+			fb->warned_pan = true;
+		}
+		if (fb->double_buffer) {
+			uint8_t *src = fb_draw_base(fb);
+
+			if (src != fb->mem)
+				memcpy(fb->mem, src, fb->page_size);
+			fb->double_buffer = false;
+			fb->draw_page = 0;
+			fb->display_page = 0;
+			fb->var.yoffset = 0;
+		}
+		return;
 	}
+	if (fb->double_buffer) {
+		fb->display_page = fb->draw_page;
+		fb->draw_page = 1u - fb->display_page;
+	}
+}
+
+static void fb_clear_black(struct fb_target *fb)
+{
+	uint32_t pix = pack_fb_pixel(0x000000, fb);
+	int bpp = (int)fb->var.bits_per_pixel;
+	int bytes = (bpp + 7) / 8;
+	size_t pages = 1;
+	size_t fill_size;
+
+	if (fb->var.yres > 0 && fb->var.yres_virtual >= fb->var.yres)
+		pages = fb->var.yres_virtual / fb->var.yres;
+	if (pages < 1)
+		pages = 1;
+	fill_size = fb->page_size * pages;
+	if (fill_size > fb->size)
+		fill_size = fb->size;
+
+	if (bytes == 4) {
+		size_t words = fill_size / 4u;
+		uint32_t *p = (uint32_t *)fb->mem;
+
+		for (size_t i = 0; i < words; i++)
+			p[i] = pix;
+	} else {
+		for (size_t off = 0; off + (size_t)bytes <= fill_size;
+		     off += (size_t)bytes) {
+			uint8_t *p = fb->mem + off;
+
+			switch (bytes) {
+			case 2:
+				p[0] = (uint8_t)(pix & 0xff);
+				p[1] = (uint8_t)((pix >> 8) & 0xff);
+				break;
+			case 3:
+				p[0] = (uint8_t)(pix & 0xff);
+				p[1] = (uint8_t)((pix >> 8) & 0xff);
+				p[2] = (uint8_t)((pix >> 16) & 0xff);
+				break;
+			default:
+				p[0] = (uint8_t)(pix & 0xff);
+				break;
+			}
+		}
+	}
+	fb_refresh(fb);
 }
 
 /*
@@ -4290,6 +4390,7 @@ static void fb_refresh(struct fb_target *fb)
 static bool fb_blit_fast_argb_cw(struct fb_target *fb, const struct canvas *c)
 {
 	uint32_t a_const;
+	uint8_t *base;
 
 	if (fb->var.bits_per_pixel != 32)
 		return false;
@@ -4301,12 +4402,13 @@ static bool fb_blit_fast_argb_cw(struct fb_target *fb, const struct canvas *c)
 		return false;
 
 	a_const = (uint32_t)fb->alpha << 24;
+	base = fb_draw_base(fb);
 	for (int cy = 0; cy < c->h; cy++) {
 		const uint32_t *src = c->px + (size_t)cy * c->w;
 		size_t fb_x_off = (size_t)(c->h - 1 - cy) * 4u;
 		for (int cx = 0; cx < c->w; cx++) {
 			uint32_t rgb = src[cx];
-			uint8_t *dst = fb->mem + (size_t)cx * fb->fix.line_length
+			uint8_t *dst = base + (size_t)cx * fb->fix.line_length
 				       + fb_x_off;
 			*(uint32_t *)dst = a_const | (rgb & 0x00ffffffu);
 		}
@@ -4322,6 +4424,7 @@ static void fb_blit(struct fb_target *fb, const struct canvas *c)
 	int bpp;
 	int bytes;
 	enum rotation rot;
+	uint8_t *base;
 
 	if (fb_blit_fast_argb_cw(fb, c))
 		return;
@@ -4331,16 +4434,18 @@ static void fb_blit(struct fb_target *fb, const struct canvas *c)
 	bpp = (int)fb->var.bits_per_pixel;
 	bytes = (bpp + 7) / 8;
 	rot = resolve_rotation(fb->rotate, width, height);
+	base = fb_draw_base(fb);
 
 	for (int y = 0; y < height; y++) {
-		uint8_t *row = fb->mem + (size_t)y * fb->fix.line_length;
+		uint8_t *row = base + (size_t)y * fb->fix.line_length;
 
 		for (int x = 0; x < width; x++) {
 			uint32_t rgb = sample_canvas(c, x, y, width, height, rot);
 			uint32_t pix = pack_fb_pixel(rgb, fb);
 			uint8_t *p = row + (size_t)x * bytes;
+			size_t offset = (size_t)(p - base);
 
-			if ((size_t)(p - fb->mem + bytes) > fb->size)
+			if (offset + (size_t)bytes > fb->page_size)
 				continue;
 			switch (bytes) {
 			case 2:
@@ -4368,6 +4473,9 @@ static int fb_open_target(struct fb_target *fb, const char *path,
 			  enum rotation rotate, enum pixel_format pixel_format,
 			  uint8_t alpha)
 {
+	size_t visible_size;
+	size_t map_size;
+
 	memset(fb, 0, sizeof(*fb));
 	fb->fd = -1;
 	fb->fd = open(path, O_RDWR);
@@ -4381,7 +4489,12 @@ static int fb_open_target(struct fb_target *fb, const char *path,
 		close(fb->fd);
 		return -1;
 	}
-	fb->size = (size_t)fb->fix.line_length * fb->var.yres;
+	visible_size = (size_t)fb->fix.line_length * fb->var.yres;
+	map_size = (size_t)fb->fix.smem_len;
+	if (map_size < visible_size)
+		map_size = visible_size;
+	fb->size = map_size;
+	fb->page_size = visible_size;
 	fb->mem = mmap(NULL, fb->size, PROT_READ | PROT_WRITE, MAP_SHARED,
 		       fb->fd, 0);
 	if (fb->mem == MAP_FAILED) {
@@ -4392,9 +4505,19 @@ static int fb_open_target(struct fb_target *fb, const char *path,
 	fb->rotate = rotate;
 	fb->pixel_format = pixel_format;
 	fb->alpha = alpha;
-	warnf("fb %s: %ux%u %ubpp line=%u rotate=%s pixel=%s alpha=%u",
+	if (fb->var.yres > 0 &&
+	    fb->var.yres_virtual >= fb->var.yres * 2 &&
+	    fb->size >= fb->page_size * 2) {
+		fb->double_buffer = true;
+		fb->display_page = (fb->var.yoffset >= fb->var.yres) ? 1u : 0u;
+		fb->draw_page = 1u - fb->display_page;
+	}
+	warnf("fb %s: %ux%u/%u %ubpp line=%u smem=%zu map=%zu page=%zu dbuf=%s rotate=%s pixel=%s alpha=%u",
 	      path, fb->var.xres,
-	      fb->var.yres, fb->var.bits_per_pixel, fb->fix.line_length,
+	      fb->var.yres, fb->var.yres_virtual,
+	      fb->var.bits_per_pixel, fb->fix.line_length,
+	      (size_t)fb->fix.smem_len, fb->size, fb->page_size,
+	      fb->double_buffer ? "yes" : "no",
 	      resolve_rotation(rotate, fb->var.xres, fb->var.yres) == ROT_CW ? "cw" :
 	      resolve_rotation(rotate, fb->var.xres, fb->var.yres) == ROT_CCW ? "ccw" :
 	      "none", pixel_format_name(resolve_pixel_format(pixel_format, fb)),
@@ -4748,6 +4871,8 @@ static void idle_sleep_update(enum app_view view)
 		g_idle_sleep_active = false;
 		return;
 	}
+	if (g_idle_sleep_active)
+		return;
 	now = monotonic_now_ms();
 	if (g_last_local_input_ms == 0)
 		g_last_local_input_ms = now;
@@ -4761,6 +4886,16 @@ static void idle_sleep_update(enum app_view view)
 		g_idle_sleep_anim.active = true;
 		clock_gettime(CLOCK_MONOTONIC, &g_idle_sleep_anim.started_at);
 	}
+}
+
+static void idle_sleep_start_now(void)
+{
+	if (!g_idle_sleep_anim.base)
+		return;
+	g_idle_sleep_active = true;
+	g_idle_sleep_anim.frame_idx = 0;
+	g_idle_sleep_anim.active = true;
+	clock_gettime(CLOCK_MONOTONIC, &g_idle_sleep_anim.started_at);
 }
 
 static int anim_load(struct anim_state *a, const char *path)
@@ -5728,6 +5863,7 @@ static void usage(const char *argv0)
 	printf("  --boot-anim PATH   AKIM container (scripts/make_boot_anim.py) played once before splash\n");
 	printf("  --wait-anim PATH   AKIM container with LOOP flag, replays until first input byte\n");
 	printf("  --sleep-anim PATH  AKIM container shown after 3 minutes without local keys outside session views\n");
+	printf("  --sleep-start-active show --sleep-anim immediately at startup until local key input\n");
 	printf("  --pet-asset-root PATH directory containing pet AKIM files such as asking.akim\n");
 	printf("  --pet-scene SCENE  initial pet scene for dumps/tests\n");
 	printf("  --pet-pose POSE    initial pet pose: idle/thinking/happy/confused/sleepy\n");
@@ -5764,6 +5900,8 @@ int main(int argc, char **argv)
 	enum app_view view = VIEW_TERMINAL;
 	bool once = false;
 	bool mock = true;
+	bool sleep_start_active = false;
+	bool startup_sleep_transition = false;
 	int alpha = 255;
 	int once_hold_ms = 3000;
 	int initial_cell_w = g_cell_w;
@@ -5782,6 +5920,8 @@ int main(int argc, char **argv)
 	struct pet_state pet;
 	struct font_ctx font;
 	struct fb_target fb;
+	bool fb_opened = false;
+	bool startup_sleep_frame_displayed = false;
 	struct kitty_graphics *kitty = NULL;
 	int input_fd = -1;
 	int ctrl_fd = -1;
@@ -5825,6 +5965,8 @@ int main(int argc, char **argv)
 			wait_anim_path = argv[++i];
 		} else if (!strcmp(argv[i], "--sleep-anim") && i + 1 < argc) {
 			sleep_anim_path = argv[++i];
+		} else if (!strcmp(argv[i], "--sleep-start-active")) {
+			sleep_start_active = true;
 		} else if (!strcmp(argv[i], "--pet-asset-root") && i + 1 < argc) {
 			pet_asset_root = argv[++i];
 		} else if (!strcmp(argv[i], "--pet-scene") && i + 1 < argc) {
@@ -5889,6 +6031,43 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	if (sleep_anim_path && !boot_anim_path && !wait_anim_path && !splash_path)
+		sleep_start_active = true;
+	startup_sleep_transition = sleep_start_active &&
+				   view_allows_idle_sleep(view);
+	if (sleep_anim_path)
+		anim_load(&g_idle_sleep_anim, sleep_anim_path);
+
+	if (!dump_path && !startup_sleep_transition) {
+		if (fb_open_target(&fb, fb_path, rotate, pixel_format,
+				   (uint8_t)alpha) < 0) {
+			kitty_graphics_destroy(kitty);
+			free(c.px);
+			return 1;
+		}
+		fb_opened = true;
+		fb_clear_black(&fb);
+	}
+
+	if (!dump_path && startup_sleep_transition) {
+		if (fb_open_target(&fb, fb_path, rotate, pixel_format,
+				   (uint8_t)alpha) < 0) {
+			kitty_graphics_destroy(kitty);
+			free(c.px);
+			return 1;
+		}
+		fb_opened = true;
+		if (g_idle_sleep_anim.base) {
+			idle_sleep_start_now();
+			anim_blit(&g_idle_sleep_anim, &c);
+			fb_blit(&fb, &c);
+			startup_sleep_frame_displayed = true;
+			warnf("startup sleep first frame displayed (single pan)");
+		} else {
+			fb_clear_black(&fb);
+		}
+	}
+
 	if (splash_path)
 		load_splash(splash_path);
 	if (ui_shell_path)
@@ -5897,13 +6076,8 @@ int main(int argc, char **argv)
 		anim_load(&g_boot_anim, boot_anim_path);
 	if (wait_anim_path)
 		anim_load(&g_wait_anim, wait_anim_path);
-	if (sleep_anim_path)
-		anim_load(&g_idle_sleep_anim, sleep_anim_path);
 	if (pet_asset_root)
 		pet_set_asset_root(pet_asset_root);
-	for (int i = 0; i < PET_SCENE_COUNT; i++)
-		pet_akim_load(&g_pet_anims[i], pet_asset_manifest((enum pet_scene)i),
-			      &g_pet_anim_argb8888[i]);
 
 	g_cell_w = initial_cell_w;
 	g_cell_h = initial_cell_h;
@@ -5925,6 +6099,9 @@ int main(int argc, char **argv)
 		pet_set_pose(&pet, initial_pet_pose);
 	pet.progress = initial_pet_progress;
 	g_last_local_input_ms = monotonic_now_ms();
+	if (sleep_start_active && view_allows_idle_sleep(view) &&
+	    !g_idle_sleep_active)
+		idle_sleep_start_now();
 	if (!font_init(&font, font_path))
 		warnf("freetype font unavailable; falling back to built-in 8x16 glyphs");
 
@@ -5957,13 +6134,15 @@ int main(int argc, char **argv)
 		return ret ? 1 : 0;
 	}
 
-	if (fb_open_target(&fb, fb_path, rotate, pixel_format,
+	if (!fb_opened &&
+	    fb_open_target(&fb, fb_path, rotate, pixel_format,
 			   (uint8_t)alpha) < 0) {
 		kitty_graphics_destroy(kitty);
 		font_destroy(&font);
 		free(c.px);
 		return 1;
 	}
+	fb_opened = true;
 
 	input_fd = open_input(input_path);
 	if (input_fd < 0 && input_path)
@@ -5985,6 +6164,8 @@ int main(int argc, char **argv)
 		clock_gettime(CLOCK_MONOTONIC, &g_boot_anim.started_at);
 	if (g_wait_anim.active)
 		clock_gettime(CLOCK_MONOTONIC, &g_wait_anim.started_at);
+	if (startup_sleep_transition && g_idle_sleep_anim.base)
+		idle_sleep_start_now();
 
 	while (!g_stop) {
 		struct pollfd pfds[3];
@@ -6018,8 +6199,13 @@ int main(int argc, char **argv)
 		if (view == VIEW_PET && timeout > 83)
 			timeout = 83;
 
-		render_frame(&c, view, &model, &term, &font, kitty, &pet);
-		fb_blit(&fb, &c);
+		if (startup_sleep_frame_displayed) {
+			startup_sleep_frame_displayed = false;
+		} else {
+			render_frame(&c, view, &model, &term, &font, kitty,
+				     &pet);
+			fb_blit(&fb, &c);
+		}
 		if (once) {
 			if (once_hold_ms > 0)
 				usleep((useconds_t)once_hold_ms * 1000);

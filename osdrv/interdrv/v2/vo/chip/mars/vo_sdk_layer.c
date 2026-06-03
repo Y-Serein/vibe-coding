@@ -1256,6 +1256,7 @@ CVI_S32 vo_suspend(void)
 static int vo_enablevideolayer(VO_LAYER VoLayer)
 {
 	CVI_S32 ret = CVI_FAILURE;
+	u16 rgb[3] = {0, 0, 0};
 
 	ret = CHECK_VO_LAYER_VALID(VoLayer);
 	if (ret != CVI_SUCCESS)
@@ -1265,7 +1266,11 @@ static int vo_enablevideolayer(VO_LAYER VoLayer)
 	if (ret != CVI_SUCCESS)
 		return ret;
 
-	sclr_disp_enable_window_bgcolor(0);
+	sclr_disp_set_pattern(patterns[CVI_VIP_PAT_OFF].type,
+			      patterns[CVI_VIP_PAT_OFF].color, rgb);
+	sclr_disp_set_frame_bgcolor(0, 0, 0);
+	sclr_disp_set_window_bgcolor(0, 0, 0);
+	sclr_disp_enable_window_bgcolor(1);
 
 	gVoCtx->is_layer_enable[VoLayer] = CVI_TRUE;
 

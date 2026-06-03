@@ -391,20 +391,20 @@ static void gc9503_show_vibe_splash(void)
 	memset(u_plane, bg.u, pitch_c * c_rows);
 	memset(v_plane, bg.v, pitch_c * c_rows);
 
-	/* IMG_9872 (Vibe Coding promo frame 1) -- panel-native YV12 baked into
+	/* IMG_9876 (Vibe Coding boot frame) -- panel-native YV12 baked into
 	 * the u-boot binary by tools/cvi_make_splash.py. Source stride is
 	 * tight (Y=PANEL_W, U/V=PANEL_W/2); destination has pitch padding.
 	 */
 	for (row = 0; row < GC9503_PANEL_H; row++)
 		memcpy(y_plane + row * pitch_y,
-		       IMG_9872_YV12_Y + row * GC9503_PANEL_W,
+		       IMG_9876_YV12_Y + row * GC9503_PANEL_W,
 		       GC9503_PANEL_W);
 	for (row = 0; row < GC9503_PANEL_H / 2; row++) {
 		memcpy(u_plane + row * pitch_c,
-		       IMG_9872_YV12_U + row * (GC9503_PANEL_W / 2),
+		       IMG_9876_YV12_U + row * (GC9503_PANEL_W / 2),
 		       GC9503_PANEL_W / 2);
 		memcpy(v_plane + row * pitch_c,
-		       IMG_9872_YV12_V + row * (GC9503_PANEL_W / 2),
+		       IMG_9876_YV12_V + row * (GC9503_PANEL_W / 2),
 		       GC9503_PANEL_W / 2);
 	}
 
@@ -427,7 +427,7 @@ static void gc9503_show_vibe_splash(void)
 	sclr_disp_enable_window_bgcolor(false);
 	sclr_disp_reg_force_up();
 
-	printf("GC9503 splash: show IMG_9872 (Vibe Coding boot frame)\n");
+	printf("GC9503 splash: show IMG_9876 (Vibe Coding boot frame)\n");
 }
 
 #if PANLE_ADAPTIVITY

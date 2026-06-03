@@ -10,30 +10,11 @@ case "$1" in
 				>/tmp/aikb_fb_init.log 2>&1 || true
 		fi
 		if [ -e /dev/fb0 ]; then
-			if [ -f /tmp/aikb_fb_keeper.pid ] &&
-				kill -0 "$(cat /tmp/aikb_fb_keeper.pid)" >/dev/null 2>&1; then
-				echo "fb keeper already running: $(cat /tmp/aikb_fb_keeper.pid)" \
-					>>/tmp/aikb_fb_init.log
-			else
-				(
-					exec 9<>/dev/fb0 || exit 0
-					while true; do
-						sleep 65535
-					done
-				) &
-				echo "$!" >/tmp/aikb_fb_keeper.pid
-				echo "fb keeper pid=$!" >>/tmp/aikb_fb_init.log
-			fi
+			echo "fb ready; defer open to aikb_lcd_ui" \
+				>>/tmp/aikb_fb_init.log
 		fi
-		# Push panel-format pre-rotated still (IMG_9876 packed by
-		# scripts/make_splash_fb.py) to /dev/fb0 the instant fb is up so the
-		# green panel-init pattern is overwritten before aikb_lcd_ui's first
-		# fb_blit lands.
-		if [ -e /dev/fb0 ] && [ -f /mnt/system/usr/share/aikb/splash_fb.bin ]; then
-			dd if=/mnt/system/usr/share/aikb/splash_fb.bin \
-				of=/dev/fb0 bs=1582080 count=1 conv=notrunc \
-				>>/tmp/aikb_fb_init.log 2>&1 || true
-		fi
+		echo "fb clear handled by soph_fb/aikb_lcd_ui" \
+			>>/tmp/aikb_fb_init.log
 	else
 		echo "video mode: skip framebuffer init" >/tmp/aikb_fb_init.log
 	fi

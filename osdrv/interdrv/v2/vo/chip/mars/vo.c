@@ -261,6 +261,18 @@ const struct vo_disp_pattern patterns[CVI_VIP_PAT_MAX] = {
 	.rgb = {0, 0, 0} },
 };
 
+static void vo_set_black_cover(bool enable)
+{
+	u16 rgb[3] = {0, 0, 0};
+
+	sclr_disp_set_pattern(patterns[CVI_VIP_PAT_OFF].type,
+			      patterns[CVI_VIP_PAT_OFF].color,
+			      rgb);
+	sclr_disp_set_frame_bgcolor(0, 0, 0);
+	sclr_disp_set_window_bgcolor(0, 0, 0);
+	sclr_disp_enable_window_bgcolor(enable);
+}
+
 /*******************************************************
  *  Internal APIs
  ******************************************************/
@@ -2333,7 +2345,6 @@ int vo_create_instance(struct platform_device *pdev)
 {
 	int ret = 0;
 	struct cvi_vo_dev *vdev;
-	u16 rgb[3] = {0, 0, 0};
 
 	job_init = 0;//tmp test
 	vdev = dev_get_drvdata(&pdev->dev);
@@ -2378,10 +2389,8 @@ int vo_create_instance(struct platform_device *pdev)
 	}
 	ret = _vo_init_param(vdev);
 
-	if (hide_vo) {
-		sclr_disp_set_pattern(SCL_PAT_TYPE_FULL, SCL_PAT_COLOR_USR, rgb);
-		sclr_disp_set_frame_bgcolor(0, 0, 0);
-	}
+	if (hide_vo || sclr_disp_check_tgen_enable())
+		vo_set_black_cover(true);
 
 err:
 	return ret;

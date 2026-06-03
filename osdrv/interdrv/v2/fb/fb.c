@@ -101,6 +101,37 @@ static void _fb_enable(bool enable)
 #endif
 }
 
+static void _fb_set_black_cover(bool enable)
+{
+	/* SCL_PAT_TYPE_OFF ignores color/rgb; use an in-range placeholder. */
+	sclr_disp_set_pattern(SCL_PAT_TYPE_OFF, SCL_PAT_COLOR_USR, NULL);
+	sclr_disp_set_frame_bgcolor(0, 0, 0);
+	sclr_disp_set_window_bgcolor(0, 0, 0);
+	sclr_disp_enable_window_bgcolor(enable);
+}
+
+static void _fb_clear_screen(struct fb_info *info)
+{
+	if (info->var.bits_per_pixel == 32) {
+		u32 __iomem *p = (u32 __iomem *)info->screen_base;
+		size_t words = info->screen_size / sizeof(u32);
+		size_t i;
+
+		for (i = 0; i < words; i++)
+			writel(0xff000000, p + i);
+	} else {
+		memset_io(info->screen_base, 0x00, info->screen_size);
+	}
+
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)) && defined(__riscv)
+	arch_sync_dma_for_device(info->fix.smem_start, info->fix.smem_len, DMA_TO_DEVICE);
+#else
+	__dma_map_area(info->screen_base, info->fix.smem_len, DMA_TO_DEVICE);
+#endif
+
+	smp_mb();	/*memory barrier*/
+}
+
 static void _fb_update_mode(struct fb_info *info)
 {
 	struct cvifb_par *par = info->par;
@@ -146,10 +177,15 @@ static void _fb_activate_var(struct fb_info *info)
 {
 	fb_dbg(info, "%s+\n", __func__);
 
+	_fb_set_black_cover(true);
 	_fb_enable(false);
 	_fb_update_mode(info);
-	if (!fb_on_sc)
-		_fb_enable(true);
+	/*
+	 * Do not enable the OSD window on open. Userspace may still be loading
+	 * or rendering its first frame; enabling here makes the cleared fb page
+	 * visible as a separate black flash. The first FBIOPAN_DISPLAY enables
+	 * the window after userspace has selected a populated page.
+	 */
 }
 
 static int cvifb_open(struct fb_info *info, int user)
@@ -185,8 +221,10 @@ static int cvifb_release(struct fb_info *info, int user)
 
 	fb_dbg(info, "%s+\n", __func__);
 
-	if (atomic_sub_return(1, &par->ref_count) == 0)
+	if (atomic_sub_return(1, &par->ref_count) == 0) {
+		_fb_set_black_cover(true);
 		_fb_enable(false);
+	}
 
 	return 0;
 }
@@ -562,6 +600,9 @@ static int cvifb_pan_display(struct fb_var_screeninfo *var, struct fb_info *info
 #else
 	sclr_gop_ow_set_cfg(SCL_GOP_DISP, ow_number, &cfg->ow_cfg[0], true);
 #endif
+	if (!fb_on_sc)
+		_fb_enable(true);
+	_fb_set_black_cover(false);
 
 	return 0;
 }
@@ -770,14 +811,8 @@ int cvifb_probe(struct platform_device *pdev)
 	len = pitch * info->var.yres * (1 + double_buffer);
 
 	// clear the framebuffer.
-	memset_io(info->screen_base, 0x00, info->screen_size);
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)) && defined(__riscv)
-	arch_sync_dma_for_device(info->fix.smem_start, info->fix.smem_len, DMA_TO_DEVICE);
-#else
-	__dma_map_area(info->screen_base, info->fix.smem_len, DMA_TO_DEVICE);
-#endif
-
-	smp_mb();	/*memory barrier*/
+	_fb_clear_screen(info);
+	_fb_set_black_cover(true);
 
 	ret = fb_alloc_cmap(&info->cmap, 256, 0);
 	if (ret) {
