@@ -395,8 +395,10 @@ struct board_session_token {
 
 struct board_session_turn {
 	char role[12];
-	char text[64];
+	char text[96];
+	char user_text[96];
 	uint64_t updated_ms;
+	uint64_t user_updated_ms;
 };
 
 struct board_session_perm {
@@ -487,6 +489,7 @@ static const uint32_t C_GRUVBOX_MUTED = 0xbdae93;
 static const uint32_t C_GRUVBOX_YELLOW = 0xfabd2f;
 static const uint32_t C_GRUVBOX_BLUE = 0x83a598;
 static const uint32_t C_GRUVBOX_RED = 0xfb4934;
+static const uint32_t C_GRUVBOX_GREEN = 0xb8bb26;
 
 static void on_signal(int sig)
 {
@@ -1715,7 +1718,75 @@ static bool font_draw_cp(struct canvas *c, struct font_ctx *font, int x, int y,
 	}
 	return true;
 }
+
+static void font_restore_default_size(struct font_ctx *font)
+{
+	if (!font || !font->ready || !font->face)
+		return;
+	if (FT_Set_Pixel_Sizes(font->face, 0, (FT_UInt)g_cell_h))
+		return;
+	font->cell_w = g_cell_w;
+	font->cell_h = g_cell_h;
+	font->ascent = (int)(font->face->size->metrics.ascender >> 6);
+	font->descent = (int)(font->face->size->metrics.descender >> 6);
+}
+
+static bool font_draw_cp_size(struct canvas *c, struct font_ctx *font,
+			      int x, int y, int cell_w, int pixel_h,
+			      uint32_t cp, uint32_t fg, uint32_t bg)
+{
+	FT_GlyphSlot slot;
+	int baseline;
+	int pen_x;
+	int ascent;
+	int descent;
+
+	if (!font->ready || !font->face || pixel_h <= 0)
+		return false;
+	if (FT_Set_Pixel_Sizes(font->face, 0, (FT_UInt)pixel_h))
+		return false;
+	if (FT_Load_Char(font->face, cp, FT_LOAD_RENDER))
+		return false;
+	slot = font->face->glyph;
+	ascent = (int)(font->face->size->metrics.ascender >> 6);
+	descent = (int)(font->face->size->metrics.descender >> 6);
+	baseline = y + (pixel_h - (ascent - descent)) / 2 + ascent;
+	pen_x = x + (cell_w - (int)(slot->advance.x >> 6)) / 2 +
+		slot->bitmap_left;
+	if (pen_x < x)
+		pen_x = x;
+	for (int row = 0; row < (int)slot->bitmap.rows; row++) {
+		for (int col = 0; col < (int)slot->bitmap.width; col++) {
+			int dx = pen_x + col;
+			int dy = baseline - slot->bitmap_top + row;
+			uint8_t a;
+			uint32_t dst;
+
+			if (dx < x || dx >= x + cell_w || dy < y ||
+			    dy >= y + pixel_h)
+				continue;
+			a = slot->bitmap.buffer[row * slot->bitmap.pitch + col];
+			dst = c->px[dy * c->w + dx];
+			put_px(c, dx, dy, blend_rgb(dst ? dst : bg, fg, a));
+		}
+	}
+	return true;
+}
 #else
+static void font_restore_default_size(struct font_ctx *font)
+{
+	(void)font;
+}
+
+static bool font_draw_cp_size(struct canvas *c, struct font_ctx *font,
+			      int x, int y, int cell_w, int pixel_h,
+			      uint32_t cp, uint32_t fg, uint32_t bg)
+{
+	(void)c; (void)font; (void)x; (void)y; (void)cell_w;
+	(void)pixel_h; (void)cp; (void)fg; (void)bg;
+	return false;
+}
+
 static bool font_init(struct font_ctx *font, const char *preferred)
 {
 	(void)preferred;
@@ -2576,48 +2647,6 @@ static void draw_pet_icon_map(struct canvas *c, int x, int y,
 	}
 }
 
-static void draw_pet_rotate_icon(struct canvas *c, int x, int y, bool right,
-				 uint32_t color)
-{
-	static const char *const map[] = {
-		"...######...",
-		"..##....##..",
-		".##......##.",
-		"##........#.",
-		"##......####",
-		"##.....#####",
-		"##......####",
-		"##........#.",
-		".##......##.",
-		"..##....##..",
-		"...######...",
-	};
-
-	draw_pet_icon_map(c, x, y + 1, map, (int)(sizeof(map) / sizeof(map[0])),
-			  !right, color);
-}
-
-static void draw_pet_down_icon(struct canvas *c, int x, int y, uint32_t color)
-{
-	static const char *const map[] = {
-		".....###.....",
-		"....#####....",
-		"....#####....",
-		"....#####....",
-		"....#####....",
-		"....#####....",
-		"....#####....",
-		"..#########..",
-		"...#######...",
-		"....#####....",
-		".....###.....",
-		"......#......",
-	};
-
-	draw_pet_icon_map(c, x, y, map, (int)(sizeof(map) / sizeof(map[0])),
-			  false, color);
-}
-
 #define PET_DINO_W 72
 #define PET_DINO_H 57
 #define PET_STAGE_X 190
@@ -2726,36 +2755,36 @@ static const struct pet_scene_asset_manifest PET_ASSET_MANIFEST[PET_SCENE_COUNT]
 		.scene = PET_SCENE_ASKING,
 		.state = "asking",
 		.resource_path = PET_ASKING_AKIM_PATH,
-		.expected_frames = 32,
-		.frame_duration_ms = 120,
+		.expected_frames = 96,
+		.frame_duration_ms = 83,
 	},
 	[PET_SCENE_UPDATING] = {
 		.scene = PET_SCENE_UPDATING,
 		.state = "updating",
 		.resource_path = PET_UPDATING_AKIM_PATH,
 		.expected_frames = 0,
-		.frame_duration_ms = 120,
+		.frame_duration_ms = 83,
 	},
 	[PET_SCENE_LISTENING] = {
 		.scene = PET_SCENE_LISTENING,
 		.state = "listening",
 		.resource_path = PET_LISTENING_AKIM_PATH,
 		.expected_frames = 0,
-		.frame_duration_ms = 120,
+		.frame_duration_ms = 83,
 	},
 	[PET_SCENE_FAULT] = {
 		.scene = PET_SCENE_FAULT,
 		.state = "fault",
 		.resource_path = PET_FAULT_AKIM_PATH,
 		.expected_frames = 0,
-		.frame_duration_ms = 120,
+		.frame_duration_ms = 83,
 	},
 	[PET_SCENE_STANDBY] = {
 		.scene = PET_SCENE_STANDBY,
 		.state = "standby",
 		.resource_path = PET_STANDBY_AKIM_PATH,
 		.expected_frames = 0,
-		.frame_duration_ms = 120,
+		.frame_duration_ms = 83,
 	},
 };
 
@@ -3205,8 +3234,7 @@ static void draw_pet_scene_visual(struct canvas *c, const struct pet_state *p,
 	int box_w = PET_STAGE_W;
 	int box_h = PET_STAGE_H;
 
-	if (p->scene != PET_SCENE_ASKING &&
-	    !g_pet_force_fallback &&
+	if (!g_pet_force_fallback &&
 	    draw_pet_scene_akim(c, p->scene, frame, box_x, box_y, box_w, box_h))
 		return;
 	pet_render_character(c, p, frame, box_x, box_y, box_w, box_h);
@@ -3514,19 +3542,6 @@ static void render_dashboard(struct canvas *c, const struct ui_model *m,
 
 /* ---------------------------------------------------------------- board session table */
 
-static const char *board_session_state_str(enum board_session_state s)
-{
-	switch (s) {
-	case BSS_CONNECTED:    return "CONNECTED";
-	case BSS_DISCONNECTED: return "DISCONNECTED";
-	case BSS_RUN:          return "RUN";
-	case BSS_WAIT:         return "WAIT";
-	case BSS_DONE:         return "DONE";
-	case BSS_ERROR:        return "ERROR";
-	default:               return "?";
-	}
-}
-
 static int board_session_find_idx(uint16_t sid)
 {
 	for (int i = 0; i < MAX_BOARD_SESSIONS; i++) {
@@ -3622,6 +3637,13 @@ static void board_session_update_turn(uint16_t sid, const char *role,
 	snprintf(g_board_sessions[idx].turn.text,
 		 sizeof(g_board_sessions[idx].turn.text), "%s", text ? text : "");
 	g_board_sessions[idx].turn.updated_ms = monotonic_now_ms();
+	if (role && streq_ci(role, "user")) {
+		snprintf(g_board_sessions[idx].turn.user_text,
+			 sizeof(g_board_sessions[idx].turn.user_text), "%s",
+			 text ? text : "");
+		g_board_sessions[idx].turn.user_updated_ms =
+			g_board_sessions[idx].turn.updated_ms;
+	}
 }
 
 static void board_session_update_perm(uint16_t sid, uint64_t req_id,
@@ -3685,6 +3707,204 @@ static const char *path_tail(const char *path)
 	if (!slash || (backslash && backslash > slash))
 		slash = backslash;
 	return slash ? slash + 1 : path;
+}
+
+static bool utf8_next_cp(const char **p, uint32_t *cp)
+{
+	const unsigned char *s = (const unsigned char *)*p;
+
+	if (!s[0])
+		return false;
+	if (s[0] < 0x80) {
+		*cp = s[0];
+		*p += 1;
+		return true;
+	}
+	if ((s[0] & 0xe0) == 0xc0 && (s[1] & 0xc0) == 0x80) {
+		*cp = ((uint32_t)(s[0] & 0x1f) << 6) |
+		      (uint32_t)(s[1] & 0x3f);
+		*p += 2;
+		return true;
+	}
+	if ((s[0] & 0xf0) == 0xe0 && (s[1] & 0xc0) == 0x80 &&
+	    (s[2] & 0xc0) == 0x80) {
+		*cp = ((uint32_t)(s[0] & 0x0f) << 12) |
+		      ((uint32_t)(s[1] & 0x3f) << 6) |
+		      (uint32_t)(s[2] & 0x3f);
+		*p += 3;
+		return true;
+	}
+	if ((s[0] & 0xf8) == 0xf0 && (s[1] & 0xc0) == 0x80 &&
+	    (s[2] & 0xc0) == 0x80 && (s[3] & 0xc0) == 0x80) {
+		*cp = ((uint32_t)(s[0] & 0x07) << 18) |
+		      ((uint32_t)(s[1] & 0x3f) << 12) |
+		      ((uint32_t)(s[2] & 0x3f) << 6) |
+		      (uint32_t)(s[3] & 0x3f);
+		*p += 4;
+		return true;
+	}
+	*cp = '?';
+	*p += 1;
+	return true;
+}
+
+static void draw_utf8_text_fit_size(struct canvas *c, struct font_ctx *font,
+				    int x, int y, int max_w, const char *s,
+				    int cell_w, int pixel_h,
+				    int fallback_scale, uint32_t color)
+{
+	const char *p = s ? s : "";
+	int fallback_w = VIDEO_FONT_WIDTH * fallback_scale;
+	int used = 0;
+
+	while (*p) {
+		uint32_t cp;
+		int width_cols;
+		int draw_w;
+		const char *before = p;
+
+		if (!utf8_next_cp(&p, &cp))
+			break;
+		width_cols = term_cp_width(cp);
+		if (width_cols < 1)
+			width_cols = 1;
+		draw_w = font && font->ready ? cell_w * width_cols :
+			 fallback_w * width_cols;
+		if (used + draw_w > max_w)
+			break;
+		if (font && font->ready &&
+		    font_draw_cp_size(c, font, x + used, y,
+				      cell_w * width_cols, pixel_h, cp,
+				      color, C_GRUVBOX_BG)) {
+			used += draw_w;
+			continue;
+		}
+		if (cp < 128)
+			draw_char(c, x + used, y, (unsigned char)cp,
+				  fallback_scale, color);
+		else
+			draw_char(c, x + used, y, '?', fallback_scale, color);
+		used += draw_w;
+		if (p == before)
+			break;
+	}
+	font_restore_default_size(font);
+}
+
+static uint32_t board_session_lamp_color(enum board_session_state state)
+{
+	switch (state) {
+	case BSS_DISCONNECTED:
+	case BSS_ERROR:
+		return C_GRUVBOX_RED;
+	case BSS_WAIT:
+	case BSS_CONNECTED:
+		return C_GRUVBOX_YELLOW;
+	case BSS_RUN:
+	case BSS_DONE:
+	default:
+		return C_GRUVBOX_GREEN;
+	}
+}
+
+static void draw_session_lamp(struct canvas *c, int x, int y, uint32_t color)
+{
+	fill_rect(c, x + 4, y + 1, 10, 16, color);
+	fill_rect(c, x + 2, y + 3, 14, 12, color);
+	fill_rect(c, x + 5, y + 4, 5, 5, blend_rgb(color, 0xffffff, 75));
+}
+
+static void draw_folder_icon(struct canvas *c, int x, int y, uint32_t color)
+{
+	static const char *const map[] = {
+		"..####........",
+		".######.......",
+		"############..",
+		"#############.",
+		"#############.",
+		"#############.",
+		"#############.",
+		"#############.",
+		".###########..",
+	};
+
+	draw_pet_icon_map(c, x, y, map, (int)(sizeof(map) / sizeof(map[0])),
+			  false, color);
+}
+
+static void draw_branch_icon(struct canvas *c, int x, int y, uint32_t color)
+{
+	static const char *const map[] = {
+		"###.......###.",
+		"###.......###.",
+		".#.........#..",
+		".#.........#..",
+		".###########..",
+		"......#.......",
+		".....###......",
+		"....#####.....",
+		"......#.......",
+	};
+
+	draw_pet_icon_map(c, x, y, map, (int)(sizeof(map) / sizeof(map[0])),
+			  false, color);
+}
+
+static void draw_message_icon(struct canvas *c, int x, int y, uint32_t color)
+{
+	static const char *const map[] = {
+		"..##########..",
+		".############.",
+		"##############",
+		"##..........##",
+		"##..........##",
+		"##..........##",
+		"##############",
+		".###########..",
+		"...###........",
+		"....###.......",
+	};
+
+	draw_pet_icon_map(c, x, y, map, (int)(sizeof(map) / sizeof(map[0])),
+			  false, color);
+}
+
+static int board_session_token_pct(const struct board_session *bs)
+{
+	const uint64_t limit = 1000000u;
+	uint64_t used = bs->token.input + bs->token.output;
+
+	if (used > limit)
+		return 100;
+	return (int)((used * 100u + limit - 1u) / limit);
+}
+
+static void format_token_label(char *buf, size_t buf_sz,
+			       const struct board_session *bs)
+{
+	snprintf(buf, buf_sz, "%d%%/1M", board_session_token_pct(bs));
+}
+
+static void draw_session_token_bar(struct canvas *c, int x, int y, int w,
+				   int pct)
+{
+	int segments = 10;
+	int gap = 3;
+	int seg_w = (w - gap * (segments - 1)) / segments;
+	int filled;
+
+	if (seg_w < 3)
+		seg_w = 3;
+	if (pct < 0)
+		pct = 0;
+	if (pct > 100)
+		pct = 100;
+	filled = (pct * segments + 99) / 100;
+	for (int i = 0; i < segments; i++) {
+		uint32_t color = i < filled ? C_GRUVBOX_YELLOW :
+			0x3b3326;
+		fill_rect(c, x + i * (seg_w + gap), y, seg_w, 18, color);
+	}
 }
 
 /* Return next live sid in iteration order, or 0 if there are none. */
@@ -3825,25 +4045,30 @@ static void draw_picker_header(struct canvas *c, struct font_ctx *font,
 	hline(c, 22, 55, UI_W - 44, C_GRUVBOX_DARK1);
 }
 
-static void draw_picker_footer(struct canvas *c, struct font_ctx *font,
-			       bool permission_mode)
+static void draw_picker_message_footer(struct canvas *c, struct font_ctx *font,
+				       const struct board_session *bs)
 {
-	hline(c, 22, 344, UI_W - 44, C_GRUVBOX_LINE);
-	hline(c, 22, 345, UI_W - 44, C_GRUVBOX_DARK1);
-	draw_pet_rotate_icon(c, 42, 362, false, C_GRUVBOX_YELLOW);
-	draw_pet_rotate_icon(c, 88, 362, true, C_GRUVBOX_YELLOW);
-	draw_pet_font_text(c, font, 140, 360, "select sid", 12, 2,
-			   C_GRUVBOX_TEXT);
-	draw_pet_font_text(c, font, 332, 360, "|", 12, 2, C_GRUVBOX_MUTED);
-	draw_pet_down_icon(c, 392, 362, C_GRUVBOX_YELLOW);
-	draw_pet_font_text(c, font, 432, 360,
-			   permission_mode ? "confirm allow" : "confirm focus",
-			   12, 2, C_GRUVBOX_TEXT);
-	draw_pet_font_text(c, font, 690, 360, "|", 12, 2, C_GRUVBOX_MUTED);
-	draw_pet_font_text(c, font, 742, 360,
-			   permission_mode ? "reject deny" : "reject = back",
-			   12, 2,
-			   C_GRUVBOX_TEXT);
+	char message_label[160];
+	const char *msg;
+	uint32_t icon_color = C_GRUVBOX_YELLOW;
+	uint32_t text_color = C_GRUVBOX_TEXT;
+
+	if (bs->perm.active) {
+		snprintf(message_label, sizeof(message_label),
+			 "PERM %s %s", bs->perm.tool, bs->perm.args);
+		msg = message_label;
+		icon_color = C_GRUVBOX_RED;
+		text_color = C_GRUVBOX_RED;
+	} else if (!bs->turn.user_text[0] && !bs->turn.text[0]) {
+		return;
+	} else {
+		msg = bs->turn.user_text[0] ? bs->turn.user_text :
+			bs->turn.text;
+	}
+
+	draw_message_icon(c, 64, 358, icon_color);
+	draw_utf8_text_fit_size(c, font, 106, 348, 830, msg, 14, 30, 2,
+				text_color);
 }
 
 /* Picker view: KEY 2 (SESSION) jumps here. Renders sid + state plus compact
@@ -3870,10 +4095,6 @@ static void render_session_picker(struct canvas *c, const struct ui_model *m,
 	fill_rect(c, 0, 0, UI_W, UI_H, 0x141312);
 	draw_picker_header(c, font, seconds, count);
 
-	const char *banner = "[ SELECT SESSION ]";
-	int bw = text_w(banner, 2);
-	draw_text(c, (UI_W - bw) / 2, 78, banner, 2, C_GRUVBOX_YELLOW);
-
 	if (count == 0) {
 		const char *msg = "NO HOST SESSIONS YET";
 		int mw = text_w(msg, 2);
@@ -3888,7 +4109,7 @@ static void render_session_picker(struct canvas *c, const struct ui_model *m,
 			break;
 		}
 	}
-	draw_picker_footer(c, font, rows[picker_idx]->perm.active);
+	draw_picker_message_footer(c, font, rows[picker_idx]);
 
 	const int rows_visible = 3;
 	int start = picker_idx - rows_visible / 2;
@@ -3902,68 +4123,62 @@ static void render_session_picker(struct canvas *c, const struct ui_model *m,
 
 	for (int i = 0; i < rows_visible && (start + i) < count; i++) {
 		int idx = start + i;
-		int row_y = 130 + i * 60;
+		int row_y = 72 + i * 76;
 		bool sel = (idx == picker_idx);
 		const struct board_session *bs = rows[idx];
-		char sid_label[24];
-		char meta_label[160];
-		char detail_label[144];
-		const char *state_label =
-			board_session_state_str(bs->state);
-		uint32_t state_color = sel ? C_GRUVBOX_YELLOW : C_GRUVBOX_MUTED;
-		if (bs->state == BSS_DISCONNECTED || bs->state == BSS_ERROR)
-			state_color = sel ? C_GRUVBOX_RED : 0x8a3a25;
+		char agent_label[64];
+		char cwd_label[64];
+		char branch_label[32];
+		char token_label[24];
+		const char *agent = bs->meta.hint[0] ? bs->meta.hint :
+			(bs->meta.kind[0] ? bs->meta.kind : "agent");
+		const char *cwd = path_tail(bs->meta.cwd);
+		uint32_t lamp_color = board_session_lamp_color(bs->state);
+		int pct = board_session_token_pct(bs);
 
-		snprintf(sid_label, sizeof(sid_label), "SID %u", bs->sid);
-		if (bs->meta.hint[0] || bs->meta.kind[0] ||
-		    bs->meta.cwd[0] || bs->meta.branch[0]) {
-			const char *kind = bs->meta.kind[0] ? bs->meta.kind : "agent";
-			const char *name = bs->meta.hint[0] ? bs->meta.hint : kind;
-			const char *cwd = path_tail(bs->meta.cwd);
-			if (bs->meta.branch[0] && cwd[0])
-				snprintf(meta_label, sizeof(meta_label), "%s  %s  %s",
-					 name, cwd, bs->meta.branch);
-			else if (cwd[0])
-				snprintf(meta_label, sizeof(meta_label), "%s  %s",
-					 name, cwd);
-			else
-				snprintf(meta_label, sizeof(meta_label), "%s", name);
-		} else {
-			snprintf(meta_label, sizeof(meta_label), "waiting for agent meta");
-		}
-
-		if (bs->perm.active) {
-			snprintf(detail_label, sizeof(detail_label), "PERM #%llu %s %s",
-				 (unsigned long long)bs->perm.req_id,
-				 bs->perm.tool, bs->perm.args);
-		} else if (bs->turn.text[0]) {
-			snprintf(detail_label, sizeof(detail_label), "%s: %s",
-				 bs->turn.role[0] ? bs->turn.role : "turn",
-				 bs->turn.text);
-		} else if (bs->token.input || bs->token.output || bs->token.cost_cents) {
-			snprintf(detail_label, sizeof(detail_label),
-				 "TOK in=%llu out=%llu cost=%llu",
-				 (unsigned long long)bs->token.input,
-				 (unsigned long long)bs->token.output,
-				 (unsigned long long)bs->token.cost_cents);
-		} else {
-			snprintf(detail_label, sizeof(detail_label), "no activity yet");
-		}
+		snprintf(agent_label, sizeof(agent_label), "%s", agent);
+		snprintf(cwd_label, sizeof(cwd_label), "%s", cwd[0] ? cwd : "-");
+		snprintf(branch_label, sizeof(branch_label), "%s",
+			 bs->meta.branch[0] ? bs->meta.branch : "-");
+		format_token_label(token_label, sizeof(token_label), bs);
 
 		if (sel) {
-			fill_rect(c, 60, row_y - 10, UI_W - 120, 54, 0x1a0e02);
-			stroke_round_rect(c, 60, row_y - 8,
-					  UI_W - 120, 48, 6, C_GRUVBOX_YELLOW);
+			fill_rect(c, 22, row_y - 2, UI_W - 44, 70, 0x1a0e02);
+			stroke_round_rect(c, 22, row_y - 2,
+					  UI_W - 44, 70, 6, C_GRUVBOX_YELLOW);
+		} else {
+			stroke_round_rect(c, 22, row_y - 2,
+					  UI_W - 44, 66, 6, 0x3b3326);
 		}
-		draw_text_fit(c, 96, row_y, 132, sid_label, 2,
-			      sel ? C_GRUVBOX_YELLOW : C_GRUVBOX_TEXT);
-		draw_text_fit(c, 246, row_y + 1, 420, meta_label, 1,
-			      sel ? C_GRUVBOX_TEXT : C_GRUVBOX_MUTED);
-		draw_text_fit(c, 728, row_y, 132, state_label, 2,
-			      state_color);
-		draw_text_fit(c, 246, row_y + 23, 560, detail_label, 1,
-			      bs->perm.active ? C_GRUVBOX_RED :
-			      (sel ? C_GRUVBOX_YELLOW : C_GRUVBOX_MUTED));
+
+		draw_session_lamp(c, 44, row_y + 24, lamp_color);
+		draw_utf8_text_fit_size(c, font, 76, row_y + 17, 210,
+					agent_label, 15, 30, 2,
+					sel ? C_GRUVBOX_YELLOW :
+					C_GRUVBOX_TEXT);
+		draw_utf8_text_fit_size(c, font, 300, row_y + 18, 16, "|",
+					12, 30, 2, C_GRUVBOX_MUTED);
+		draw_folder_icon(c, 326, row_y + 25,
+				 sel ? C_GRUVBOX_YELLOW : C_GRUVBOX_MUTED);
+		draw_utf8_text_fit_size(c, font, 356, row_y + 17, 190,
+					cwd_label, 15, 30, 2,
+					sel ? C_GRUVBOX_TEXT :
+					C_GRUVBOX_MUTED);
+		draw_utf8_text_fit_size(c, font, 560, row_y + 18, 16, "|",
+					12, 30, 2, C_GRUVBOX_MUTED);
+		draw_branch_icon(c, 590, row_y + 25,
+				 sel ? C_GRUVBOX_YELLOW : C_GRUVBOX_MUTED);
+		draw_utf8_text_fit_size(c, font, 622, row_y + 17, 118,
+					branch_label, 15, 30, 2,
+					sel ? C_GRUVBOX_TEXT :
+					C_GRUVBOX_MUTED);
+		draw_utf8_text_fit_size(c, font, 748, row_y + 18, 16, "|",
+					12, 30, 2, C_GRUVBOX_MUTED);
+		draw_session_token_bar(c, 778, row_y + 25, 90, pct);
+		draw_utf8_text_fit_size(c, font, 874, row_y + 18, 62,
+					token_label, 12, 28, 2,
+					sel ? C_GRUVBOX_YELLOW :
+					C_GRUVBOX_MUTED);
 	}
 }
 
