@@ -2,8 +2,21 @@
 
 . /etc/profile
 
+hold_ephy_for_iis2_mic() {
+	if command -v devmem >/dev/null 2>&1
+	then
+		devmem 0x03009800 32 0x0900 >/dev/null 2>&1 || true
+	fi
+}
+
 start() {
 	printf "start ethernet: "
+	if ! ip link show eth0 >/dev/null 2>&1
+	then
+		hold_ephy_for_iis2_mic
+		echo "SKIP (eth0 not found)"
+		return 0
+	fi
 	if [ ! -e /boot/eth.nodhcp ]
 	then
 		(udhcpc -i eth0 -t 10 -T 1 -A 5 -b -p /run/udhcpc.eth0.pid) &
@@ -12,8 +25,11 @@ start() {
 }
 
 stop() {
-	kill `cat /run/udhcpc.eth0.pid`
-	rm /run/udhcpc.eth0.pid
+	if [ -f /run/udhcpc.eth0.pid ]
+	then
+		kill `cat /run/udhcpc.eth0.pid` >/dev/null 2>&1 || true
+		rm /run/udhcpc.eth0.pid
+	fi
 }
 
 restart() {

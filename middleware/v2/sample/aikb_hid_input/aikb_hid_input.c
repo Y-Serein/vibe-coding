@@ -12,6 +12,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -112,6 +113,10 @@
 #define PLUGIN_HINT_MAX 24
 #define KEY_COUNT 7
 #define ENCODER_STEPS_PER_EVENT 2
+#define REJECT_KEY_INDEX 0
+#define VOICE_KEY_INDEX 1
+#define CONFIRM_KEY_INDEX 6
+#define AIKB_USB_MIC_BRIDGE "/mnt/system/usr/bin/aikb_usb_mic_bridge"
 
 enum gpio_bank {
 	GPIO_BANK_A,
@@ -182,13 +187,14 @@ static uint64_t g_diag_vt100_write_retry;
 static uint64_t g_diag_vt100_write_fail;
 
 static const struct pin_def g_keys[] = {
-	{ "key0_P19", GPIO_BANK_E, 19, 0x030010d4u, 0x05027090u, 0x0502705cu },
+	/* Keep the HID/UI contract semantic: KEY0 is REJECT, KEY6 is CONFIRM. */
+	{ "key0_A15", GPIO_BANK_A, 15, 0x0300103cu, 0x03001908u, IOBLK_NONE },
 	{ "key1_A22", GPIO_BANK_A, 22, 0x03001050u, 0x0300191cu, IOBLK_NONE },
 	{ "key2_A25", GPIO_BANK_A, 25, 0x03001054u, 0x03001920u, IOBLK_NONE },
 	{ "key3_A27", GPIO_BANK_A, 27, 0x03001058u, 0x03001924u, IOBLK_NONE },
 	{ "key4_A23", GPIO_BANK_A, 23, 0x0300105cu, 0x03001928u, IOBLK_NONE },
 	{ "key5_A24", GPIO_BANK_A, 24, 0x03001060u, 0x0300192cu, IOBLK_NONE },
-	{ "key6_A15", GPIO_BANK_A, 15, 0x0300103cu, 0x03001908u, IOBLK_NONE },
+	{ "key6_P19", GPIO_BANK_E, 19, 0x030010d4u, 0x05027090u, 0x0502705cu },
 };
 
 static const struct pin_def g_enc_a = {
@@ -732,6 +738,61 @@ static int write_event_line(int *event_fd, const char *path, const char *line,
 	len = strlen(line);
 	return write_screen_bytes(event_fd, path, (const uint8_t *)line, len,
 				  debug);
+}
+
+static void reap_voice_mic_children(void)
+{
+	while (waitpid(-1, NULL, WNOHANG) > 0)
+		;
+}
+
+static void spawn_voice_mic_cmd(bool start, bool debug)
+{
+	pid_t pid;
+
+	pid = fork();
+	if (pid < 0) {
+		if (debug)
+			fprintf(stderr, "aikb_hid_input: fork mic %s failed: %s\n",
+				start ? "start" : "stop", strerror(errno));
+		return;
+	}
+	if (pid == 0) {
+		int nullfd = open("/dev/null", O_RDWR);
+
+		if (nullfd >= 0) {
+			dup2(nullfd, STDIN_FILENO);
+			dup2(nullfd, STDOUT_FILENO);
+			dup2(nullfd, STDERR_FILENO);
+			if (nullfd > STDERR_FILENO)
+				close(nullfd);
+		}
+		execl(AIKB_USB_MIC_BRIDGE, AIKB_USB_MIC_BRIDGE,
+		      start ? "mic-start" : "mic-stop", (char *)NULL);
+		_exit(127);
+	}
+	if (debug)
+		fprintf(stderr, "aikb_hid_input: voice mic %s pid=%ld\n",
+			start ? "start" : "stop", (long)pid);
+}
+
+static void control_voice_mic(uint8_t old_bits, uint8_t new_bits, bool debug)
+{
+	static bool active;
+	uint8_t voice_bit = (uint8_t)(1u << VOICE_KEY_INDEX);
+	uint8_t reject_bit = (uint8_t)(1u << REJECT_KEY_INDEX);
+	uint8_t confirm_bit = (uint8_t)(1u << CONFIRM_KEY_INDEX);
+	bool voice_down = (new_bits & voice_bit) && !(old_bits & voice_bit);
+	bool reject_down = (new_bits & reject_bit) && !(old_bits & reject_bit);
+	bool confirm_down = (new_bits & confirm_bit) && !(old_bits & confirm_bit);
+
+	if (voice_down && !active) {
+		spawn_voice_mic_cmd(true, debug);
+		active = true;
+	} else if ((reject_down || confirm_down) && active) {
+		spawn_voice_mic_cmd(false, debug);
+		active = false;
+	}
 }
 
 static void emit_key_down_events(int *event_fd, const struct config *cfg,
@@ -1755,6 +1816,8 @@ int main(int argc, char **argv)
 
 		if (keys_dirty) {
 			key_bits = build_key_bits(keys);
+			control_voice_mic(event_prev_key_bits, key_bits,
+					  cfg.debug);
 			emit_key_down_events(&event_fd, &cfg, event_prev_key_bits,
 					     key_bits, event_prev_enc_pressed,
 					     enc_sw.stable);
@@ -1770,6 +1833,7 @@ int main(int argc, char **argv)
 			drain_packets(hid_fd, &screen_fd, &ctrl_fd, &cfg);
 
 		drain_ui_ctrl(&ui_ctrl_fd, hid_fd, &ctrl_fd, &cfg);
+		reap_voice_mic_children();
 
 		if (now >= next_reap_ms) {
 			reap_sessions(hid_fd, &ctrl_fd, &cfg, now);
@@ -1841,6 +1905,9 @@ int main(int argc, char **argv)
 
 		sleep_ms(cfg.poll_ms);
 	}
+
+	spawn_voice_mic_cmd(false, cfg.debug);
+	reap_voice_mic_children();
 
 	if (hid_fd >= 0)
 		close(hid_fd);

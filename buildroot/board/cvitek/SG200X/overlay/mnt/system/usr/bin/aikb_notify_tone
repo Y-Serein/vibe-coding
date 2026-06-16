@@ -1,0 +1,59 @@
+#!/bin/sh
+
+. /etc/profile
+
+DEV="${AIKB_NOTIFY_AUDIO_DEV:-hw:2,0}"
+RATE="${AIKB_NOTIFY_RATE:-48000}"
+CHANNELS="${AIKB_NOTIFY_CHANNELS:-2}"
+KIND="${1:-done}"
+
+case "$KIND" in
+  done|ok)
+	FREQ="${AIKB_NOTIFY_FREQ:-880}"
+	MS="${AIKB_NOTIFY_MS:-160}"
+	AMP="${AIKB_NOTIFY_AMP:-4500}"
+	;;
+  error|fail)
+	FREQ="${AIKB_NOTIFY_FREQ:-440}"
+	MS="${AIKB_NOTIFY_MS:-240}"
+	AMP="${AIKB_NOTIFY_AMP:-5000}"
+	;;
+  *)
+	FREQ="${AIKB_NOTIFY_FREQ:-660}"
+	MS="${AIKB_NOTIFY_MS:-160}"
+	AMP="${AIKB_NOTIFY_AMP:-4200}"
+	;;
+esac
+
+if ! command -v awk >/dev/null 2>&1 || ! command -v aplay >/dev/null 2>&1
+then
+	exit 1
+fi
+
+awk -v rate="$RATE" -v freq="$FREQ" -v ms="$MS" -v amp="$AMP" -v channels="$CHANNELS" '
+BEGIN {
+	pi = atan2(0, -1)
+	samples = int(rate * ms / 1000)
+	fade = int(rate * 12 / 1000)
+	if (fade < 1) {
+		fade = 1
+	}
+	for (i = 0; i < samples; i++) {
+		env = 1.0
+		if (i < fade) {
+			env = i / fade
+		} else if (i > samples - fade) {
+			env = (samples - i) / fade
+		}
+		v = int(sin(2 * pi * freq * i / rate) * amp * env)
+		if (v < 0) {
+			v += 65536
+		}
+		lo = v % 256
+		hi = int(v / 256)
+		for (ch = 0; ch < channels; ch++) {
+			printf("%c%c", lo, hi)
+		}
+	}
+}
+' | aplay -q -D "$DEV" -f S16_LE -r "$RATE" -c "$CHANNELS" -t raw

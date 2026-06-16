@@ -34,6 +34,12 @@ then
 	fi
 	echo "hostname: ${new_hostname}"
 
+	if ! ip link show eth0 >/dev/null 2>&1
+	then
+		echo "eth0 not found; skip ethernet mac address"
+		exit 0
+	fi
+
 	if [ -e /boot/eth.mac ]
 	then
 		new_ethmac=$(cat /boot/ethmac)

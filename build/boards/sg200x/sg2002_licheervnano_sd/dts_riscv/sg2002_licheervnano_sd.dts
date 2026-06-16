@@ -31,6 +31,17 @@
         //max-frequency = <5000000>; // 5Mhz
 };
 
+#ifndef __UBOOT__
+&ethernet0 {
+        /* AIKB reuses ETH pads B24/B25/B26 for IIS2 mic. */
+        status = "disabled";
+};
+
+&{/i2s_subsys} {
+        master_base = <0x04120000>;
+};
+#endif
+
 &cvi_vo {
 #ifndef __UBOOT__
 	/delete-property/ reset-gpio;
@@ -189,6 +200,42 @@
 
 / {
         model = "LicheeRv Nano";
+
+#ifndef __UBOOT__
+        aikb_i2s2: i2s@04120000 {
+                compatible = "cvitek,cv1835-i2s";
+                reg = <0x0 0x04120000 0x0 0x2000>;
+                interrupts = <42 IRQ_TYPE_LEVEL_HIGH>;
+                interrupt-parent = <&plic0>;
+                clocks = <&i2s_mclk 0>;
+                clock-names = "i2sclk";
+                dev-id = <2>;
+                #sound-dai-cells = <0>;
+                dmas = <&dmac 6 1 1>, <&dmac 1 1 1>;
+                dma-names = "rx", "tx";
+                capability = "txrx";
+                mclk_out = "false";
+        };
+
+        aikb_iis2_mic {
+                compatible = "cvitek,cv1835-dummy-card";
+                cvi,model = "CV1835";
+                cvi,mode = "I2S";
+                cvi,fmt = "IBNF";
+                cvi,card_name = "aikb_iis2_mic";
+                cvi,slot_no = <2>;
+
+                dai@0 {
+                        cvi,dai_name = "cv1835-iis2-mic";
+                        cvi,stream_name = "dummy_codec-aif";
+                        cvi,cpu_dai_name = "4120000.i2s";
+                        cvi,codec_dai_name = "dummy_codec-aif";
+                        cvi,platform_name = "4120000.i2s";
+                        cvi,codec_name = "dummy_codec";
+                        cvi,role = "master";
+                };
+        };
+#endif
 
 	spi4: spi4@gpio {
 		compatible = "spi-gpio";

@@ -699,7 +699,7 @@ static int cvi_i2s_trigger(struct snd_pcm_substream *substream,
 		snd_pcm_stream_unlock_irq(substream);
 		dev->active++;
 #if defined(CONFIG_SND_SOC_CV1835_CONCURRENT_I2S)
-		if ((dev->dev_id != 0) && (dev->dev_id != 3) && (dev->dev_id != i2s_subsys_query_master())) {
+		if ((dev->dev_id != 0) && (dev->dev_id != 3)) {
 			dev_dbg(dev->dev, "enable master clk generation\n");
 			i2s_master_clk_switch_on(true);
 		}
@@ -717,7 +717,7 @@ static int cvi_i2s_trigger(struct snd_pcm_substream *substream,
 		dev->active--;
 		i2s_stop(dev, substream);
 #if defined(CONFIG_SND_SOC_CV1835_CONCURRENT_I2S)
-		if ((dev->dev_id != 0) && (dev->dev_id != 3) && (dev->dev_id != i2s_subsys_query_master())) {
+		if ((dev->dev_id != 0) && (dev->dev_id != 3)) {
 			dev_dbg(dev->dev, "disable master clk generation\n");
 			i2s_master_clk_switch_on(false);
 		}

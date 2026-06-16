@@ -1,5 +1,13 @@
 #!/bin/sh
 
+boot_value_or_default() {
+	if [ -e "/boot/$1" ]
+	then
+		cat "/boot/$1"
+	else
+		echo "$2"
+	fi
+}
 
 if [ "$1" = "start" ]
 then
@@ -160,6 +168,36 @@ then
 			ln -s functions/hid.aikb configs/c.1/
 		fi
 
+		# AIKB USB Audio Class 1. Default to mic-only: Windows can see
+		# the capture endpoint at boot, while the speaker endpoint stays
+		# hidden unless explicitly requested.
+		if [ -e /boot/usb.uac1 ]
+		then
+			uac1_default_c_chmask=0x0
+			if [ -e /boot/usb.uac1.speaker ] || [ -e /boot/usb.uac1.speaker_endpoint ]
+			then
+				uac1_default_c_chmask=0x3
+			fi
+			mkdir -p functions/uac1.mic
+			boot_value_or_default usb.uac1.p_chmask 0x3 > functions/uac1.mic/p_chmask
+			boot_value_or_default usb.uac1.p_srate 48000 > functions/uac1.mic/p_srate
+			boot_value_or_default usb.uac1.p_ssize 2 > functions/uac1.mic/p_ssize
+			if [ -e /boot/usb.uac1.no_speaker ]
+			then
+				echo 0x0 > functions/uac1.mic/c_chmask
+			else
+				boot_value_or_default usb.uac1.c_chmask "${uac1_default_c_chmask}" > functions/uac1.mic/c_chmask
+			fi
+			boot_value_or_default usb.uac1.c_srate 48000 > functions/uac1.mic/c_srate
+			boot_value_or_default usb.uac1.c_ssize 2 > functions/uac1.mic/c_ssize
+			if [ -e functions/uac1.mic/req_number ]
+			then
+				boot_value_or_default usb.uac1.req_number 3 > functions/uac1.mic/req_number
+			fi
+			rm -rf configs/c.1/uac1.mic
+			ln -s functions/uac1.mic configs/c.1/
+		fi
+
 		# mouse
 		if [ -e /boot/usb.mouse ]
 		then
@@ -224,6 +262,10 @@ fi
 
 if [ "$1" = "stop" ]
 then
+	if [ -x /mnt/system/usr/bin/aikb_usb_mic_bridge ]
+	then
+		/mnt/system/usr/bin/aikb_usb_mic_bridge stop
+	fi
 	echo '' > /sys/kernel/config/usb_gadget/g0/UDC
 	echo host > /proc/cviusb/otg_role
 	# uvc
@@ -244,6 +286,13 @@ then
 	then
 		unlink /sys/kernel/config/usb_gadget/g0/configs/c.1/ncm.usb0
 		rmdir /sys/kernel/config/usb_gadget/g0/functions/ncm.usb0
+	fi
+
+	# uac1
+	if [ -e /sys/kernel/config/usb_gadget/g0/configs/c.1/uac1.mic ]
+	then
+		unlink /sys/kernel/config/usb_gadget/g0/configs/c.1/uac1.mic
+		rmdir /sys/kernel/config/usb_gadget/g0/functions/uac1.mic
 	fi
 
     # adbd

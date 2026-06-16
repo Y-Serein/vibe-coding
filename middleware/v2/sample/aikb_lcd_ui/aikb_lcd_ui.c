@@ -501,6 +501,13 @@ static void warnf(const char *fmt, ...)
 {
 	va_list ap;
 
+	if (!strncmp(fmt, "diag ", 5)) {
+		const char *diag = getenv("AIKB_LCD_DIAG");
+
+		if (!diag || !diag[0] || !strcmp(diag, "0"))
+			return;
+	}
+
 	va_start(ap, fmt);
 	fprintf(stderr, "aikb_lcd_ui: ");
 	vfprintf(stderr, fmt, ap);
@@ -6388,7 +6395,7 @@ int main(int argc, char **argv)
 		int input_idx = -1;
 		int ctrl_idx = -1;
 		int event_idx = -1;
-		int timeout = 1000;
+		int timeout = (view == VIEW_TERMINAL) ? 1000 : 5000;
 		time_t now;
 
 		idle_sleep_update(view);

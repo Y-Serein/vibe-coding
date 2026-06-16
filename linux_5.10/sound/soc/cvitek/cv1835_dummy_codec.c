@@ -15,9 +15,16 @@
 #include <sound/soc.h>
 #include <sound/pcm_params.h>
 #include <linux/io.h>
+#include <linux/of.h>
 #include <linux/delay.h>
 
 u16 tdm_slot_no2 = 2;
+
+#if defined(CONFIG_SND_SOC_CV1835_CONCURRENT_I2S)
+#define CV1835_DUMMY_MAX_LINKS 2
+#else
+#define CV1835_DUMMY_MAX_LINKS 1
+#endif
 
 static int cv1835_dummy_hw_params(struct snd_pcm_substream *substream,
 				  struct snd_pcm_hw_params *params)
@@ -29,16 +36,10 @@ static struct snd_soc_ops cv1835_dummy_ops = {
 	.hw_params = cv1835_dummy_hw_params,
 };
 
-static struct snd_soc_dai_link cv1835_dummy_dai[] = {
-	{
-		.ops = &cv1835_dummy_ops,
-	},
-#if defined(CONFIG_SND_SOC_CV1835_CONCURRENT_I2S)
-	{
-		.ops = &cv1835_dummy_ops,
-	},
-#endif
-};
+static struct snd_soc_dai_link_component cv1835_dummy_cpus[CV1835_DUMMY_MAX_LINKS];
+static struct snd_soc_dai_link_component cv1835_dummy_codecs[CV1835_DUMMY_MAX_LINKS];
+static struct snd_soc_dai_link_component cv1835_dummy_platforms[CV1835_DUMMY_MAX_LINKS];
+static struct snd_soc_dai_link cv1835_dummy_dai[CV1835_DUMMY_MAX_LINKS];
 
 static struct snd_soc_card cv1835_dummy = {
 	.owner = THIS_MODULE,
@@ -76,13 +77,37 @@ static int cv1835_dummy_probe(struct platform_device *pdev)
 		of_property_read_string(np, "cvi,fmt", &fmt);
 
 		for_each_child_of_node(np, dai) {
+			const char *cpu_dai_name;
+			const char *codec_dai_name;
+			const char *platform_name;
+			const char *codec_name;
+
+			if (idx >= CV1835_DUMMY_MAX_LINKS) {
+				dev_err(&pdev->dev, "%s, too many dai links\n", __func__);
+				of_node_put(dai);
+				return -EINVAL;
+			}
+
 			of_property_read_string(dai, "cvi,dai_name", &card->dai_link[idx].name);
 			of_property_read_string(dai, "cvi,stream_name", &card->dai_link[idx].stream_name);
-			of_property_read_string(dai, "cvi,cpu_dai_name", &card->dai_link[idx].cpu_dai_name);
+			of_property_read_string(dai, "cvi,cpu_dai_name", &cpu_dai_name);
+			of_property_read_string(dai, "cvi,codec_dai_name", &codec_dai_name);
+			of_property_read_string(dai, "cvi,platform_name", &platform_name);
+			of_property_read_string(dai, "cvi,codec_name", &codec_name);
 
-			of_property_read_string(dai, "cvi,codec_dai_name", &card->dai_link[idx].codec_dai_name);
-			of_property_read_string(dai, "cvi,platform_name", &card->dai_link[idx].platform_name);
-			of_property_read_string(dai, "cvi,codec_name", &card->dai_link[idx].codec_name);
+			cv1835_dummy_cpus[idx].name = cpu_dai_name;
+			cv1835_dummy_cpus[idx].dai_name = cpu_dai_name;
+			cv1835_dummy_codecs[idx].name = codec_name;
+			cv1835_dummy_codecs[idx].dai_name = codec_dai_name;
+			cv1835_dummy_platforms[idx].name = platform_name;
+			cv1835_dummy_platforms[idx].dai_name = platform_name;
+			card->dai_link[idx].cpus = &cv1835_dummy_cpus[idx];
+			card->dai_link[idx].num_cpus = 1;
+			card->dai_link[idx].codecs = &cv1835_dummy_codecs[idx];
+			card->dai_link[idx].num_codecs = 1;
+			card->dai_link[idx].platforms = &cv1835_dummy_platforms[idx];
+			card->dai_link[idx].num_platforms = 1;
+			card->dai_link[idx].ops = &cv1835_dummy_ops;
 
 			card->dev = &pdev->dev;
 
@@ -135,6 +160,12 @@ static int cv1835_dummy_probe(struct platform_device *pdev)
 			idx++;
 		}
 
+		if (!idx) {
+			dev_err(&pdev->dev, "%s, no dai link configured\n", __func__);
+			return -EINVAL;
+		}
+
+		card->num_links = idx;
 		platform_set_drvdata(pdev, card);
 		return devm_snd_soc_register_card(&pdev->dev, card);
 	}
@@ -157,4 +188,3 @@ MODULE_AUTHOR("RuiLong.Chen <ruilong.chen@cvitek.com>");
 MODULE_DESCRIPTION("ALSA SoC cv1835 dummy driver");
 MODULE_LICENSE("GPL");
 MODULE_ALIAS("platform:cv1835-dummy");
-

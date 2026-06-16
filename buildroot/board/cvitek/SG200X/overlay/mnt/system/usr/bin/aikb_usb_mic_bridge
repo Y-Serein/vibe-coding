@@ -1,0 +1,555 @@
+#!/bin/sh
+
+. /etc/profile
+
+PIDFILE="${AIKB_USB_MIC_PIDFILE:-/var/run/aikb_usb_mic_bridge.pid}"
+CHILD_PIDFILE="${AIKB_USB_MIC_CHILD_PIDFILE:-/var/run/aikb_usb_mic_bridge.children}"
+MIC_LOOP_PIDFILE="${AIKB_USB_MIC_TO_HOST_LOOP_PIDFILE:-/var/run/aikb_usb_mic_to_host.pid}"
+SPK_LOOP_PIDFILE="${AIKB_USB_HOST_TO_SPK_LOOP_PIDFILE:-/var/run/aikb_usb_host_to_speaker.pid}"
+MIC_CHILD_PIDFILE="${AIKB_USB_MIC_TO_HOST_CHILD_PIDFILE:-/var/run/aikb_usb_mic_to_host.children}"
+SPK_CHILD_PIDFILE="${AIKB_USB_HOST_TO_SPK_CHILD_PIDFILE:-/var/run/aikb_usb_host_to_speaker.children}"
+MIC_START_LOCK="${AIKB_USB_MIC_TO_HOST_START_LOCK:-/var/run/aikb_usb_mic_to_host.startlock}"
+LOGFILE="${AIKB_USB_MIC_LOG:-/tmp/aikb_usb_mic.log}"
+MIC_FIFO="${AIKB_USB_MIC_FIFO:-/tmp/aikb_usb_mic_to_host.pcm}"
+MIC_PLAY_FIFO="${AIKB_USB_MIC_PLAY_FIFO:-/tmp/aikb_usb_mic_to_host.play.pcm}"
+SPK_FIFO="${AIKB_USB_SPK_FIFO:-/tmp/aikb_usb_host_to_speaker.pcm}"
+SPK_PLAY_FIFO="${AIKB_USB_SPK_PLAY_FIFO:-/tmp/aikb_usb_host_to_speaker.play.pcm}"
+SPK_PREROLL="${AIKB_USB_SPK_PREROLL:-/tmp/aikb_usb_host_to_speaker.preroll}"
+MIC_DEV="${AIKB_USB_MIC_SRC:-hw:0,0}"
+SPK_DEV="${AIKB_USB_SPK_DST:-hw:2,0}"
+PCM_DUAL_MONO_TOOL="${AIKB_PCM_DUAL_MONO_TOOL:-/mnt/system/usr/bin/aikb_pcm_dual_mono}"
+MIC_MONO_TOOL="${AIKB_USB_MIC_MONO_TOOL:-$PCM_DUAL_MONO_TOOL}"
+MIC_MONO="${AIKB_USB_MIC_MONO:-1}"
+MIC_MONO_MODE="${AIKB_USB_MIC_MONO_MODE:-left-only}"
+SPK_DOWNMIX_TOOL="${AIKB_USB_SPK_DOWNMIX_TOOL:-$PCM_DUAL_MONO_TOOL}"
+SPK_DOWNMIX="${AIKB_USB_SPK_DOWNMIX:-1}"
+FORMAT="${AIKB_USB_MIC_FORMAT:-S16_LE}"
+RATE="${AIKB_USB_MIC_RATE:-48000}"
+MIC_SRC_CHANNELS="${AIKB_USB_MIC_SRC_CHANNELS:-${AIKB_USB_MIC_CHANNELS:-2}}"
+MIC_UAC_CHMASK="$(cat /sys/kernel/config/usb_gadget/g0/functions/uac1.mic/p_chmask 2>/dev/null)"
+case "$MIC_UAC_CHMASK" in
+	3|0x3|0X3)
+		DEFAULT_MIC_UAC_CHANNELS=2
+		;;
+	*)
+		DEFAULT_MIC_UAC_CHANNELS=1
+		;;
+esac
+MIC_UAC_CHANNELS="${AIKB_USB_MIC_UAC_CHANNELS:-$DEFAULT_MIC_UAC_CHANNELS}"
+MIC_UAC_APLAY_OPTS="${AIKB_USB_MIC_UAC_APLAY_OPTS:---start-delay=50000 --period-size=480 --buffer-size=9600 --avail-min=10000}"
+SPK_CHANNELS="${AIKB_USB_SPK_CHANNELS:-${AIKB_USB_MIC_CHANNELS:-2}}"
+RETRY_SLEEP="${AIKB_USB_AUDIO_RETRY_SLEEP:-30}"
+SPK_PREROLL_BYTES="${AIKB_USB_SPK_PREROLL_BYTES:-4096}"
+MIC_STARTUP_GRACE="${AIKB_USB_MIC_STARTUP_GRACE:-3}"
+MIC_RETRY_ON_EXIT="${AIKB_USB_MIC_RETRY_ON_EXIT:-0}"
+STOP_KILL_WAIT="${AIKB_USB_STOP_KILL_WAIT:-1}"
+
+log_msg() {
+	echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOGFILE"
+}
+
+uac_pcm_dev() {
+	awk '/UAC1_Gadget|UAC1Gadget/ {gsub(":", "", $1); print "hw:" $1 ",0"; exit}' /proc/asound/cards 2>/dev/null
+}
+
+wait_uac_pcm() {
+	i=0
+	while [ "$i" -lt 50 ]
+	do
+		dst="$(uac_pcm_dev)"
+		if [ -n "$dst" ]
+		then
+			echo "$dst"
+			return 0
+		fi
+		i=$((i + 1))
+		sleep 0.1
+	done
+	return 1
+}
+
+uac_pcm_card() {
+	card="${1#hw:}"
+	card="${card%%,*}"
+	case "$card" in
+		''|*[!0-9]*)
+			return 1
+			;;
+	esac
+	echo "$card"
+}
+
+uac_playback_status_path() {
+	card="$(uac_pcm_card "$1")" || return 1
+	echo "/proc/asound/card${card}/pcm0p/sub0/status"
+}
+
+mic_uac_stream_active() {
+	status_path="$(uac_playback_status_path "$1")" || return 1
+	i=0
+	last_state=""
+	last_hw=""
+	last_appl=""
+	while [ "$i" -lt "$MIC_STARTUP_GRACE" ]
+	do
+		if [ ! -f "$status_path" ]
+		then
+			log_msg "mic-to-host UAC playback status missing: ${status_path}"
+			return 1
+		fi
+		last_state="$(awk '/^state:/{print $2}' "$status_path" 2>/dev/null)"
+		last_hw="$(awk '/^hw_ptr/{print $3}' "$status_path" 2>/dev/null)"
+		last_appl="$(awk '/^appl_ptr/{print $3}' "$status_path" 2>/dev/null)"
+		if [ "$last_state" = "RUNNING" ] || [ "${last_hw:-0}" != "0" ]
+		then
+			log_msg "mic-to-host UAC playback active state=${last_state} hw_ptr=${last_hw} appl_ptr=${last_appl}"
+			return 0
+		fi
+		sleep 1
+		i=$((i + 1))
+	done
+	log_msg "mic-to-host UAC playback inactive after ${MIC_STARTUP_GRACE}s state=${last_state} hw_ptr=${last_hw} appl_ptr=${last_appl}"
+	return 1
+}
+
+bridge_loop() {
+	trap 'kill_child_pids; exit 0' INT TERM
+	rm -f "$CHILD_PIDFILE"
+	if [ -e /boot/usb.uac1.mic_always ]
+	then
+		start_mic_to_host
+	else
+		log_msg "mic-to-host idle by default; use mic-start for voice capture"
+	fi
+	if [ -e /boot/usb.uac1.no_speaker ]
+	then
+		log_msg "host-to-speaker disabled by /boot/usb.uac1.no_speaker"
+	elif [ -e /boot/usb.uac1.speaker ]
+	then
+		start_host_to_speaker
+	else
+		log_msg "host-to-speaker idle by default; use speaker-start or /boot/usb.uac1.speaker"
+	fi
+	wait
+}
+
+pidfile_running() {
+	pidfile="$1"
+	if [ ! -f "$pidfile" ]
+	then
+		return 1
+	fi
+	set -- $(cat "$pidfile" 2>/dev/null)
+	if [ -z "$1" ]
+	then
+		return 1
+	fi
+	kill -0 "$1" >/dev/null 2>&1
+}
+
+terminate_pids() {
+	pids="$*"
+	if [ -z "$pids" ]
+	then
+		return 0
+	fi
+	kill $pids >/dev/null 2>&1 || true
+	sleep "$STOP_KILL_WAIT"
+	for pid in $pids
+	do
+		if kill -0 "$pid" >/dev/null 2>&1
+		then
+			kill -9 "$pid" >/dev/null 2>&1 || true
+		fi
+	done
+}
+
+kill_pids_from_file() {
+	pidfile="$1"
+	if [ ! -f "$pidfile" ]
+	then
+		return 0
+	fi
+	pids="$(cat "$pidfile" 2>/dev/null)"
+	terminate_pids $pids
+	rm -f "$pidfile"
+}
+
+acquire_lock_dir() {
+	lock_dir="$1"
+	lock_label="$2"
+	if mkdir "$lock_dir" 2>/dev/null
+	then
+		echo "$$" > "$lock_dir/pid"
+		return 0
+	fi
+	lock_pid="$(cat "$lock_dir/pid" 2>/dev/null)"
+	if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" >/dev/null 2>&1
+	then
+		rm -f "$lock_dir/pid"
+		rmdir "$lock_dir" >/dev/null 2>&1 || true
+		if mkdir "$lock_dir" 2>/dev/null
+		then
+			echo "$$" > "$lock_dir/pid"
+			return 0
+		fi
+	fi
+	log_msg "${lock_label} already in progress"
+	return 1
+}
+
+release_lock_dir() {
+	lock_dir="$1"
+	rm -f "$lock_dir/pid"
+	rmdir "$lock_dir" >/dev/null 2>&1 || true
+}
+
+remember_loop() {
+	echo "$2" > "$1"
+	echo "$2" >> "$CHILD_PIDFILE"
+}
+
+remember_pair() {
+	echo "$2 $3" > "$1"
+}
+
+wait_pair() {
+	first="$1"
+	second="$2"
+	while kill -0 "$first" >/dev/null 2>&1 && kill -0 "$second" >/dev/null 2>&1
+	do
+		sleep 1
+	done
+	terminate_pids "$first" "$second"
+	wait "$first" >/dev/null 2>&1 || true
+	wait "$second" >/dev/null 2>&1 || true
+}
+
+wait_group() {
+	while true
+	do
+		for pid in "$@"
+		do
+			if ! kill -0 "$pid" >/dev/null 2>&1
+			then
+				terminate_pids "$@"
+				wait "$@" >/dev/null 2>&1 || true
+				return 0
+			fi
+		done
+		sleep 1
+	done
+}
+
+start_mic_to_host() {
+	if [ ! -e /boot/usb.uac1 ]
+	then
+		log_msg "/boot/usb.uac1 not present; mic-to-host skip"
+		return 0
+	fi
+	if pidfile_running "$MIC_LOOP_PIDFILE"
+	then
+		log_msg "mic-to-host already running pid=$(cat "$MIC_LOOP_PIDFILE")"
+		return 0
+	fi
+	if ! command -v arecord >/dev/null 2>&1 || ! command -v aplay >/dev/null 2>&1
+	then
+		log_msg "arecord/aplay not found"
+		return 1
+	fi
+	if ! acquire_lock_dir "$MIC_START_LOCK" "mic-to-host start"
+	then
+		return 0
+	fi
+	if pidfile_running "$MIC_LOOP_PIDFILE"
+	then
+		log_msg "mic-to-host already running pid=$(cat "$MIC_LOOP_PIDFILE")"
+		release_lock_dir "$MIC_START_LOCK"
+		return 0
+	fi
+	mic_to_host_loop &
+	remember_loop "$MIC_LOOP_PIDFILE" "$!"
+	log_msg "mic-to-host started pid=$(cat "$MIC_LOOP_PIDFILE") ${MIC_DEV} -> UAC"
+	release_lock_dir "$MIC_START_LOCK"
+}
+
+stop_mic_to_host() {
+	release_lock_dir "$MIC_START_LOCK"
+	kill_pids_from_file "$MIC_LOOP_PIDFILE"
+	kill_pids_from_file "$MIC_CHILD_PIDFILE"
+	rm -f "$MIC_FIFO" "$MIC_PLAY_FIFO"
+	log_msg "mic-to-host stopped"
+}
+
+mic_to_host_filter() {
+	if [ "$MIC_MONO" != "0" ] && [ "$FORMAT" = "S16_LE" ] && [ "$MIC_SRC_CHANNELS" = "2" ] && [ "$MIC_UAC_CHANNELS" = "1" ] && [ -x "$MIC_MONO_TOOL" ]
+	then
+		case "$MIC_MONO_MODE" in
+			left|left-only)
+				exec "$MIC_MONO_TOOL" --left-to-mono
+				;;
+			right|right-only)
+				exec "$MIC_MONO_TOOL" --right-to-mono
+				;;
+			average)
+				exec "$MIC_MONO_TOOL" --average-to-mono
+				;;
+			preserve|preserve-single)
+				exec "$MIC_MONO_TOOL" --preserve-to-mono
+				;;
+			*)
+				exec "$MIC_MONO_TOOL" --left-to-mono
+				;;
+		esac
+	fi
+	if [ "$MIC_MONO" != "0" ] && [ "$FORMAT" = "S16_LE" ] && [ "$MIC_SRC_CHANNELS" = "2" ] && [ "$MIC_UAC_CHANNELS" = "2" ] && [ -x "$MIC_MONO_TOOL" ]
+	then
+		case "$MIC_MONO_MODE" in
+			left|left-only)
+				exec "$MIC_MONO_TOOL" --left-only
+				;;
+			right|right-only)
+				exec "$MIC_MONO_TOOL" --right-only
+				;;
+			average)
+				exec "$MIC_MONO_TOOL" --average
+				;;
+			preserve|preserve-single)
+				exec "$MIC_MONO_TOOL" --preserve-single
+				;;
+			*)
+				exec "$MIC_MONO_TOOL" --left-only
+				;;
+		esac
+	fi
+	if [ "$MIC_SRC_CHANNELS" = "$MIC_UAC_CHANNELS" ]
+	then
+		exec cat
+	fi
+	log_msg "unsupported mic channel conversion src_channels=${MIC_SRC_CHANNELS} uac_channels=${MIC_UAC_CHANNELS} format=${FORMAT}"
+	exit 1
+}
+
+mic_to_host_loop() {
+	trap 'terminate_pids "$rec_pid" "$copy_pid" "$play_pid"; rm -f "$MIC_FIFO" "$MIC_PLAY_FIFO"; exit 0' INT TERM
+	while true
+	do
+		uac_dev="$(wait_uac_pcm)"
+		if [ -z "$uac_dev" ]
+		then
+			log_msg "UAC1_Gadget card not found"
+			sleep "$RETRY_SLEEP"
+			continue
+		fi
+
+		log_msg "mic-to-host ${MIC_DEV} -> ${uac_dev} format=${FORMAT} rate=${RATE} src_channels=${MIC_SRC_CHANNELS} uac_channels=${MIC_UAC_CHANNELS} mono=${MIC_MONO}:${MIC_MONO_MODE}"
+		rm -f "$MIC_FIFO" "$MIC_PLAY_FIFO"
+		mkfifo "$MIC_FIFO" || {
+			log_msg "mkfifo ${MIC_FIFO} failed"
+			sleep "$RETRY_SLEEP"
+			continue
+		}
+		mkfifo "$MIC_PLAY_FIFO" || {
+			log_msg "mkfifo ${MIC_PLAY_FIFO} failed"
+			rm -f "$MIC_FIFO"
+			sleep "$RETRY_SLEEP"
+			continue
+		}
+		arecord -D "$MIC_DEV" -f "$FORMAT" -r "$RATE" -c "$MIC_SRC_CHANNELS" -t raw > "$MIC_FIFO" 2>>"$LOGFILE" &
+		rec_pid="$!"
+		mic_to_host_filter < "$MIC_FIFO" > "$MIC_PLAY_FIFO" &
+		copy_pid="$!"
+			aplay $MIC_UAC_APLAY_OPTS -D "$uac_dev" -f "$FORMAT" -r "$RATE" -c "$MIC_UAC_CHANNELS" -t raw < "$MIC_PLAY_FIFO" 2>>"$LOGFILE" &
+		play_pid="$!"
+		echo "$rec_pid $copy_pid $play_pid" > "$MIC_CHILD_PIDFILE"
+		if ! mic_uac_stream_active "$uac_dev"
+		then
+			terminate_pids "$rec_pid" "$copy_pid" "$play_pid"
+			wait "$rec_pid" >/dev/null 2>&1 || true
+			wait "$copy_pid" >/dev/null 2>&1 || true
+			wait "$play_pid" >/dev/null 2>&1 || true
+			rm -f "$MIC_FIFO" "$MIC_PLAY_FIFO" "$MIC_CHILD_PIDFILE" "$MIC_LOOP_PIDFILE"
+			log_msg "mic-to-host stopped: host did not consume UAC stream"
+			exit 0
+		fi
+		wait_group "$rec_pid" "$copy_pid" "$play_pid"
+		rm -f "$MIC_FIFO" "$MIC_PLAY_FIFO" "$MIC_CHILD_PIDFILE"
+		if [ "$MIC_RETRY_ON_EXIT" = "1" ]
+		then
+			log_msg "mic-to-host exited; retrying"
+			sleep "$RETRY_SLEEP"
+		else
+			rm -f "$MIC_LOOP_PIDFILE"
+			log_msg "mic-to-host exited; stopped"
+			exit 0
+		fi
+	done
+}
+
+start_host_to_speaker() {
+	if [ ! -e /boot/usb.uac1 ]
+	then
+		log_msg "/boot/usb.uac1 not present; host-to-speaker skip"
+		return 0
+	fi
+	if pidfile_running "$SPK_LOOP_PIDFILE"
+	then
+		log_msg "host-to-speaker already running pid=$(cat "$SPK_LOOP_PIDFILE")"
+		return 0
+	fi
+	if ! command -v arecord >/dev/null 2>&1 || ! command -v aplay >/dev/null 2>&1
+	then
+		log_msg "arecord/aplay not found"
+		return 1
+	fi
+	host_to_speaker_loop &
+	remember_loop "$SPK_LOOP_PIDFILE" "$!"
+	log_msg "host-to-speaker started pid=$(cat "$SPK_LOOP_PIDFILE") UAC -> ${SPK_DEV}"
+}
+
+stop_host_to_speaker() {
+	kill_pids_from_file "$SPK_LOOP_PIDFILE"
+	kill_pids_from_file "$SPK_CHILD_PIDFILE"
+	rm -f "$SPK_FIFO" "$SPK_PLAY_FIFO" "$SPK_PREROLL"
+	log_msg "host-to-speaker stopped"
+}
+
+host_to_speaker_filter() {
+	if [ "$SPK_DOWNMIX" != "0" ] && [ "$FORMAT" = "S16_LE" ] && [ "$SPK_CHANNELS" = "2" ] && [ -x "$SPK_DOWNMIX_TOOL" ]
+	then
+		exec "$SPK_DOWNMIX_TOOL" --preserve-single
+	fi
+	exec cat
+}
+
+host_to_speaker_loop() {
+	trap 'terminate_pids "$rec_pid" "$copy_pid" "$play_pid"; rm -f "$SPK_FIFO" "$SPK_PLAY_FIFO" "$SPK_PREROLL"; exit 0' INT TERM
+	while true
+	do
+		uac_dev="$(wait_uac_pcm)"
+		if [ -z "$uac_dev" ]
+		then
+			log_msg "UAC1_Gadget card not found"
+			sleep "$RETRY_SLEEP"
+			continue
+		fi
+
+		log_msg "host-to-speaker waiting ${uac_dev} -> ${SPK_DEV} format=${FORMAT} rate=${RATE} channels=${SPK_CHANNELS}"
+		rm -f "$SPK_FIFO" "$SPK_PLAY_FIFO" "$SPK_PREROLL"
+		mkfifo "$SPK_FIFO" || {
+			log_msg "mkfifo ${SPK_FIFO} failed"
+			sleep "$RETRY_SLEEP"
+			continue
+		}
+		mkfifo "$SPK_PLAY_FIFO" || {
+			log_msg "mkfifo ${SPK_PLAY_FIFO} failed"
+			rm -f "$SPK_FIFO"
+			sleep "$RETRY_SLEEP"
+			continue
+		}
+		arecord -D "$uac_dev" -f "$FORMAT" -r "$RATE" -c "$SPK_CHANNELS" -t raw > "$SPK_FIFO" 2>>"$LOGFILE" &
+		rec_pid="$!"
+		echo "$rec_pid" > "$SPK_CHILD_PIDFILE"
+		if dd bs="$SPK_PREROLL_BYTES" count=1 of="$SPK_PREROLL" < "$SPK_FIFO" >/dev/null 2>>"$LOGFILE" && [ -s "$SPK_PREROLL" ]
+		then
+			log_msg "host-to-speaker active ${uac_dev} -> ${SPK_DEV} downmix=${SPK_DOWNMIX}"
+			(cat "$SPK_PREROLL" "$SPK_FIFO" | host_to_speaker_filter) > "$SPK_PLAY_FIFO" &
+			copy_pid="$!"
+			aplay -D "$SPK_DEV" -f "$FORMAT" -r "$RATE" -c "$SPK_CHANNELS" -t raw < "$SPK_PLAY_FIFO" 2>>"$LOGFILE" &
+			play_pid="$!"
+			echo "$rec_pid $copy_pid $play_pid" > "$SPK_CHILD_PIDFILE"
+			wait_group "$rec_pid" "$copy_pid" "$play_pid"
+		else
+			kill "$rec_pid" >/dev/null 2>&1 || true
+			wait "$rec_pid" >/dev/null 2>&1 || true
+		fi
+		rm -f "$SPK_FIFO" "$SPK_PLAY_FIFO" "$SPK_PREROLL" "$SPK_CHILD_PIDFILE"
+		log_msg "host-to-speaker exited; retrying"
+		sleep "$RETRY_SLEEP"
+	done
+}
+
+kill_child_pids() {
+	kill_pids_from_file "$MIC_LOOP_PIDFILE"
+	kill_pids_from_file "$SPK_LOOP_PIDFILE"
+	kill_pids_from_file "$CHILD_PIDFILE"
+	kill_pids_from_file "$MIC_CHILD_PIDFILE"
+	kill_pids_from_file "$SPK_CHILD_PIDFILE"
+	rm -f "$MIC_FIFO" "$MIC_PLAY_FIFO" "$SPK_FIFO" "$SPK_PLAY_FIFO" "$SPK_PREROLL"
+}
+
+stop_bridge() {
+	if [ -f "$PIDFILE" ]
+	then
+		kill "$(cat "$PIDFILE")" >/dev/null 2>&1 || true
+		rm -f "$PIDFILE"
+	fi
+	kill_child_pids
+	log_msg "stopped"
+}
+
+start_bridge() {
+	mic_mode="idle"
+	speaker_mode="enabled"
+
+	if [ ! -e /boot/usb.uac1 ]
+	then
+		log_msg "/boot/usb.uac1 not present; skip"
+		return 0
+	fi
+	if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" >/dev/null 2>&1
+	then
+		log_msg "already running pid=$(cat "$PIDFILE")"
+		return 0
+	fi
+	if ! command -v arecord >/dev/null 2>&1 || ! command -v aplay >/dev/null 2>&1
+	then
+		log_msg "arecord/aplay not found"
+		return 1
+	fi
+	if [ -e /boot/usb.uac1.mic_always ]
+	then
+		mic_mode="always"
+	fi
+	if [ -e /boot/usb.uac1.no_speaker ]
+	then
+		speaker_mode="disabled"
+	elif [ ! -e /boot/usb.uac1.speaker ]
+	then
+		speaker_mode="idle"
+	fi
+	bridge_loop &
+	echo "$!" > "$PIDFILE"
+	log_msg "started pid=$(cat "$PIDFILE") mic=${mic_mode}(${MIC_DEV},src_ch=${MIC_SRC_CHANNELS},uac_ch=${MIC_UAC_CHANNELS},mono=${MIC_MONO}:${MIC_MONO_MODE}) speaker=${speaker_mode}(${SPK_DEV},ch=${SPK_CHANNELS})"
+}
+
+case "$1" in
+  start)
+	start_bridge
+	;;
+  stop)
+	stop_bridge
+	;;
+  restart)
+	stop_bridge
+	start_bridge
+	;;
+  mic-start)
+	start_mic_to_host
+	;;
+  mic-stop)
+	stop_mic_to_host
+	;;
+  speaker-start)
+	start_host_to_speaker
+	;;
+  speaker-stop)
+	stop_host_to_speaker
+	;;
+  *)
+	echo "Usage: $0 {start|stop|restart|mic-start|mic-stop|speaker-start|speaker-stop}"
+	exit 1
+	;;
+esac
+
+exit 0

@@ -167,6 +167,9 @@ static int i2s_subsys_probe(struct platform_device *pdev)
 	struct clk *i2sclk;
 	const char *clk_id;
 	u32 audio_clk;
+#if defined(CONFIG_SND_SOC_CV1835_CONCURRENT_I2S)
+	u32 sdi_in_sel;
+#endif
 
 	dev = devm_kzalloc(&pdev->dev, sizeof(*dev), GFP_KERNEL);
 	if (!dev)
@@ -218,9 +221,18 @@ static int i2s_subsys_probe(struct platform_device *pdev)
 	writel(0x0000, dev->subsys_base + BCLK_OEN_SEL);
 
 #elif defined(CONFIG_SND_SOC_CV1835_CONCURRENT_I2S)
+	/*
+	 * SG2002 TRM defines i2s_tdm_2_sdi_in_sel[10:8] = 3'b110 as
+	 * IO I2S2_SDI. The default 0x7554 routes I2S2 RX from IO I2S1_SDI,
+	 * which leaves an I2S2 pad capture path filled with zeros.
+	 */
+	sdi_in_sel = 0x7554;
+	if (dev->master_id == 2)
+		sdi_in_sel = (sdi_in_sel & ~0x00000700) | 0x00000600;
+
 	writel(0x7114, dev->subsys_base + SCLK_IN_SEL);
 	writel(0x7114, dev->subsys_base + FS_IN_SEL);
-	writel(0x7554, dev->subsys_base + SDI_IN_SEL);
+	writel(sdi_in_sel, dev->subsys_base + SDI_IN_SEL);
 	writel(0x7664, dev->subsys_base + SDO_OUT_SEL);
 	writel(0x0000, dev->subsys_base + MULTI_SYNC);
 	writel(0x0000, dev->subsys_base + BCLK_OEN_SEL);

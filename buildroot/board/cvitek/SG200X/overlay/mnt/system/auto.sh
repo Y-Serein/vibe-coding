@@ -17,7 +17,7 @@ AIKB_LCD_SPLASH=""
 AIKB_UI_SHELL="/mnt/system/usr/share/aikb/ui/session_shell.argb"
 AIKB_LCD_BOOT_ANIM=""
 AIKB_LCD_WAIT_ANIM=""
-AIKB_LCD_SLEEP_ANIM="/mnt/system/usr/share/aikb/boot/vedio_sleep.akim"
+AIKB_LCD_SLEEP_ANIM="${AIKB_LCD_SLEEP_ANIM:-}"
 AIKB_MIPI_PANEL_DEFAULT="GC9503CV_BOE_QV034"
 AIKB_MIPI_REINIT="${AIKB_MIPI_REINIT:-0}"
 
@@ -154,9 +154,10 @@ start_aikb_hid_input()
    prepare_aikb_lcd_input
 
    HID_DEBUG_ARG=""
-   [ "${AIKB_HID_DEBUG:-1}" = "1" ] && HID_DEBUG_ARG="--debug"
+   [ "${AIKB_HID_DEBUG:-0}" = "1" ] && HID_DEBUG_ARG="--debug"
 
-   "${HID_INPUT}" --hid /dev/hidg0 --screen-out "${AIKB_LCD_INPUT}" --ctrl-out "${AIKB_LCD_CTRL}" --event-out "${AIKB_PET_EVENTS}" --ui-ctrl-in "${AIKB_UI_CTRL}" ${HID_DEBUG_ARG} >> "${HID_LOG}" 2>&1 &
+   HID_POLL_MS="${AIKB_HID_POLL_MS:-10}"
+   "${HID_INPUT}" --hid /dev/hidg0 --screen-out "${AIKB_LCD_INPUT}" --ctrl-out "${AIKB_LCD_CTRL}" --event-out "${AIKB_PET_EVENTS}" --ui-ctrl-in "${AIKB_UI_CTRL}" --poll-ms "${HID_POLL_MS}" ${HID_DEBUG_ARG} >> "${HID_LOG}" 2>&1 &
    HID_PID=$!
    sleep 1
    if kill -0 "${HID_PID}" >/dev/null 2>&1; then
