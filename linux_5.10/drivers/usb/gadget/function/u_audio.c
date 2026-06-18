@@ -69,12 +69,15 @@ static void uac_dbg_log(struct usb_request *req)
 struct uac_req {
 	struct uac_rtd_params *pp; /* parent param */
 	struct usb_request *req;
+	bool queued;
 };
 
 /* Runtime data params for one stream */
 struct uac_rtd_params {
 	struct snd_uac_chip *uac; /* parent chip */
 	bool ep_enabled; /* if the ep is enabled */
+	bool usb_active; /* if host selected the streaming altsetting */
+	bool defer_usb_start; /* keep USB-IN idle until ALSA playback starts */
 
 	struct snd_pcm_substream *ss;
 
@@ -108,6 +111,8 @@ struct snd_uac_chip {
 	unsigned int p_framesize;
 };
 
+static inline void free_ep(struct uac_rtd_params *prm, struct usb_ep *ep);
+
 static const struct snd_pcm_hardware uac_pcm_hardware = {
 	.info = SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_BLOCK_TRANSFER
 		 | SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID
@@ -130,6 +135,9 @@ static void u_audio_iso_complete(struct usb_ep *ep, struct usb_request *req)
 	struct snd_pcm_runtime *runtime;
 	struct uac_rtd_params *prm = ur->pp;
 	struct snd_uac_chip *uac = prm->uac;
+	bool playback = prm == &uac->p_prm;
+
+	ur->queued = false;
 
 	/* i/f shutting down */
 	if (!prm->ep_enabled || req->status == -ESHUTDOWN)
@@ -149,14 +157,19 @@ static void u_audio_iso_complete(struct usb_ep *ep, struct usb_request *req)
 	substream = prm->ss;
 
 	/* Do nothing if ALSA isn't active */
-	if (!substream)
+	if (!substream) {
+		if (playback)
+			return;
 		goto exit;
+	}
 
 	snd_pcm_stream_lock_irqsave(substream, flags2);
 
 	runtime = substream->runtime;
 	if (!runtime || !snd_pcm_running(substream)) {
 		snd_pcm_stream_unlock_irqrestore(substream, flags2);
+		if (playback)
+			return;
 		goto exit;
 	}
 
@@ -224,8 +237,59 @@ static void u_audio_iso_complete(struct usb_ep *ep, struct usb_request *req)
 		snd_pcm_period_elapsed(substream);
 
 exit:
-	if (usb_ep_queue(ep, req, GFP_ATOMIC))
+	if (usb_ep_queue(ep, req, GFP_ATOMIC)) {
 		dev_err(uac->card->dev, "%d Error!\n", __LINE__);
+	} else {
+		ur->queued = true;
+	}
+}
+
+static void u_audio_queue_playback(struct snd_uac_chip *uac)
+{
+	struct g_audio *audio_dev = uac->audio_dev;
+	struct uac_rtd_params *prm = &uac->p_prm;
+	struct uac_params *params = &audio_dev->params;
+	struct usb_ep *ep = audio_dev->in_ep;
+	int i;
+
+	if (!prm->ep_enabled)
+		return;
+
+	for (i = 0; i < params->req_number; i++) {
+		if (!prm->ureq[i].req || prm->ureq[i].queued)
+			continue;
+
+		if (usb_ep_queue(ep, prm->ureq[i].req, GFP_ATOMIC))
+			dev_err(uac->card->dev, "%s:%d Error!\n",
+				__func__, __LINE__);
+		else
+			prm->ureq[i].queued = true;
+	}
+}
+
+static void u_audio_disable_playback_ep(struct snd_uac_chip *uac)
+{
+	free_ep(&uac->p_prm, uac->audio_dev->in_ep);
+}
+
+static void u_audio_playback_close(struct snd_uac_chip *uac,
+				   struct snd_pcm_substream *substream)
+{
+	struct g_audio *audio_dev = uac->audio_dev;
+	struct uac_rtd_params *prm = &uac->p_prm;
+	struct uac_params *params = &audio_dev->params;
+	unsigned long flags;
+
+	spin_lock_irqsave(&prm->lock, flags);
+	if (prm->ss == substream)
+		prm->ss = NULL;
+	spin_unlock_irqrestore(&prm->lock, flags);
+
+	if (prm->defer_usb_start && prm->ep_enabled)
+		u_audio_disable_playback_ep(uac);
+
+	if (prm->rbuf)
+		memset(prm->rbuf, 0, prm->max_psize * params->req_number);
 }
 
 static int uac_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
@@ -265,8 +329,20 @@ static int uac_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 
 	spin_unlock_irqrestore(&prm->lock, flags);
 
+	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK && prm->ss) {
+		if (!prm->ep_enabled && prm->usb_active)
+			err = u_audio_start_playback(audio_dev);
+		else if (prm->ep_enabled)
+			u_audio_queue_playback(uac);
+	}
+
+	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK && !prm->ss &&
+	    prm->defer_usb_start && prm->ep_enabled)
+		u_audio_disable_playback_ep(uac);
+
 	/* Clear buffer after Play stops */
-	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK && !prm->ss)
+	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK && !prm->ss &&
+	    prm->rbuf)
 		memset(prm->rbuf, 0, prm->max_psize * params->req_number);
 
 	return err;
@@ -357,9 +433,29 @@ static int uac_pcm_null(struct snd_pcm_substream *substream)
 	return 0;
 }
 
+static int uac_pcm_close(struct snd_pcm_substream *substream)
+{
+	struct snd_uac_chip *uac = snd_pcm_substream_chip(substream);
+	struct uac_rtd_params *prm;
+	unsigned long flags;
+
+	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+		u_audio_playback_close(uac, substream);
+		return 0;
+	}
+
+	prm = &uac->c_prm;
+	spin_lock_irqsave(&prm->lock, flags);
+	if (prm->ss == substream)
+		prm->ss = NULL;
+	spin_unlock_irqrestore(&prm->lock, flags);
+
+	return 0;
+}
+
 static const struct snd_pcm_ops uac_pcm_ops = {
 	.open = uac_pcm_open,
-	.close = uac_pcm_null,
+	.close = uac_pcm_close,
 	.trigger = uac_pcm_trigger,
 	.pointer = uac_pcm_pointer,
 	.prepare = uac_pcm_null,
@@ -385,6 +481,7 @@ static inline void free_ep(struct uac_rtd_params *prm, struct usb_ep *ep)
 			usb_ep_dequeue(ep, prm->ureq[i].req);
 			usb_ep_free_request(ep, prm->ureq[i].req);
 			prm->ureq[i].req = NULL;
+			prm->ureq[i].queued = false;
 		}
 	}
 
@@ -431,8 +528,11 @@ int u_audio_start_capture(struct g_audio *audio_dev)
 			req->buf = prm->rbuf + i * ep->maxpacket;
 		}
 
-		if (usb_ep_queue(ep, prm->ureq[i].req, GFP_ATOMIC))
+		if (usb_ep_queue(ep, prm->ureq[i].req, GFP_ATOMIC)) {
 			dev_err(dev, "%s:%d Error!\n", __func__, __LINE__);
+		} else {
+			prm->ureq[i].queued = true;
+		}
 	}
 
 	return 0;
@@ -462,6 +562,7 @@ int u_audio_start_playback(struct g_audio *audio_dev)
 
 	ep = audio_dev->in_ep;
 	prm = &uac->p_prm;
+	prm->usb_active = true;
 #if IS_ENABLED(CONFIG_ARCH_CVITEK)
 	usb_ep_disable(ep);
 #endif
@@ -512,18 +613,37 @@ int u_audio_start_playback(struct g_audio *audio_dev)
 			req->buf = prm->rbuf + i * ep->maxpacket;
 		}
 
-		if (usb_ep_queue(ep, prm->ureq[i].req, GFP_ATOMIC))
+		if (usb_ep_queue(ep, prm->ureq[i].req, GFP_ATOMIC)) {
 			dev_err(dev, "%s:%d Error!\n", __func__, __LINE__);
+		} else {
+			prm->ureq[i].queued = true;
+		}
 	}
 
 	return 0;
 }
 EXPORT_SYMBOL_GPL(u_audio_start_playback);
 
+int u_audio_start_playback_deferred(struct g_audio *audio_dev)
+{
+	struct snd_uac_chip *uac = audio_dev->uac;
+	struct uac_rtd_params *prm = &uac->p_prm;
+
+	prm->usb_active = true;
+	prm->defer_usb_start = true;
+
+	if (prm->ss)
+		return u_audio_start_playback(audio_dev);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(u_audio_start_playback_deferred);
+
 void u_audio_stop_playback(struct g_audio *audio_dev)
 {
 	struct snd_uac_chip *uac = audio_dev->uac;
 
+	uac->p_prm.usb_active = false;
 	free_ep(&uac->p_prm, audio_dev->in_ep);
 }
 EXPORT_SYMBOL_GPL(u_audio_stop_playback);

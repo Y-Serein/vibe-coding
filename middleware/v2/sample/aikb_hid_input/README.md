@@ -10,9 +10,11 @@ Inputs are configured as GPIO inputs with software pull-up enabled for the
 current test board. RTC GPIOE inputs keep the existing RTC ioblk pull-up path
 and also program the SDIO1 pad-control addresses from the SG2002 U-Boot
 headers. GPIOA22/A23/A24/A25/A27 use the cv181x EMMC pad-control registers at
-`0x0300191c..0x0300192c`; GPIOA15/SPK_EN uses `0x03001908`. Buttons and the
-encoder switch are active-low. The final hardware can drop these software
-pull-ups once external pulls are present and verified.
+`0x0300191c..0x0300192c`; GPIOA15/SPK_EN uses `0x03001908`. GPIOA30/AUX0 is
+sampled by U-Boot as the boot key before Linux starts, then by this program as
+the encoder switch. Buttons and the encoder switch are active-low. The final
+hardware can drop these software pull-ups once external pulls are present and
+verified.
 
 | Logical input | Board pin | Pad | GPIO bit |
 | --- | --- | --- | --- |
@@ -25,7 +27,7 @@ pull-ups once external pulls are present and verified.
 | key6 | A15 | SPK_EN | GPIOA15 |
 | encoder A | P22 | RTC pad | GPIOE22 |
 | encoder B | P23 | RTC pad | GPIOE23 |
-| encoder E | P21 | RTC pad | GPIOE21 |
+| encoder E | A30 | AUX0 | GPIOA30 |
 
 ## Wire format
 

@@ -206,7 +206,7 @@ static const struct pin_def g_enc_b = {
 };
 
 static const struct pin_def g_enc_e = {
-	"encE_P21", GPIO_BANK_E, 21, 0x030010dcu, 0x05027098u, 0x05027064u
+	"encE_A30", GPIO_BANK_A, 30, 0x03001078u, IOBLK_NONE, IOBLK_NONE
 };
 
 static volatile sig_atomic_t g_stop;
@@ -388,7 +388,10 @@ static int configure_board_inputs(struct mmio_page *pinmux,
 	configure_pin(pinmux, rtc_ioblk, &g_enc_e, debug);
 	mask_e |= BIT_U32(g_enc_a.gpio_bit);
 	mask_e |= BIT_U32(g_enc_b.gpio_bit);
-	mask_e |= BIT_U32(g_enc_e.gpio_bit);
+	if (g_enc_e.bank == GPIO_BANK_E)
+		mask_e |= BIT_U32(g_enc_e.gpio_bit);
+	else
+		mask_a |= BIT_U32(g_enc_e.gpio_bit);
 
 	if (mask_a)
 		configure_gpio_input(gpio_a, GPIOA_BASE, mask_a, "A", debug);

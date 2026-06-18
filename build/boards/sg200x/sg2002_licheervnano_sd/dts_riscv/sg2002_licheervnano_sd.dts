@@ -260,15 +260,11 @@
                 status = "okay";
 	};
 
-        gpio-keys {
-                compatible = "gpio-keys";
-                key-user {
-                        label = "User Key";
-                        linux,code = <KEY_DISPLAYTOGGLE>;
-                        debounce-interval = <1>;
-                        gpios = <&porta 30 1>;
-                };
-        };
+	/*
+	 * GPIOA30/AUX0 is sampled by U-Boot as the boot key, then owned by
+	 * aikb_hid_input as the rotary encoder switch after Linux starts.
+	 * Do not also register it as a kernel gpio-keys input.
+	 */
 
 	leds {
 		compatible = "gpio-leds";

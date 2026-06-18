@@ -80,6 +80,7 @@ void g_audio_cleanup(struct g_audio *g_audio);
 int u_audio_start_capture(struct g_audio *g_audio);
 void u_audio_stop_capture(struct g_audio *g_audio);
 int u_audio_start_playback(struct g_audio *g_audio);
+int u_audio_start_playback_deferred(struct g_audio *g_audio);
 void u_audio_stop_playback(struct g_audio *g_audio);
 
 #endif /* __U_AUDIO_H */

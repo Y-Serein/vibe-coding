@@ -97,6 +97,33 @@ enum app_view {
 	VIEW_SESSION_PICKER,
 };
 
+#define LCD_RENDER_TERMINAL_MS 50u
+#define LCD_RENDER_PET_MS 83u
+#define LCD_RENDER_DEFAULT_MS 1000u
+
+static unsigned lcd_render_interval_ms(enum app_view view)
+{
+	switch (view) {
+	case VIEW_TERMINAL:
+		return LCD_RENDER_TERMINAL_MS;
+	case VIEW_PET:
+		return LCD_RENDER_PET_MS;
+	case VIEW_DASHBOARD:
+	case VIEW_SESSION_PICKER:
+	default:
+		return LCD_RENDER_DEFAULT_MS;
+	}
+}
+
+static bool lcd_view_has_periodic_render(enum app_view view)
+{
+	return view != VIEW_TERMINAL;
+}
+
+#define LCD_POLL_INPUT 0x1u
+#define LCD_POLL_CTRL  0x2u
+#define LCD_POLL_EVENT 0x4u
+
 enum pet_mood {
 	PET_IDLE,
 	PET_ASKING,
@@ -5985,6 +6012,36 @@ static void process_ctrl_fd(int fd, struct font_ctx *font, struct terminal *t,
 	}
 }
 
+static unsigned process_ready_fds(struct pollfd *pfds,
+				  int input_idx, int ctrl_idx, int event_idx,
+				  int input_fd, int ctrl_fd, int event_fd,
+				  struct ui_model *model, struct terminal *term,
+				  struct kitty_graphics *kitty,
+				  struct pet_state *pet, struct font_ctx *font,
+				  enum app_view *view)
+{
+	unsigned handled = 0;
+
+	if (ctrl_idx >= 0 && (pfds[ctrl_idx].revents & POLLIN)) {
+		process_ctrl_fd(ctrl_fd, font, term, view);
+		handled |= LCD_POLL_CTRL;
+	}
+	if (event_idx >= 0 && (pfds[event_idx].revents & POLLIN)) {
+		process_event_fd(event_fd, pet, term, view);
+		handled |= LCD_POLL_EVENT;
+	}
+	if (input_idx >= 0 && (pfds[input_idx].revents & POLLIN)) {
+		process_input_fd(input_fd, model, term, kitty, pet, view);
+		handled |= LCD_POLL_INPUT;
+	}
+	if (term->clear_graphics) {
+		kitty_graphics_clear(kitty);
+		term->clear_graphics = false;
+		handled |= LCD_POLL_INPUT;
+	}
+	return handled;
+}
+
 static void render_terminal_waiting_overlay(struct canvas *c,
 					    const struct ui_model *model)
 {
@@ -6152,6 +6209,8 @@ int main(int argc, char **argv)
 	time_t next_input_retry = 0;
 	time_t next_ctrl_retry = 0;
 	time_t next_event_retry = 0;
+	uint64_t next_render_ms = 0;
+	bool needs_render = true;
 
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--fb") && i + 1 < argc) {
@@ -6388,6 +6447,11 @@ int main(int argc, char **argv)
 		clock_gettime(CLOCK_MONOTONIC, &g_wait_anim.started_at);
 	if (startup_sleep_transition && g_idle_sleep_anim.base)
 		idle_sleep_start_now();
+	if (startup_sleep_frame_displayed) {
+		needs_render = false;
+		next_render_ms = monotonic_now_ms() +
+				 lcd_render_interval_ms(view);
+	}
 
 	while (!g_stop) {
 		struct pollfd pfds[3];
@@ -6395,44 +6459,15 @@ int main(int argc, char **argv)
 		int input_idx = -1;
 		int ctrl_idx = -1;
 		int event_idx = -1;
-		int timeout = (view == VIEW_TERMINAL) ? 1000 : 5000;
+		int timeout = 1000;
 		time_t now;
-
-		idle_sleep_update(view);
-		if (g_boot_anim.active) {
-			long ms = anim_advance(&g_boot_anim);
-			if (!g_boot_anim.active && g_wait_anim.active)
-				clock_gettime(CLOCK_MONOTONIC,
-					      &g_wait_anim.started_at);
-			if (ms > 0 && ms < timeout)
-				timeout = (int)ms;
-		}
-		if (g_wait_anim.active) {
-			long ms = anim_advance(&g_wait_anim);
-			if (ms > 0 && ms < timeout)
-				timeout = (int)ms;
-		}
-		if (g_idle_sleep_active && g_idle_sleep_anim.active) {
-			long ms = anim_advance(&g_idle_sleep_anim);
-			if (ms > 0 && ms < timeout)
-				timeout = (int)ms;
-		}
-
-		if (view == VIEW_PET && timeout > 83)
-			timeout = 83;
-
-		if (startup_sleep_frame_displayed) {
-			startup_sleep_frame_displayed = false;
-		} else {
-			render_frame(&c, view, &model, &term, &font, kitty,
-				     &pet);
-			fb_blit(&fb, &c);
-		}
-		if (once) {
-			if (once_hold_ms > 0)
-				usleep((useconds_t)once_hold_ms * 1000);
-			break;
-		}
+		uint64_t now_ms;
+		unsigned handled = 0;
+		unsigned interval_ms;
+		bool periodic_render;
+		bool anim_active = false;
+		bool render_due;
+		bool was_idle_sleep_active;
 
 		now = time(NULL);
 		if (input_fd < 0 && input_path && now >= next_input_retry) {
@@ -6470,23 +6505,97 @@ int main(int argc, char **argv)
 			nfds++;
 		}
 
+		if (nfds > 0 && poll(pfds, nfds, 0) > 0) {
+			handled = process_ready_fds(pfds, input_idx, ctrl_idx,
+						    event_idx, input_fd,
+						    ctrl_fd, event_fd, &model,
+						    &term, kitty, &pet, &font,
+						    &view);
+			if (handled) {
+				needs_render = true;
+				if (handled & (LCD_POLL_CTRL | LCD_POLL_EVENT))
+					next_render_ms = 0;
+			}
+		}
+
+		was_idle_sleep_active = g_idle_sleep_active;
+		idle_sleep_update(view);
+		if (g_idle_sleep_active != was_idle_sleep_active) {
+			needs_render = true;
+			next_render_ms = 0;
+		}
+		if (g_boot_anim.active) {
+			long ms = anim_advance(&g_boot_anim);
+			anim_active = true;
+			if (!g_boot_anim.active && g_wait_anim.active)
+				clock_gettime(CLOCK_MONOTONIC,
+					      &g_wait_anim.started_at);
+			if (!g_boot_anim.active) {
+				needs_render = true;
+				next_render_ms = 0;
+			}
+			if (ms > 0 && ms < timeout)
+				timeout = (int)ms;
+		}
+		if (g_wait_anim.active) {
+			long ms = anim_advance(&g_wait_anim);
+			anim_active = true;
+			if (ms > 0 && ms < timeout)
+				timeout = (int)ms;
+		}
+		if (g_idle_sleep_active && g_idle_sleep_anim.active) {
+			long ms = anim_advance(&g_idle_sleep_anim);
+			anim_active = true;
+			if (ms > 0 && ms < timeout)
+				timeout = (int)ms;
+		}
+
+		if (startup_sleep_frame_displayed)
+			startup_sleep_frame_displayed = false;
+
+		now_ms = monotonic_now_ms();
+		interval_ms = lcd_render_interval_ms(view);
+		periodic_render = lcd_view_has_periodic_render(view) ||
+				  anim_active || g_show_splash;
+		render_due = (next_render_ms == 0 || now_ms >= next_render_ms);
+		if ((needs_render && render_due) ||
+		    (periodic_render && render_due)) {
+			render_frame(&c, view, &model, &term, &font, kitty,
+				     &pet);
+			fb_blit(&fb, &c);
+			needs_render = false;
+			next_render_ms = monotonic_now_ms() + interval_ms;
+		}
+		if (once) {
+			if (once_hold_ms > 0)
+				usleep((useconds_t)once_hold_ms * 1000);
+			break;
+		}
+
+		now_ms = monotonic_now_ms();
+		if (needs_render || periodic_render) {
+			if (next_render_ms <= now_ms)
+				timeout = 0;
+			else if (next_render_ms - now_ms < (uint64_t)timeout)
+				timeout = (int)(next_render_ms - now_ms);
+		}
 		if (nfds == 0) {
+			if (timeout <= 0)
+				timeout = 1;
 			usleep((useconds_t)timeout * 1000);
 			continue;
 		}
 
 		if (poll(pfds, nfds, timeout) <= 0)
 			continue;
-		if (ctrl_idx >= 0 && (pfds[ctrl_idx].revents & POLLIN))
-			process_ctrl_fd(ctrl_fd, &font, &term, &view);
-		if (input_idx >= 0 && (pfds[input_idx].revents & POLLIN))
-			process_input_fd(input_fd, &model, &term, kitty, &pet,
-					 &view);
-		if (event_idx >= 0 && (pfds[event_idx].revents & POLLIN))
-			process_event_fd(event_fd, &pet, &term, &view);
-		if (term.clear_graphics) {
-			kitty_graphics_clear(kitty);
-			term.clear_graphics = false;
+		handled = process_ready_fds(pfds, input_idx, ctrl_idx,
+					    event_idx, input_fd, ctrl_fd,
+					    event_fd, &model, &term, kitty,
+					    &pet, &font, &view);
+		if (handled) {
+			needs_render = true;
+			if (handled & (LCD_POLL_CTRL | LCD_POLL_EVENT))
+				next_render_ms = 0;
 		}
 	}
 

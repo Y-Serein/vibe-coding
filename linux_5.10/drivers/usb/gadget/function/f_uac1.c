@@ -570,7 +570,7 @@ static int f_audio_set_alt(struct usb_function *f, unsigned intf, unsigned alt)
 		uac1->as_in_alt = alt;
 
 		if (alt)
-			ret = u_audio_start_playback(&uac1->g_audio);
+			ret = u_audio_start_playback_deferred(&uac1->g_audio);
 		else
 			u_audio_stop_playback(&uac1->g_audio);
 	} else {

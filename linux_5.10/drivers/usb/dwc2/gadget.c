@@ -1383,6 +1383,8 @@ static int dwc2_gadget_set_ep0_desc_chain(struct dwc2_hsotg *hsotg,
 	return 0;
 }
 
+static void dwc2_gadget_update_isoc_in_nak_irq(struct dwc2_hsotg *hsotg);
+
 static int dwc2_hsotg_ep_queue(struct usb_ep *ep, struct usb_request *req,
 			       gfp_t gfp_flags)
 {
@@ -1455,6 +1457,8 @@ static int dwc2_hsotg_ep_queue(struct usb_ep *ep, struct usb_request *req,
 
 	first = list_empty(&hs_ep->queue);
 	list_add_tail(&hs_req->queue, &hs_ep->queue);
+	if (hs_ep->dir_in && hs_ep->isochronous)
+		dwc2_gadget_update_isoc_in_nak_irq(hs);
 
 	/*
 	 * Handle DDMA isochronous transfers separately - just add new entry
@@ -1715,6 +1719,32 @@ static struct dwc2_hsotg_req *get_ep_head(struct dwc2_hsotg_ep *hs_ep)
 					queue);
 }
 
+static bool dwc2_gadget_has_isoc_in_reqs(struct dwc2_hsotg *hsotg)
+{
+	struct dwc2_hsotg_ep *ep;
+	int i;
+
+	for (i = 1; i < hsotg->num_of_eps; i++) {
+		ep = hsotg->eps_in[i];
+		if (ep && ep->isochronous && !list_empty(&ep->queue))
+			return true;
+	}
+
+	return false;
+}
+
+static void dwc2_gadget_update_isoc_in_nak_irq(struct dwc2_hsotg *hsotg)
+{
+	u32 mask = dwc2_readl(hsotg, DIEPMSK);
+
+	if (dwc2_gadget_has_isoc_in_reqs(hsotg))
+		mask |= DIEPMSK_NAKMSK;
+	else
+		mask &= ~DIEPMSK_NAKMSK;
+
+	dwc2_writel(hsotg, mask, DIEPMSK);
+}
+
 /**
  * dwc2_gadget_start_next_request - Starts next request from ep queue
  * @hs_ep: Endpoint structure
@@ -1742,6 +1772,7 @@ static void dwc2_gadget_start_next_request(struct dwc2_hsotg_ep *hs_ep)
 	if (dir_in) {
 		dev_dbg(hsotg->dev, "%s: No more ISOC-IN requests\n",
 			__func__);
+		dwc2_gadget_update_isoc_in_nak_irq(hsotg);
 	} else {
 		dev_dbg(hsotg->dev, "%s: No more ISOC-OUT requests\n",
 			__func__);
@@ -3279,6 +3310,8 @@ static void kill_all_requests(struct dwc2_hsotg *hsotg,
 
 		dwc2_hsotg_complete_request(hsotg, ep, req, result);
 	}
+	if (ep->dir_in && ep->isochronous)
+		dwc2_gadget_update_isoc_in_nak_irq(hsotg);
 
 	if (!hsotg->dedicated_fifos)
 		return;
@@ -4079,9 +4112,6 @@ static int dwc2_hsotg_ep_enable(struct usb_ep *ep,
 		hs_ep->compl_desc = 0;
 		if (dir_in) {
 			hs_ep->periodic = 1;
-			mask = dwc2_readl(hsotg, DIEPMSK);
-			mask |= DIEPMSK_NAKMSK;
-			dwc2_writel(hsotg, mask, DIEPMSK);
 		} else {
 			mask = dwc2_readl(hsotg, DOEPMSK);
 			mask |= DOEPMSK_OUTTKNEPDISMSK;
@@ -4301,6 +4331,8 @@ static int dwc2_hsotg_ep_dequeue(struct usb_ep *ep, struct usb_request *req)
 		dwc2_hsotg_ep_stop_xfr(hs, hs_ep);
 
 	dwc2_hsotg_complete_request(hs, hs_ep, hs_req, -ECONNRESET);
+	if (hs_ep->dir_in && hs_ep->isochronous)
+		dwc2_gadget_update_isoc_in_nak_irq(hs);
 	spin_unlock_irqrestore(&hs->lock, flags);
 
 	return 0;
