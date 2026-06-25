@@ -20,10 +20,13 @@ SPK_DEV="${AIKB_USB_SPK_DST:-hw:2,0}"
 PCM_DUAL_MONO_TOOL="${AIKB_PCM_DUAL_MONO_TOOL:-/mnt/system/usr/bin/aikb_pcm_dual_mono}"
 MIC_MONO_TOOL="${AIKB_USB_MIC_MONO_TOOL:-$PCM_DUAL_MONO_TOOL}"
 MIC_MONO="${AIKB_USB_MIC_MONO:-1}"
-MIC_MONO_MODE="${AIKB_USB_MIC_MONO_MODE:-left-only}"
+MIC_MONO_MODE="${AIKB_USB_MIC_MONO_MODE:-cardioid-agc}"
 SPK_DOWNMIX_TOOL="${AIKB_USB_SPK_DOWNMIX_TOOL:-$PCM_DUAL_MONO_TOOL}"
 SPK_DOWNMIX="${AIKB_USB_SPK_DOWNMIX:-1}"
-FORMAT="${AIKB_USB_MIC_FORMAT:-S16_LE}"
+MIC_SRC_FORMAT="${AIKB_USB_MIC_SRC_FORMAT:-${AIKB_USB_MIC_FORMAT:-S32_LE}}"
+MIC_UAC_FORMAT="${AIKB_USB_MIC_UAC_FORMAT:-${AIKB_USB_MIC_FORMAT:-S16_LE}}"
+MIC_S32_SHIFT="${AIKB_USB_MIC_S32_SHIFT:-13}"
+SPK_FORMAT="${AIKB_USB_SPK_FORMAT:-S16_LE}"
 UAC_FUNC="${AIKB_USB_UAC_FUNC:-/sys/kernel/config/usb_gadget/g0/functions/uac1.mic}"
 uac_value_or_default() {
 	if [ -r "${UAC_FUNC}/$1" ]
@@ -304,9 +307,24 @@ stop_mic_to_host() {
 }
 
 mic_to_host_filter() {
-	if [ "$MIC_MONO" != "0" ] && [ "$FORMAT" = "S16_LE" ] && [ "$MIC_SRC_CHANNELS" = "2" ] && [ "$MIC_UAC_CHANNELS" = "1" ] && [ -x "$MIC_MONO_TOOL" ]
+	if [ "$MIC_MONO" != "0" ] && [ "$MIC_SRC_FORMAT" = "S16_LE" ] && [ "$MIC_UAC_FORMAT" = "S16_LE" ] && [ "$MIC_SRC_CHANNELS" = "2" ] && [ "$MIC_UAC_CHANNELS" = "1" ] && [ -x "$MIC_MONO_TOOL" ]
 	then
 		case "$MIC_MONO_MODE" in
+			left-agc)
+				exec "$MIC_MONO_TOOL" --left-agc-to-mono
+				;;
+			right-agc)
+				exec "$MIC_MONO_TOOL" --right-agc-to-mono
+				;;
+			average-agc)
+				exec "$MIC_MONO_TOOL" --average-agc-to-mono
+				;;
+			dual-ns|delaysum-agc|delay-sum-agc)
+				exec "$MIC_MONO_TOOL" --dual-ns-to-mono
+				;;
+			cardioid-agc)
+				exec "$MIC_MONO_TOOL" --cardioid-agc-to-mono
+				;;
 			left|left-only)
 				exec "$MIC_MONO_TOOL" --left-to-mono
 				;;
@@ -324,9 +342,24 @@ mic_to_host_filter() {
 				;;
 		esac
 	fi
-	if [ "$MIC_MONO" != "0" ] && [ "$FORMAT" = "S16_LE" ] && [ "$MIC_SRC_CHANNELS" = "2" ] && [ "$MIC_UAC_CHANNELS" = "2" ] && [ -x "$MIC_MONO_TOOL" ]
+	if [ "$MIC_MONO" != "0" ] && [ "$MIC_SRC_FORMAT" = "S16_LE" ] && [ "$MIC_UAC_FORMAT" = "S16_LE" ] && [ "$MIC_SRC_CHANNELS" = "2" ] && [ "$MIC_UAC_CHANNELS" = "2" ] && [ -x "$MIC_MONO_TOOL" ]
 	then
 		case "$MIC_MONO_MODE" in
+			left-agc)
+				exec "$MIC_MONO_TOOL" --left-agc
+				;;
+			right-agc)
+				exec "$MIC_MONO_TOOL" --right-agc
+				;;
+			average-agc)
+				exec "$MIC_MONO_TOOL" --average-agc
+				;;
+			dual-ns|delaysum-agc|delay-sum-agc)
+				exec "$MIC_MONO_TOOL" --dual-ns
+				;;
+			cardioid-agc)
+				exec "$MIC_MONO_TOOL" --cardioid-agc
+				;;
 			left|left-only)
 				exec "$MIC_MONO_TOOL" --left-only
 				;;
@@ -344,11 +377,81 @@ mic_to_host_filter() {
 				;;
 		esac
 	fi
-	if [ "$MIC_SRC_CHANNELS" = "$MIC_UAC_CHANNELS" ]
+	if [ "$MIC_MONO" != "0" ] && [ "$MIC_SRC_FORMAT" = "S32_LE" ] && [ "$MIC_UAC_FORMAT" = "S16_LE" ] && [ "$MIC_SRC_CHANNELS" = "2" ] && [ "$MIC_UAC_CHANNELS" = "1" ] && [ -x "$MIC_MONO_TOOL" ]
+	then
+		case "$MIC_MONO_MODE" in
+			left-agc)
+				AIKB_PCM_S32_SHIFT="$MIC_S32_SHIFT" exec "$MIC_MONO_TOOL" --s32-left-agc-to-mono
+				;;
+			right-agc)
+				AIKB_PCM_S32_SHIFT="$MIC_S32_SHIFT" exec "$MIC_MONO_TOOL" --s32-right-agc-to-mono
+				;;
+			average-agc)
+				AIKB_PCM_S32_SHIFT="$MIC_S32_SHIFT" exec "$MIC_MONO_TOOL" --s32-average-agc-to-mono
+				;;
+			dual-ns|delaysum-agc|delay-sum-agc)
+				AIKB_PCM_S32_SHIFT="$MIC_S32_SHIFT" exec "$MIC_MONO_TOOL" --s32-dual-ns-to-mono
+				;;
+			cardioid-agc)
+				AIKB_PCM_S32_SHIFT="$MIC_S32_SHIFT" exec "$MIC_MONO_TOOL" --s32-cardioid-agc-to-mono
+				;;
+			left|left-only)
+				AIKB_PCM_S32_SHIFT="$MIC_S32_SHIFT" exec "$MIC_MONO_TOOL" --s32-left-to-mono
+				;;
+			right|right-only)
+				AIKB_PCM_S32_SHIFT="$MIC_S32_SHIFT" exec "$MIC_MONO_TOOL" --s32-right-to-mono
+				;;
+			average)
+				AIKB_PCM_S32_SHIFT="$MIC_S32_SHIFT" exec "$MIC_MONO_TOOL" --s32-average-to-mono
+				;;
+			preserve|preserve-single)
+				AIKB_PCM_S32_SHIFT="$MIC_S32_SHIFT" exec "$MIC_MONO_TOOL" --s32-preserve-to-mono
+				;;
+			*)
+				AIKB_PCM_S32_SHIFT="$MIC_S32_SHIFT" exec "$MIC_MONO_TOOL" --s32-left-to-mono
+				;;
+		esac
+	fi
+	if [ "$MIC_MONO" != "0" ] && [ "$MIC_SRC_FORMAT" = "S32_LE" ] && [ "$MIC_UAC_FORMAT" = "S16_LE" ] && [ "$MIC_SRC_CHANNELS" = "2" ] && [ "$MIC_UAC_CHANNELS" = "2" ] && [ -x "$MIC_MONO_TOOL" ]
+	then
+		case "$MIC_MONO_MODE" in
+			left-agc)
+				AIKB_PCM_S32_SHIFT="$MIC_S32_SHIFT" exec "$MIC_MONO_TOOL" --s32-left-agc
+				;;
+			right-agc)
+				AIKB_PCM_S32_SHIFT="$MIC_S32_SHIFT" exec "$MIC_MONO_TOOL" --s32-right-agc
+				;;
+			average-agc)
+				AIKB_PCM_S32_SHIFT="$MIC_S32_SHIFT" exec "$MIC_MONO_TOOL" --s32-average-agc
+				;;
+			dual-ns|delaysum-agc|delay-sum-agc)
+				AIKB_PCM_S32_SHIFT="$MIC_S32_SHIFT" exec "$MIC_MONO_TOOL" --s32-dual-ns
+				;;
+			cardioid-agc)
+				AIKB_PCM_S32_SHIFT="$MIC_S32_SHIFT" exec "$MIC_MONO_TOOL" --s32-cardioid-agc
+				;;
+			left|left-only)
+				AIKB_PCM_S32_SHIFT="$MIC_S32_SHIFT" exec "$MIC_MONO_TOOL" --s32-left-only
+				;;
+			right|right-only)
+				AIKB_PCM_S32_SHIFT="$MIC_S32_SHIFT" exec "$MIC_MONO_TOOL" --s32-right-only
+				;;
+			average)
+				AIKB_PCM_S32_SHIFT="$MIC_S32_SHIFT" exec "$MIC_MONO_TOOL" --s32-average
+				;;
+			preserve|preserve-single)
+				AIKB_PCM_S32_SHIFT="$MIC_S32_SHIFT" exec "$MIC_MONO_TOOL" --s32-preserve-single
+				;;
+			*)
+				AIKB_PCM_S32_SHIFT="$MIC_S32_SHIFT" exec "$MIC_MONO_TOOL" --s32-left-only
+				;;
+		esac
+	fi
+	if [ "$MIC_SRC_FORMAT" = "$MIC_UAC_FORMAT" ] && [ "$MIC_SRC_CHANNELS" = "$MIC_UAC_CHANNELS" ]
 	then
 		exec cat
 	fi
-	log_msg "unsupported mic channel conversion src_channels=${MIC_SRC_CHANNELS} uac_channels=${MIC_UAC_CHANNELS} format=${FORMAT}"
+	log_msg "unsupported mic channel conversion src_channels=${MIC_SRC_CHANNELS} uac_channels=${MIC_UAC_CHANNELS} src_format=${MIC_SRC_FORMAT} uac_format=${MIC_UAC_FORMAT}"
 	exit 1
 }
 
@@ -364,7 +467,7 @@ mic_to_host_loop() {
 			continue
 		fi
 
-		log_msg "mic-to-host ${MIC_DEV} -> ${uac_dev} format=${FORMAT} rate=${MIC_RATE} src_channels=${MIC_SRC_CHANNELS} uac_channels=${MIC_UAC_CHANNELS} mono=${MIC_MONO}:${MIC_MONO_MODE}"
+		log_msg "mic-to-host ${MIC_DEV} -> ${uac_dev} src_format=${MIC_SRC_FORMAT} uac_format=${MIC_UAC_FORMAT} rate=${MIC_RATE} src_channels=${MIC_SRC_CHANNELS} uac_channels=${MIC_UAC_CHANNELS} mono=${MIC_MONO}:${MIC_MONO_MODE} s32_shift=${MIC_S32_SHIFT}"
 		rm -f "$MIC_FIFO" "$MIC_PLAY_FIFO"
 		mkfifo "$MIC_FIFO" || {
 			log_msg "mkfifo ${MIC_FIFO} failed"
@@ -377,11 +480,11 @@ mic_to_host_loop() {
 			sleep "$RETRY_SLEEP"
 			continue
 		}
-		arecord -D "$MIC_DEV" -f "$FORMAT" -r "$MIC_RATE" -c "$MIC_SRC_CHANNELS" -t raw > "$MIC_FIFO" 2>>"$LOGFILE" &
+		arecord -D "$MIC_DEV" -f "$MIC_SRC_FORMAT" -r "$MIC_RATE" -c "$MIC_SRC_CHANNELS" -t raw > "$MIC_FIFO" 2>>"$LOGFILE" &
 		rec_pid="$!"
 		mic_to_host_filter < "$MIC_FIFO" > "$MIC_PLAY_FIFO" &
 		copy_pid="$!"
-			aplay $MIC_UAC_APLAY_OPTS -D "$uac_dev" -f "$FORMAT" -r "$MIC_RATE" -c "$MIC_UAC_CHANNELS" -t raw < "$MIC_PLAY_FIFO" 2>>"$LOGFILE" &
+			aplay $MIC_UAC_APLAY_OPTS -D "$uac_dev" -f "$MIC_UAC_FORMAT" -r "$MIC_RATE" -c "$MIC_UAC_CHANNELS" -t raw < "$MIC_PLAY_FIFO" 2>>"$LOGFILE" &
 		play_pid="$!"
 		echo "$rec_pid $copy_pid $play_pid" > "$MIC_CHILD_PIDFILE"
 		if ! mic_uac_stream_active "$uac_dev"
@@ -437,7 +540,7 @@ stop_host_to_speaker() {
 }
 
 host_to_speaker_filter() {
-	if [ "$SPK_DOWNMIX" != "0" ] && [ "$FORMAT" = "S16_LE" ] && [ "$SPK_CHANNELS" = "2" ] && [ -x "$SPK_DOWNMIX_TOOL" ]
+	if [ "$SPK_DOWNMIX" != "0" ] && [ "$SPK_FORMAT" = "S16_LE" ] && [ "$SPK_CHANNELS" = "2" ] && [ -x "$SPK_DOWNMIX_TOOL" ]
 	then
 		exec "$SPK_DOWNMIX_TOOL" --preserve-single
 	fi
@@ -456,7 +559,7 @@ host_to_speaker_loop() {
 			continue
 		fi
 
-		log_msg "host-to-speaker waiting ${uac_dev} -> ${SPK_DEV} format=${FORMAT} rate=${SPK_RATE} channels=${SPK_CHANNELS}"
+		log_msg "host-to-speaker waiting ${uac_dev} -> ${SPK_DEV} format=${SPK_FORMAT} rate=${SPK_RATE} channels=${SPK_CHANNELS}"
 		rm -f "$SPK_FIFO" "$SPK_PLAY_FIFO" "$SPK_PREROLL"
 		mkfifo "$SPK_FIFO" || {
 			log_msg "mkfifo ${SPK_FIFO} failed"
@@ -469,7 +572,7 @@ host_to_speaker_loop() {
 			sleep "$RETRY_SLEEP"
 			continue
 		}
-		arecord -D "$uac_dev" -f "$FORMAT" -r "$SPK_RATE" -c "$SPK_CHANNELS" -t raw > "$SPK_FIFO" 2>>"$LOGFILE" &
+		arecord -D "$uac_dev" -f "$SPK_FORMAT" -r "$SPK_RATE" -c "$SPK_CHANNELS" -t raw > "$SPK_FIFO" 2>>"$LOGFILE" &
 		rec_pid="$!"
 		echo "$rec_pid" > "$SPK_CHILD_PIDFILE"
 		if dd bs="$SPK_PREROLL_BYTES" count=1 of="$SPK_PREROLL" < "$SPK_FIFO" >/dev/null 2>>"$LOGFILE" && [ -s "$SPK_PREROLL" ]
@@ -477,7 +580,7 @@ host_to_speaker_loop() {
 			log_msg "host-to-speaker active ${uac_dev} -> ${SPK_DEV} downmix=${SPK_DOWNMIX}"
 			(cat "$SPK_PREROLL" "$SPK_FIFO" | host_to_speaker_filter) > "$SPK_PLAY_FIFO" &
 			copy_pid="$!"
-			aplay -D "$SPK_DEV" -f "$FORMAT" -r "$SPK_RATE" -c "$SPK_CHANNELS" -t raw < "$SPK_PLAY_FIFO" 2>>"$LOGFILE" &
+			aplay -D "$SPK_DEV" -f "$SPK_FORMAT" -r "$SPK_RATE" -c "$SPK_CHANNELS" -t raw < "$SPK_PLAY_FIFO" 2>>"$LOGFILE" &
 			play_pid="$!"
 			echo "$rec_pid $copy_pid $play_pid" > "$SPK_CHILD_PIDFILE"
 			wait_group "$rec_pid" "$copy_pid" "$play_pid"
