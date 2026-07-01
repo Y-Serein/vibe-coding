@@ -5,34 +5,70 @@
 DEV="${AIKB_NOTIFY_AUDIO_DEV:-hw:2,0}"
 RATE="${AIKB_NOTIFY_RATE:-48000}"
 CHANNELS="${AIKB_NOTIFY_CHANNELS:-2}"
+SOUND_DIR="${AIKB_NOTIFY_SOUND_DIR:-/mnt/system/usr/share/aikb/sounds}"
+ENABLE="${AIKB_NOTIFY_ENABLE:-1}"
+VOLUME="${AIKB_NOTIFY_VOLUME:-100}"
 KIND="${1:-done}"
+
+if [ "$ENABLE" = "0" ] || [ "$ENABLE" = "false" ]
+then
+	exit 0
+fi
 
 case "$KIND" in
   done|ok)
+	NAME="done"
 	FREQ="${AIKB_NOTIFY_FREQ:-880}"
 	MS="${AIKB_NOTIFY_MS:-160}"
-	AMP="${AIKB_NOTIFY_AMP:-4500}"
+	AMP="${AIKB_NOTIFY_AMP:-2400}"
+	;;
+  pending|wait|permission|request)
+	NAME="pending"
+	FREQ="${AIKB_NOTIFY_FREQ:-660}"
+	MS="${AIKB_NOTIFY_MS:-140}"
+	AMP="${AIKB_NOTIFY_AMP:-2000}"
 	;;
   error|fail)
+	NAME="error"
 	FREQ="${AIKB_NOTIFY_FREQ:-440}"
 	MS="${AIKB_NOTIFY_MS:-240}"
-	AMP="${AIKB_NOTIFY_AMP:-5000}"
+	AMP="${AIKB_NOTIFY_AMP:-2600}"
 	;;
   *)
+	NAME="pending"
 	FREQ="${AIKB_NOTIFY_FREQ:-660}"
 	MS="${AIKB_NOTIFY_MS:-160}"
-	AMP="${AIKB_NOTIFY_AMP:-4200}"
+	AMP="${AIKB_NOTIFY_AMP:-2000}"
 	;;
 esac
 
-if ! command -v awk >/dev/null 2>&1 || ! command -v aplay >/dev/null 2>&1
+if ! command -v aplay >/dev/null 2>&1
 then
 	exit 1
 fi
 
-awk -v rate="$RATE" -v freq="$FREQ" -v ms="$MS" -v amp="$AMP" -v channels="$CHANNELS" '
+SOUND_FILE="${AIKB_NOTIFY_FILE:-${SOUND_DIR}/${NAME}.wav}"
+if [ -r "$SOUND_FILE" ]
+then
+	aplay -q -D "$DEV" "$SOUND_FILE"
+	exit $?
+fi
+
+if ! command -v awk >/dev/null 2>&1
+then
+	exit 1
+fi
+
+awk -v rate="$RATE" -v freq="$FREQ" -v ms="$MS" -v amp="$AMP" -v channels="$CHANNELS" -v volume="$VOLUME" '
 BEGIN {
 	pi = atan2(0, -1)
+	if (volume < 0) {
+		volume = 0
+	}
+	if (volume > 100) {
+		volume = 100
+	}
+	amp = int(amp * volume / 100)
 	samples = int(rate * ms / 1000)
 	fade = int(rate * 12 / 1000)
 	if (fade < 1) {

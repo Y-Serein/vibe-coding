@@ -140,18 +140,6 @@ then
 			ln -s functions/ncm.usb0 configs/c.1/
 		fi
 
-		# keyboard
-		if [ -e /boot/usb.keyboard ]
-		then
-			mkdir functions/hid.GS0
-			# echo 1 > functions/hid.GS0/subclass
-			echo 1 > functions/hid.GS0/wakeup_on_write
-			echo 1 > functions/hid.GS0/protocol
-			echo 6 > functions/hid.GS0/report_length
-			echo -ne \\x05\\x01\\x09\\x06\\xa1\\x01\\x05\\x07\\x19\\xe0\\x29\\xe7\\x15\\x00\\x25\\x01\\x75\\x01\\x95\\x08\\x81\\x02\\x95\\x01\\x75\\x08\\x81\\x03\\x95\\x05\\x75\\x01\\x05\\x08\\x19\\x01\\x29\\x05\\x91\\x02\\x95\\x01\\x75\\x03\\x91\\x03\\x95\\x06\\x75\\x08\\x15\\x00\\x25\\x65\\x05\\x07\\x19\\x00\\x29\\x65\\x81\\x00\\xc0 > functions/hid.GS0/report_desc
-			ln -s functions/hid.GS0 configs/c.1
-		fi
-
 		# AIKB vendor terminal/control HID. This is intentionally not a
 		# keyboard-class HID, so the host should open it through hidraw.
 		if [ -e /boot/usb.aikb_hid ]
@@ -166,6 +154,22 @@ then
 			printf '\x06\x60\xff\x09\x01\xa1\x01\x85\x10\x15\x00\x25\x01\x75\x01\x95\x08\x09\x10\x81\x02\x15\x81\x25\x7f\x75\x08\x95\x01\x09\x11\x81\x02\x15\x00\x25\x00\x75\x08\x95\x3d\x81\x03\x85\x20\x15\x00\x26\xff\x00\x75\x08\x95\x3f\x09\x20\x91\x02\x85\x21\x15\x00\x26\xff\x00\x75\x08\x95\x02\x09\x21\x81\x02\x75\x08\x95\x3d\x81\x03\x85\x30\x15\x00\x26\xff\x00\x75\x08\x95\x3f\x09\x30\xb1\x02\xc0' > functions/hid.aikb/report_desc
 			rm -rf configs/c.1/hid.aikb
 			ln -s functions/hid.aikb configs/c.1/
+		fi
+
+		# Standard boot keyboard HID. Keep this after hid.aikb so the
+		# existing vendor channel remains /dev/hidg0 and keyboard is hidg1.
+		if [ -e /boot/usb.keyboard ]
+		then
+			mkdir -p functions/hid.kbd
+			echo 1 > functions/hid.kbd/subclass
+			echo 1 > functions/hid.kbd/protocol
+			if [ -e functions/hid.kbd/wakeup_on_write ]; then
+				echo 1 > functions/hid.kbd/wakeup_on_write
+			fi
+			echo 8 > functions/hid.kbd/report_length
+			printf '\x05\x01\x09\x06\xa1\x01\x05\x07\x19\xe0\x29\xe7\x15\x00\x25\x01\x75\x01\x95\x08\x81\x02\x95\x01\x75\x08\x81\x03\x95\x05\x75\x01\x05\x08\x19\x01\x29\x05\x91\x02\x95\x01\x75\x03\x91\x03\x95\x06\x75\x08\x15\x00\x25\x65\x05\x07\x19\x00\x29\x65\x81\x00\xc0' > functions/hid.kbd/report_desc
+			rm -rf configs/c.1/hid.kbd
+			ln -s functions/hid.kbd configs/c.1/
 		fi
 
 		# AIKB USB Audio Class 1. Default to mic-only: Windows can see
@@ -293,6 +297,18 @@ then
 	then
 		unlink /sys/kernel/config/usb_gadget/g0/configs/c.1/uac1.mic
 		rmdir /sys/kernel/config/usb_gadget/g0/functions/uac1.mic
+	fi
+
+	# hid
+	if [ -e /sys/kernel/config/usb_gadget/g0/configs/c.1/hid.kbd ]
+	then
+		unlink /sys/kernel/config/usb_gadget/g0/configs/c.1/hid.kbd
+		rmdir /sys/kernel/config/usb_gadget/g0/functions/hid.kbd
+	fi
+	if [ -e /sys/kernel/config/usb_gadget/g0/configs/c.1/hid.aikb ]
+	then
+		unlink /sys/kernel/config/usb_gadget/g0/configs/c.1/hid.aikb
+		rmdir /sys/kernel/config/usb_gadget/g0/functions/hid.aikb
 	fi
 
     # adbd

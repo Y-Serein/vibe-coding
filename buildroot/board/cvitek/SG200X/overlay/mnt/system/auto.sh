@@ -17,7 +17,8 @@ AIKB_LCD_SPLASH=""
 AIKB_UI_SHELL="/mnt/system/usr/share/aikb/ui/session_shell.argb"
 AIKB_LCD_BOOT_ANIM=""
 AIKB_LCD_WAIT_ANIM=""
-AIKB_LCD_SLEEP_ANIM="${AIKB_LCD_SLEEP_ANIM:-}"
+AIKB_LCD_SLEEP_ANIM="${AIKB_LCD_SLEEP_ANIM:-/mnt/system/usr/share/aikb/boot/vedio_sleep.akim}"
+AIKB_LCD_HINT_ANIM="${AIKB_LCD_HINT_ANIM:-/mnt/system/usr/share/aikb/boot/hint.akim}"
 AIKB_MIPI_PANEL_DEFAULT="GC9503CV_BOE_QV034"
 AIKB_MIPI_REINIT="${AIKB_MIPI_REINIT:-0}"
 
@@ -157,13 +158,41 @@ start_aikb_hid_input()
    [ "${AIKB_HID_DEBUG:-0}" = "1" ] && HID_DEBUG_ARG="--debug"
 
    HID_POLL_MS="${AIKB_HID_POLL_MS:-10}"
-   "${HID_INPUT}" --hid /dev/hidg0 --screen-out "${AIKB_LCD_INPUT}" --ctrl-out "${AIKB_LCD_CTRL}" --event-out "${AIKB_PET_EVENTS}" --ui-ctrl-in "${AIKB_UI_CTRL}" --poll-ms "${HID_POLL_MS}" ${HID_DEBUG_ARG} >> "${HID_LOG}" 2>&1 &
+   "${HID_INPUT}" --hid /dev/hidg0 --kbd-hid /dev/hidg1 --screen-out "${AIKB_LCD_INPUT}" --ctrl-out "${AIKB_LCD_CTRL}" --event-out "${AIKB_PET_EVENTS}" --ui-ctrl-in "${AIKB_UI_CTRL}" --poll-ms "${HID_POLL_MS}" ${HID_DEBUG_ARG} >> "${HID_LOG}" 2>&1 &
    HID_PID=$!
    sleep 1
    if kill -0 "${HID_PID}" >/dev/null 2>&1; then
       echo "$(date '+%H:%M:%S') aikb_hid_input pid=${HID_PID}" >> "${HID_LOG}"
    else
       echo "$(date '+%H:%M:%S') aikb_hid_input exited during startup" >> "${HID_LOG}"
+   fi
+}
+
+start_aikb_config_webd()
+{
+   WEBD="/mnt/system/usr/bin/aikb_config_webd"
+   WEBD_LOG="/tmp/aikb_config_webd.log"
+
+   if pidof aikb_config_webd >/dev/null 2>&1; then
+      echo "$(date '+%H:%M:%S') aikb_config_webd already running: $(pidof aikb_config_webd)" >> "${WEBD_LOG}"
+      return 0
+   fi
+
+   : > "${WEBD_LOG}"
+   echo "$(date '+%H:%M:%S') start aikb_config_webd port=${AIKB_CONFIG_WEB_PORT:-80}" >> "${WEBD_LOG}"
+
+   if [ ! -x "${WEBD}" ]; then
+      echo "$(date '+%H:%M:%S') aikb_config_webd not executable: ${WEBD}" >> "${WEBD_LOG}"
+      return 0
+   fi
+
+   "${WEBD}" >> "${WEBD_LOG}" 2>&1 &
+   WEBD_PID=$!
+   sleep 1
+   if kill -0 "${WEBD_PID}" >/dev/null 2>&1; then
+      echo "$(date '+%H:%M:%S') aikb_config_webd pid=${WEBD_PID}" >> "${WEBD_LOG}"
+   else
+      echo "$(date '+%H:%M:%S') aikb_config_webd exited during startup" >> "${WEBD_LOG}"
    fi
 }
 
@@ -227,6 +256,8 @@ start_aikb_lcd_ui()
    [ -f "${AIKB_LCD_WAIT_ANIM}" ] && LCD_WAIT_ANIM_ARG="--wait-anim ${AIKB_LCD_WAIT_ANIM}"
    LCD_SLEEP_ANIM_ARG=""
    [ -f "${AIKB_LCD_SLEEP_ANIM}" ] && LCD_SLEEP_ANIM_ARG="--sleep-anim ${AIKB_LCD_SLEEP_ANIM}"
+   LCD_HINT_ANIM_ARG=""
+   [ -f "${AIKB_LCD_HINT_ANIM}" ] && LCD_HINT_ANIM_ARG="--hint-anim ${AIKB_LCD_HINT_ANIM}"
 
    # Pass the event FIFO to every view for immediate key-label feedback.
    # Default to pet because dashboard is unused now that the host stopped
@@ -234,7 +265,7 @@ start_aikb_lcd_ui()
    LCD_VIEW="${AIKB_VIEW:-pet}"
    LCD_EVENT_ARG="--event-input ${AIKB_PET_EVENTS}"
 
-   "${LCD_UI}" --fb /dev/fb0 --input "${AIKB_LCD_INPUT}" --ctrl "${AIKB_LCD_CTRL}" --ui-ctrl-out "${AIKB_UI_CTRL}" ${LCD_EVENT_ARG} ${LCD_BOOT_ANIM_ARG} ${LCD_WAIT_ANIM_ARG} ${LCD_SLEEP_ANIM_ARG} ${LCD_SPLASH_ARG} ${LCD_UI_SHELL_ARG} --rotate auto --view "${LCD_VIEW}" --no-mock >> "${LCD_LOG}" 2>&1 &
+   "${LCD_UI}" --fb /dev/fb0 --input "${AIKB_LCD_INPUT}" --ctrl "${AIKB_LCD_CTRL}" --ui-ctrl-out "${AIKB_UI_CTRL}" ${LCD_EVENT_ARG} ${LCD_BOOT_ANIM_ARG} ${LCD_WAIT_ANIM_ARG} ${LCD_SLEEP_ANIM_ARG} ${LCD_HINT_ANIM_ARG} ${LCD_SPLASH_ARG} ${LCD_UI_SHELL_ARG} --rotate auto --view "${LCD_VIEW}" --no-mock >> "${LCD_LOG}" 2>&1 &
    LCD_PID=$!
    sleep 1
    if kill -0 "${LCD_PID}" >/dev/null 2>&1; then
@@ -256,3 +287,4 @@ case "${AIKB_VIEW:-pet}" in
       ;;
 esac
 start_aikb_hid_input
+start_aikb_config_webd

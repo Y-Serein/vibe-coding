@@ -99,6 +99,7 @@ enum app_view {
 
 #define LCD_RENDER_TERMINAL_MS 50u
 #define LCD_RENDER_PET_MS 83u
+#define LCD_RENDER_PICKER_MS 120u
 #define LCD_RENDER_DEFAULT_MS 1000u
 
 static unsigned lcd_render_interval_ms(enum app_view view)
@@ -108,8 +109,9 @@ static unsigned lcd_render_interval_ms(enum app_view view)
 		return LCD_RENDER_TERMINAL_MS;
 	case VIEW_PET:
 		return LCD_RENDER_PET_MS;
-	case VIEW_DASHBOARD:
 	case VIEW_SESSION_PICKER:
+		return LCD_RENDER_PICKER_MS;
+	case VIEW_DASHBOARD:
 	default:
 		return LCD_RENDER_DEFAULT_MS;
 	}
@@ -157,7 +159,7 @@ static const struct key_action KEY_ACTIONS[] = {
 	{"KEY 1 DOWN",   "VOICE",   PET_SCENE_LISTENING},
 	{"KEY 2 DOWN",   "SESSION", PET_SCENE_ASKING},
 	{"KEY 3 DOWN",   "REVIEW",  PET_SCENE_ASKING},
-	{"KEY 4 DOWN",   "MODEL",   PET_SCENE_UPDATING},
+	{"KEY 4 DOWN",   "SLEEP",   PET_SCENE_STANDBY},
 	{"KEY 5 DOWN",   "MULTI",   PET_SCENE_ASKING},
 	{"KEY 6 DOWN",   "CONFIRM", PET_SCENE_UPDATING},
 };
@@ -291,6 +293,7 @@ struct anim_state {
 static struct anim_state g_boot_anim = { .label = "boot-anim" };
 static struct anim_state g_wait_anim = { .label = "wait-anim" };
 static struct anim_state g_idle_sleep_anim = { .label = "idle-sleep" };
+static struct anim_state g_hint_anim = { .label = "hint-anim" };
 static struct anim_state g_pet_anims[PET_SCENE_COUNT] = {
 	[PET_SCENE_ASKING] = { .label = "pet-asking" },
 	[PET_SCENE_UPDATING] = { .label = "pet-updating" },
@@ -305,6 +308,9 @@ static char g_pet_asset_paths[PET_SCENE_COUNT][256];
 static bool g_pet_force_fallback;
 static uint64_t g_last_local_input_ms;
 static bool g_idle_sleep_active;
+static const char *g_hint_anim_path;
+static bool g_hint_jump_pending;
+static uint16_t g_hint_done_sid;
 
 static int find_cell_preset(int w, int h)
 {
@@ -403,6 +409,10 @@ struct ui_model {
  * (`session N state X`, `session N removed`). The picker view renders straight
  * out of this table; only sid + state are shown. */
 #define MAX_BOARD_SESSIONS 16
+#define BOARD_ASSISTANT_CACHE_COUNT 2
+#define BOARD_ASSISTANT_CACHE_BYTES 4096
+#define BOARD_USER_CACHE_BYTES 1024
+#define PICKER_ENC_STEPS_PER_SESSION 2
 enum board_session_state {
 	BSS_CONNECTED = 0,
 	BSS_DISCONNECTED,
@@ -420,10 +430,18 @@ struct board_session_token {
 	uint64_t cost_cents;
 };
 
+struct board_session_cached_text {
+	char text[BOARD_ASSISTANT_CACHE_BYTES + 1];
+	uint64_t updated_ms;
+};
+
 struct board_session_turn {
 	char role[12];
-	char text[96];
-	char user_text[96];
+	char text[256];
+	char user_text[BOARD_USER_CACHE_BYTES + 1];
+	struct board_session_cached_text assistant[BOARD_ASSISTANT_CACHE_COUNT];
+	int assistant_head;
+	int assistant_count;
 	uint64_t updated_ms;
 	uint64_t user_updated_ms;
 };
@@ -456,6 +474,11 @@ static uint16_t g_lcd_selected_sid;   /* current highlight in picker */
 static uint16_t g_lcd_active_sid;     /* sid the user last focused (terminal view) */
 static int g_ui_ctrl_out_fd = -1;
 static const char *g_ui_ctrl_out_path;
+static int g_picker_enc_accum;
+
+static void release_intro_surfaces(void);
+static void ui_ctrl_emit_view(const char *view_name);
+static void ui_ctrl_emit_select(uint16_t sid);
 
 struct pet_animation_state {
 	enum pet_pose pose;
@@ -516,7 +539,7 @@ static const uint32_t C_GRUVBOX_MUTED = 0xbdae93;
 static const uint32_t C_GRUVBOX_YELLOW = 0xfabd2f;
 static const uint32_t C_GRUVBOX_BLUE = 0x83a598;
 static const uint32_t C_GRUVBOX_RED = 0xfb4934;
-static const uint32_t C_GRUVBOX_GREEN = 0xb8bb26;
+static const uint32_t C_GRUVBOX_WHITE = 0xffffff;
 
 static void on_signal(int sig)
 {
@@ -1806,6 +1829,13 @@ static bool font_draw_cp_size(struct canvas *c, struct font_ctx *font,
 	}
 	return true;
 }
+
+static bool font_has_codepoint(struct font_ctx *font, uint32_t cp)
+{
+	if (!font || !font->ready || !font->face)
+		return false;
+	return FT_Get_Char_Index(font->face, cp) != 0;
+}
 #else
 static void font_restore_default_size(struct font_ctx *font)
 {
@@ -1818,6 +1848,13 @@ static bool font_draw_cp_size(struct canvas *c, struct font_ctx *font,
 {
 	(void)c; (void)font; (void)x; (void)y; (void)cell_w;
 	(void)pixel_h; (void)cp; (void)fg; (void)bg;
+	return false;
+}
+
+static bool font_has_codepoint(struct font_ctx *font, uint32_t cp)
+{
+	(void)font;
+	(void)cp;
 	return false;
 }
 
@@ -3594,6 +3631,17 @@ static int board_session_alloc_idx(void)
 	return -1;
 }
 
+static bool board_session_get_state(uint16_t sid, enum board_session_state *out)
+{
+	int idx = board_session_find_idx(sid);
+
+	if (idx < 0)
+		return false;
+	if (out)
+		*out = g_board_sessions[idx].state;
+	return true;
+}
+
 static int board_session_count_live(void)
 {
 	int n = 0;
@@ -3637,6 +3685,32 @@ static void board_session_upsert(uint16_t sid, enum board_session_state state)
 		       sizeof(g_board_sessions[idx].perm));
 }
 
+static void board_session_auto_show_first(uint16_t sid, enum app_view *view)
+{
+	if (!view || sid == 0 || board_session_find_idx(sid) < 0)
+		return;
+	g_lcd_selected_sid = sid;
+	if (*view != VIEW_SESSION_PICKER) {
+		*view = VIEW_SESSION_PICKER;
+		g_picker_enc_accum = 0;
+		ui_ctrl_emit_view("picker");
+		release_intro_surfaces();
+	}
+	ui_ctrl_emit_select(sid);
+}
+
+static void board_session_ensure_for_ctrl(uint16_t sid, enum app_view *view)
+{
+	bool was_empty;
+
+	if (sid == 0 || board_session_find_idx(sid) >= 0)
+		return;
+	was_empty = board_session_count_live() == 0;
+	board_session_upsert(sid, BSS_CONNECTED);
+	if (was_empty)
+		board_session_auto_show_first(sid, view);
+}
+
 static void board_session_remove(uint16_t sid)
 {
 	int idx = board_session_find_idx(sid);
@@ -3660,23 +3734,77 @@ static void board_session_update_token(uint16_t sid, uint64_t input,
 	g_board_sessions[idx].token.cost_cents = cost_cents;
 }
 
+static void append_bounded_text(char *dst, size_t dst_sz, const char *text)
+{
+	size_t used;
+
+	if (!dst || dst_sz == 0 || !text)
+		return;
+	used = strlen(dst);
+	if (used + 1 >= dst_sz)
+		return;
+	snprintf(dst + used, dst_sz - used, "%s", text);
+}
+
+static void board_session_update_assistant_turn(struct board_session_turn *turn,
+						const char *text, uint64_t now)
+{
+	struct board_session_cached_text *cur;
+	bool append;
+
+	append = turn->assistant_count > 0 &&
+		now - turn->assistant[turn->assistant_head].updated_ms < 1000u;
+	if (!append) {
+		if (turn->assistant_count == 0)
+			turn->assistant_head = 0;
+		else
+			turn->assistant_head =
+				(turn->assistant_head + 1) %
+				BOARD_ASSISTANT_CACHE_COUNT;
+		if (turn->assistant_count < BOARD_ASSISTANT_CACHE_COUNT)
+			turn->assistant_count++;
+		turn->assistant[turn->assistant_head].text[0] = '\0';
+	}
+
+	cur = &turn->assistant[turn->assistant_head];
+	append_bounded_text(cur->text, sizeof(cur->text), text);
+	cur->updated_ms = now;
+}
+
 static void board_session_update_turn(uint16_t sid, const char *role,
 				      const char *text)
 {
 	int idx = board_session_find_idx(sid);
+	struct board_session_turn *turn;
+	uint64_t now = monotonic_now_ms();
+	bool append;
 	if (idx < 0)
 		return;
-	snprintf(g_board_sessions[idx].turn.role,
-		 sizeof(g_board_sessions[idx].turn.role), "%s", role ? role : "");
-	snprintf(g_board_sessions[idx].turn.text,
-		 sizeof(g_board_sessions[idx].turn.text), "%s", text ? text : "");
-	g_board_sessions[idx].turn.updated_ms = monotonic_now_ms();
-	if (role && streq_ci(role, "user")) {
-		snprintf(g_board_sessions[idx].turn.user_text,
-			 sizeof(g_board_sessions[idx].turn.user_text), "%s",
+	turn = &g_board_sessions[idx].turn;
+	append = role && turn->role[0] && streq_ci(turn->role, role) &&
+		turn->text[0] && now - turn->updated_ms < 1000u;
+	if (!append) {
+		snprintf(turn->role, sizeof(turn->role), "%s", role ? role : "");
+		snprintf(turn->text, sizeof(turn->text), "%s", text ? text : "");
+	} else {
+		size_t used = strlen(turn->text);
+		snprintf(turn->text + used, sizeof(turn->text) - used, "%s",
 			 text ? text : "");
-		g_board_sessions[idx].turn.user_updated_ms =
-			g_board_sessions[idx].turn.updated_ms;
+	}
+	turn->updated_ms = now;
+	if (role && streq_ci(role, "assistant"))
+		board_session_update_assistant_turn(turn, text, now);
+	if (role && streq_ci(role, "user")) {
+		append = turn->user_text[0] &&
+			now - turn->user_updated_ms < 1000u;
+		if (!append) {
+			snprintf(turn->user_text, sizeof(turn->user_text), "%s",
+				 text ? text : "");
+		} else {
+			append_bounded_text(turn->user_text,
+					    sizeof(turn->user_text), text);
+		}
+		turn->user_updated_ms = turn->updated_ms;
 	}
 }
 
@@ -3825,82 +3953,71 @@ static void draw_utf8_text_fit_size(struct canvas *c, struct font_ctx *font,
 	font_restore_default_size(font);
 }
 
-static uint32_t board_session_lamp_color(enum board_session_state state)
+enum session_status_visual {
+	SESSION_STATUS_WORKING,
+	SESSION_STATUS_DONE,
+	SESSION_STATUS_ATTENTION,
+};
+
+static enum session_status_visual board_session_status_visual(
+	const struct board_session *bs)
 {
-	switch (state) {
+	if (bs->perm.active)
+		return SESSION_STATUS_ATTENTION;
+	switch (bs->state) {
 	case BSS_DISCONNECTED:
 	case BSS_ERROR:
-		return C_GRUVBOX_RED;
 	case BSS_WAIT:
-	case BSS_CONNECTED:
-		return C_GRUVBOX_YELLOW;
+		return SESSION_STATUS_ATTENTION;
 	case BSS_RUN:
+		return SESSION_STATUS_WORKING;
+	case BSS_CONNECTED:
 	case BSS_DONE:
 	default:
-		return C_GRUVBOX_GREEN;
+		return SESSION_STATUS_DONE;
 	}
 }
 
-static void draw_session_lamp(struct canvas *c, int x, int y, uint32_t color)
+static const char *session_spinner_frame(uint64_t now_ms, uint16_t sid)
 {
-	fill_rect(c, x + 4, y + 1, 10, 16, color);
-	fill_rect(c, x + 2, y + 3, 14, 12, color);
-	fill_rect(c, x + 5, y + 4, 5, 5, blend_rgb(color, 0xffffff, 75));
+	static const char *const frames[] = {
+		"⠋", "⠙", "⠸", "⢰", "⣰", "⣤", "⡆", "⠇",
+	};
+	size_t idx = (size_t)((now_ms / 120u) + sid) % ARRAY_SIZE(frames);
+
+	return frames[idx];
 }
 
-static void draw_folder_icon(struct canvas *c, int x, int y, uint32_t color)
+static void draw_session_done_icon(struct canvas *c, int x, int y,
+				   struct font_ctx *font, uint32_t color)
 {
-	static const char *const map[] = {
-		"..####........",
-		".######.......",
-		"############..",
-		"#############.",
-		"#############.",
-		"#############.",
-		"#############.",
-		"#############.",
-		".###########..",
-	};
-
-	draw_pet_icon_map(c, x, y, map, (int)(sizeof(map) / sizeof(map[0])),
-			  false, color);
+	(void)font;
+	stroke_round_rect(c, x + 5, y + 6, 22, 21, 5, color);
+	fill_rect(c, x + 10, y + 4, 12, 3, color);
+	fill_rect(c, x + 8, y + 24, 18, 3, color);
+	fill_rect(c, x + 15, y + 28, 5, 3, color);
 }
 
-static void draw_branch_icon(struct canvas *c, int x, int y, uint32_t color)
+static void draw_session_status_icon(struct canvas *c, struct font_ctx *font,
+				     const struct board_session *bs,
+				     int x, int y, uint64_t now_ms)
 {
-	static const char *const map[] = {
-		"###.......###.",
-		"###.......###.",
-		".#.........#..",
-		".#.........#..",
-		".###########..",
-		"......#.......",
-		".....###......",
-		"....#####.....",
-		"......#.......",
-	};
-
-	draw_pet_icon_map(c, x, y, map, (int)(sizeof(map) / sizeof(map[0])),
-			  false, color);
-}
-
-static void draw_message_icon(struct canvas *c, int x, int y, uint32_t color)
-{
-	static const char *const map[] = {
-		"..##########..",
-		".############.",
-		"##############",
-		"##..........##",
-		"##..........##",
-		"##..........##",
-		"##############",
-		".###########..",
-		"...###........",
-		"....###.......",
-	};
-
-	draw_pet_icon_map(c, x, y, map, (int)(sizeof(map) / sizeof(map[0])),
-			  false, color);
+	switch (board_session_status_visual(bs)) {
+	case SESSION_STATUS_WORKING:
+		draw_utf8_text_fit_size(c, font, x, y - 2, 34,
+					session_spinner_frame(now_ms, bs->sid),
+					26, 34, 3, C_GRUVBOX_YELLOW);
+		break;
+	case SESSION_STATUS_DONE:
+		draw_session_done_icon(c, x - 3, y - 1, font,
+				       C_GRUVBOX_WHITE);
+		break;
+	case SESSION_STATUS_ATTENTION:
+	default:
+		draw_utf8_text_fit_size(c, font, x + 5, y - 3, 28, "!",
+					20, 34, 4, C_GRUVBOX_YELLOW);
+		break;
+	}
 }
 
 static int board_session_token_pct(const struct board_session *bs)
@@ -3916,29 +4033,82 @@ static int board_session_token_pct(const struct board_session *bs)
 static void format_token_label(char *buf, size_t buf_sz,
 			       const struct board_session *bs)
 {
-	snprintf(buf, buf_sz, "%d%%/1M", board_session_token_pct(bs));
+	snprintf(buf, buf_sz, "%d%%", board_session_token_pct(bs));
 }
 
-static void draw_session_token_bar(struct canvas *c, int x, int y, int w,
-				   int pct)
+static void draw_message_bubble_icon(struct canvas *c, int x, int y,
+				     uint32_t color)
 {
-	int segments = 10;
-	int gap = 3;
-	int seg_w = (w - gap * (segments - 1)) / segments;
-	int filled;
+	stroke_round_rect(c, x, y, 24, 18, 4, color);
+	fill_rect(c, x + 5, y + 17, 5, 3, color);
+	fill_rect(c, x + 8, y + 20, 3, 3, color);
+}
 
-	if (seg_w < 3)
-		seg_w = 3;
-	if (pct < 0)
-		pct = 0;
-	if (pct > 100)
-		pct = 100;
-	filled = (pct * segments + 99) / 100;
-	for (int i = 0; i < segments; i++) {
-		uint32_t color = i < filled ? C_GRUVBOX_YELLOW :
-			0x3b3326;
-		fill_rect(c, x + i * (seg_w + gap), y, seg_w, 18, color);
+static void draw_picker_message_prefix(struct canvas *c, struct font_ctx *font,
+				       int x, int y, uint32_t color,
+				       int *text_x)
+{
+	if (font_has_codepoint(font, 0x1f4ac)) {
+		draw_utf8_text_fit_size(c, font, x, y - 4, 34,
+					"\xf0\x9f\x92\xac", 28, 34, 2,
+					color);
+		*text_x = x + 42;
+		return;
 	}
+	draw_message_bubble_icon(c, x + 3, y + 4, color);
+	*text_x = x + 42;
+}
+
+static void compact_preview_text(char *dst, size_t dst_sz, const char *src)
+{
+	size_t out = 0;
+	bool pending_space = false;
+
+	if (!dst_sz)
+		return;
+	if (!src)
+		src = "";
+	while (*src && out + 1 < dst_sz) {
+		unsigned char ch = (unsigned char)*src++;
+
+		if (ch < 0x20 || ch == 0x7f || isspace(ch)) {
+			if (out > 0)
+				pending_space = true;
+			continue;
+		}
+		if (pending_space && out + 1 < dst_sz)
+			dst[out++] = ' ';
+		pending_space = false;
+		dst[out++] = (char)ch;
+	}
+	dst[out] = '\0';
+}
+
+static void board_session_preview(const struct board_session *bs,
+				  char *text, size_t text_sz)
+{
+	char raw[192];
+
+	if (text_sz)
+		text[0] = '\0';
+
+	if (bs->perm.active) {
+		snprintf(raw, sizeof(raw), "permission %s %s",
+			 bs->perm.tool[0] ? bs->perm.tool : "permission",
+			 bs->perm.args);
+		compact_preview_text(text, text_sz, raw);
+		if (!text[0])
+			safe_copy(text, text_sz, "permission required");
+		return;
+	}
+
+	if (bs->turn.user_text[0]) {
+		compact_preview_text(text, text_sz, bs->turn.user_text);
+		return;
+	}
+
+	/* No assistant/cwd filler here: picker preview is the user's latest
+	 * message, or an active permission request. */
 }
 
 /* Return next live sid in iteration order, or 0 if there are none. */
@@ -3975,6 +4145,39 @@ static uint16_t board_session_step(uint16_t cur, int delta)
 	if (idx < 0)
 		idx += n;
 	return sids[idx];
+}
+
+static void sort_board_session_rows(struct board_session **rows, int count)
+{
+	for (int i = 1; i < count; i++) {
+		struct board_session *cur = rows[i];
+		int j = i - 1;
+
+		while (j >= 0 && rows[j]->sid > cur->sid) {
+			rows[j + 1] = rows[j];
+			j--;
+		}
+		rows[j + 1] = cur;
+	}
+}
+
+static void picker_step_session_slow(int dir)
+{
+	if (dir == 0 || board_session_count_live() <= 0)
+		return;
+	if ((g_picker_enc_accum > 0 && dir < 0) ||
+	    (g_picker_enc_accum < 0 && dir > 0))
+		g_picker_enc_accum = 0;
+	g_picker_enc_accum += dir;
+	if (g_picker_enc_accum >= PICKER_ENC_STEPS_PER_SESSION ||
+	    g_picker_enc_accum <= -PICKER_ENC_STEPS_PER_SESSION) {
+		int step = g_picker_enc_accum > 0 ? 1 : -1;
+
+		g_lcd_selected_sid =
+			board_session_step(g_lcd_selected_sid, step);
+		ui_ctrl_emit_select(g_lcd_selected_sid);
+		g_picker_enc_accum = 0;
+	}
 }
 
 /* ---------------------------------------------------------------- ui-ctrl-out */
@@ -4079,32 +4282,6 @@ static void draw_picker_header(struct canvas *c, struct font_ctx *font,
 	hline(c, 22, 55, UI_W - 44, C_GRUVBOX_DARK1);
 }
 
-static void draw_picker_message_footer(struct canvas *c, struct font_ctx *font,
-				       const struct board_session *bs)
-{
-	char message_label[160];
-	const char *msg;
-	uint32_t icon_color = C_GRUVBOX_YELLOW;
-	uint32_t text_color = C_GRUVBOX_TEXT;
-
-	if (bs->perm.active) {
-		snprintf(message_label, sizeof(message_label),
-			 "PERM %s %s", bs->perm.tool, bs->perm.args);
-		msg = message_label;
-		icon_color = C_GRUVBOX_RED;
-		text_color = C_GRUVBOX_RED;
-	} else if (!bs->turn.user_text[0] && !bs->turn.text[0]) {
-		return;
-	} else {
-		msg = bs->turn.user_text[0] ? bs->turn.user_text :
-			bs->turn.text;
-	}
-
-	draw_message_icon(c, 64, 358, icon_color);
-	draw_utf8_text_fit_size(c, font, 106, 348, 830, msg, 14, 30, 2,
-				text_color);
-}
-
 /* Picker view: KEY 2 (SESSION) jumps here. Renders sid + state plus compact
  * host-pushed agent metadata. The
  * picker_idx member of ui_model is no longer used — selection lives in
@@ -4124,6 +4301,7 @@ static void render_session_picker(struct canvas *c, const struct ui_model *m,
 		if (g_board_sessions[i].used)
 			rows[count++] = &g_board_sessions[i];
 	}
+	sort_board_session_rows(rows, count);
 
 	canvas_clear(c, C_GRUVBOX_BG);
 	fill_rect(c, 0, 0, UI_W, UI_H, 0x141312);
@@ -4143,76 +4321,123 @@ static void render_session_picker(struct canvas *c, const struct ui_model *m,
 			break;
 		}
 	}
-	draw_picker_message_footer(c, font, rows[picker_idx]);
 
 	const int rows_visible = 3;
-	int start = picker_idx - rows_visible / 2;
+	const int row_h = 66;
+	const int row_gap = 10;
+	const int preview_h = 38;
+	const int rows_top_y = 72;
+	const int card_x = 22;
+	const int card_w = UI_W - 44;
+	const int col_status_x = 52;
+	const int div_status_x = 104;
+	const int col_sid_x = 124;
+	const int col_sid_w = 148;
+	const int div_sid_x = 292;
+	const int col_text_x = 312;
+	const int col_text_w = 148;
+	const int div_text_x = 480;
+	const int col_quota_x = 500;
+	const int col_quota_w = 74;
+	const int div_quota_x = 594;
+	const int col_user_x = 616;
+	const int col_user_w = card_x + card_w - col_user_x - 18;
+	int visible_rows = count < rows_visible ? count : rows_visible;
+	int start = picker_idx < rows_visible ? 0 : picker_idx - rows_visible + 1;
 	int max_start = count - rows_visible;
+	int row_base_y;
+
 	if (max_start < 0)
 		max_start = 0;
 	if (start < 0)
 		start = 0;
 	if (start > max_start)
 		start = max_start;
+	row_base_y = rows_top_y;
 
-	for (int i = 0; i < rows_visible && (start + i) < count; i++) {
+	for (int i = 0; i < visible_rows && (start + i) < count; i++) {
 		int idx = start + i;
-		int row_y = 72 + i * 76;
 		bool sel = (idx == picker_idx);
+		int main_text_y = row_base_y + 17;
+		int preview_y = row_base_y + row_h + 10;
+		int message_text_x = 0;
 		const struct board_session *bs = rows[idx];
 		char agent_label[64];
+		char sid_model_label[96];
 		char cwd_label[64];
-		char branch_label[32];
 		char token_label[24];
+		char preview_text[192];
+		char user_label[192];
 		const char *agent = bs->meta.hint[0] ? bs->meta.hint :
 			(bs->meta.kind[0] ? bs->meta.kind : "agent");
 		const char *cwd = path_tail(bs->meta.cwd);
-		uint32_t lamp_color = board_session_lamp_color(bs->state);
-		int pct = board_session_token_pct(bs);
 
 		snprintf(agent_label, sizeof(agent_label), "%s", agent);
+		snprintf(sid_model_label, sizeof(sid_model_label), "%u %s",
+			 bs->sid, agent_label);
 		snprintf(cwd_label, sizeof(cwd_label), "%s", cwd[0] ? cwd : "-");
-		snprintf(branch_label, sizeof(branch_label), "%s",
-			 bs->meta.branch[0] ? bs->meta.branch : "-");
 		format_token_label(token_label, sizeof(token_label), bs);
+		board_session_preview(bs, preview_text, sizeof(preview_text));
+		user_label[0] = '\0';
+		if (bs->turn.user_text[0])
+			compact_preview_text(user_label, sizeof(user_label),
+					     bs->turn.user_text);
 
 		if (sel) {
-			fill_rect(c, 22, row_y - 2, UI_W - 44, 70, 0x1a0e02);
-			stroke_round_rect(c, 22, row_y - 2,
-					  UI_W - 44, 70, 6, C_GRUVBOX_YELLOW);
+			fill_rect(c, card_x, row_base_y - 2, card_w, row_h + 4,
+				  0x1a0e02);
+			stroke_round_rect(c, card_x, row_base_y - 2, card_w,
+					  row_h + 4, 6, C_GRUVBOX_YELLOW);
 		} else {
-			stroke_round_rect(c, 22, row_y - 2,
-					  UI_W - 44, 66, 6, 0x3b3326);
+			stroke_round_rect(c, card_x, row_base_y - 2, card_w,
+					  row_h, 6, 0x3b3326);
 		}
 
-		draw_session_lamp(c, 44, row_y + 24, lamp_color);
-		draw_utf8_text_fit_size(c, font, 76, row_y + 17, 210,
-					agent_label, 15, 30, 2,
+		draw_session_status_icon(c, font, bs, col_status_x,
+					 row_base_y + 11, now_ms);
+		vline(c, div_status_x, row_base_y + 14, 38,
+		      sel ? C_GRUVBOX_YELLOW : 0x3b3326);
+		draw_utf8_text_fit_size(c, font, col_sid_x, main_text_y,
+					col_sid_w, sid_model_label, 15, 30, 2,
 					sel ? C_GRUVBOX_YELLOW :
 					C_GRUVBOX_TEXT);
-		draw_utf8_text_fit_size(c, font, 300, row_y + 18, 16, "|",
-					12, 30, 2, C_GRUVBOX_MUTED);
-		draw_folder_icon(c, 326, row_y + 25,
-				 sel ? C_GRUVBOX_YELLOW : C_GRUVBOX_MUTED);
-		draw_utf8_text_fit_size(c, font, 356, row_y + 17, 190,
-					cwd_label, 15, 30, 2,
+		vline(c, div_sid_x, row_base_y + 14, 38,
+		      sel ? C_GRUVBOX_YELLOW : 0x3b3326);
+		draw_utf8_text_fit_size(c, font, col_text_x, main_text_y,
+					col_text_w, cwd_label, 15, 30, 2,
 					sel ? C_GRUVBOX_TEXT :
 					C_GRUVBOX_MUTED);
-		draw_utf8_text_fit_size(c, font, 560, row_y + 18, 16, "|",
-					12, 30, 2, C_GRUVBOX_MUTED);
-		draw_branch_icon(c, 590, row_y + 25,
-				 sel ? C_GRUVBOX_YELLOW : C_GRUVBOX_MUTED);
-		draw_utf8_text_fit_size(c, font, 622, row_y + 17, 118,
-					branch_label, 15, 30, 2,
-					sel ? C_GRUVBOX_TEXT :
-					C_GRUVBOX_MUTED);
-		draw_utf8_text_fit_size(c, font, 748, row_y + 18, 16, "|",
-					12, 30, 2, C_GRUVBOX_MUTED);
-		draw_session_token_bar(c, 778, row_y + 25, 90, pct);
-		draw_utf8_text_fit_size(c, font, 874, row_y + 18, 62,
-					token_label, 12, 28, 2,
+		vline(c, div_text_x, row_base_y + 14, 38,
+		      sel ? C_GRUVBOX_YELLOW : 0x3b3326);
+		draw_utf8_text_fit_size(c, font, col_quota_x, main_text_y,
+					col_quota_w, token_label, 15, 30, 2,
 					sel ? C_GRUVBOX_YELLOW :
 					C_GRUVBOX_MUTED);
+		vline(c, div_quota_x, row_base_y + 14, 38,
+		      sel ? C_GRUVBOX_YELLOW : 0x3b3326);
+		if (user_label[0]) {
+			draw_utf8_text_fit_size(c, font, col_user_x, main_text_y,
+						col_user_w, user_label, 15, 30, 2,
+						sel ? C_GRUVBOX_TEXT :
+						C_GRUVBOX_MUTED);
+		}
+
+		if (sel && preview_text[0]) {
+			draw_picker_message_prefix(c, font, card_x + 42,
+						   preview_y,
+						   bs->perm.active ?
+						   C_GRUVBOX_RED :
+						   C_GRUVBOX_WHITE,
+						   &message_text_x);
+			draw_utf8_text_fit_size(c, font, message_text_x,
+						preview_y,
+						card_x + card_w - message_text_x - 18,
+						preview_text, 14, 30, 2,
+						bs->perm.active ?
+						C_GRUVBOX_RED :
+						C_GRUVBOX_TEXT);
+		}
+		row_base_y += row_h + row_gap + (sel && preview_text[0] ? preview_h : 0);
 	}
 }
 
@@ -5116,6 +5341,10 @@ static void idle_sleep_update(enum app_view view)
 {
 	uint64_t now;
 
+	if (g_hint_anim.active) {
+		g_idle_sleep_active = false;
+		return;
+	}
 	if (!view_allows_idle_sleep(view) || !g_idle_sleep_anim.base) {
 		g_idle_sleep_active = false;
 		return;
@@ -5225,6 +5454,46 @@ static int anim_load(struct anim_state *a, const char *path)
 	      a->argb8888 ? "ARGB8888" : "RGBA",
 	      a->size);
 	return 0;
+}
+
+static void sleep_done_hint_jump_to_picker(uint16_t sid, enum app_view *view)
+{
+	if (!view || sid == 0 || board_session_find_idx(sid) < 0)
+		return;
+	g_hint_jump_pending = false;
+	g_hint_done_sid = 0;
+	g_idle_sleep_active = false;
+	g_last_local_input_ms = monotonic_now_ms();
+	g_lcd_selected_sid = sid;
+	*view = VIEW_SESSION_PICKER;
+	g_picker_enc_accum = 0;
+	ui_ctrl_emit_view("picker");
+	ui_ctrl_emit_select(sid);
+	release_intro_surfaces();
+	warnf("diag sleep done jump picker sid=%u", sid);
+}
+
+static void sleep_done_hint_start(uint16_t sid, enum app_view *view)
+{
+	if (!view || sid == 0 || board_session_find_idx(sid) < 0)
+		return;
+	g_hint_done_sid = sid;
+	g_hint_jump_pending = true;
+	g_lcd_selected_sid = sid;
+	g_idle_sleep_active = false;
+	g_last_local_input_ms = monotonic_now_ms();
+	release_intro_surfaces();
+
+	if (g_hint_anim.active && g_hint_anim.base) {
+		warnf("diag sleep done hint already active sid=%u", sid);
+		return;
+	}
+	if (!g_hint_anim_path || anim_load(&g_hint_anim, g_hint_anim_path) < 0) {
+		warnf("diag sleep done hint unavailable; jump picker sid=%u", sid);
+		sleep_done_hint_jump_to_picker(sid, view);
+		return;
+	}
+	warnf("diag sleep done hint start sid=%u", sid);
 }
 
 static int pet_akim_load(struct anim_state *a,
@@ -5621,11 +5890,8 @@ static void process_event_fd(int fd, struct pet_state *pet, struct terminal *ter
 						dir = +1;
 					else if (!strncmp(buf, "ENC -", 5))
 						dir = -1;
-					if (dir != 0 && board_session_count_live() > 0) {
-						g_lcd_selected_sid =
-							board_session_step(g_lcd_selected_sid, dir);
-						ui_ctrl_emit_select(g_lcd_selected_sid);
-					}
+					if (dir != 0 && board_session_count_live() > 0)
+						picker_step_session_slow(dir);
 				} else if (*view == VIEW_TERMINAL && term) {
 					int dir = 0;
 					if (!strncmp(buf, "ENC +", 5))
@@ -5651,11 +5917,9 @@ static void process_event_fd(int fd, struct pet_state *pet, struct terminal *ter
 				continue;
 			}
 
-			/* ENC_BTN / CONFIRM (KEY 6) in the picker with a live
-			 * selection: focus that sid and switch to terminal.
-			 * Without a selection, ENC_BTN does nothing here and
-			 * CONFIRM falls through to its generic KEY_ACTIONS
-			 * handler below (pet + UPDATING scene). */
+			/* CONFIRM (KEY 6) allows pending permission requests and
+			 * otherwise focuses the highlighted sid. Encoder push follows
+			 * the same focus path on release. */
 			if (*view == VIEW_SESSION_PICKER &&
 			    g_lcd_selected_sid != 0 &&
 			    streq_ci(buf, "KEY 0 DOWN")) {
@@ -5673,8 +5937,7 @@ static void process_event_fd(int fd, struct pet_state *pet, struct terminal *ter
 			}
 			if (*view == VIEW_SESSION_PICKER &&
 			    g_lcd_selected_sid != 0 &&
-			    (streq_ci(buf, "ENC_BTN DOWN") ||
-			     streq_ci(buf, "KEY 6 DOWN"))) {
+			    streq_ci(buf, "KEY 6 DOWN")) {
 				int idx = board_session_find_idx(g_lcd_selected_sid);
 				if (idx >= 0 && g_board_sessions[idx].perm.active) {
 					uint64_t req_id =
@@ -5688,13 +5951,40 @@ static void process_event_fd(int fd, struct pet_state *pet, struct terminal *ter
 				}
 			}
 			if (*view == VIEW_SESSION_PICKER &&
+			    streq_ci(buf, "ENC_BTN DOWN")) {
+				len = 0;
+				continue;
+			}
+			if (*view == VIEW_SESSION_PICKER &&
+			    streq_ci(buf, "ENC_BTN UP")) {
+				if (g_lcd_selected_sid != 0) {
+					int idx = board_session_find_idx(g_lcd_selected_sid);
+					if (idx >= 0 && g_board_sessions[idx].perm.active) {
+						uint64_t req_id =
+							g_board_sessions[idx].perm.req_id;
+						ui_ctrl_emit_permission(g_lcd_selected_sid,
+									req_id, "allow");
+						board_session_clear_perm(g_lcd_selected_sid,
+									 req_id);
+					} else {
+						ui_ctrl_emit_focus(g_lcd_selected_sid);
+						g_lcd_active_sid = g_lcd_selected_sid;
+						*view = VIEW_TERMINAL;
+						ui_ctrl_emit_view("terminal");
+						release_intro_surfaces();
+						warnf("diag picker focus sid=%u view=%s",
+						      g_lcd_active_sid,
+						      app_view_name(*view));
+					}
+				}
+				len = 0;
+				continue;
+			}
+			if (*view == VIEW_SESSION_PICKER &&
 			    g_lcd_selected_sid != 0 &&
-			    (streq_ci(buf, "ENC_BTN DOWN") ||
-			     streq_ci(buf, "KEY 6 DOWN"))) {
+			    streq_ci(buf, "KEY 6 DOWN")) {
 				ui_ctrl_emit_focus(g_lcd_selected_sid);
 				g_lcd_active_sid = g_lcd_selected_sid;
-				if (term)
-					terminal_reset(term);
 				*view = VIEW_TERMINAL;
 				ui_ctrl_emit_view("terminal");
 				release_intro_surfaces();
@@ -5703,14 +5993,18 @@ static void process_event_fd(int fd, struct pet_state *pet, struct terminal *ter
 				len = 0;
 				continue;
 			}
-			if (*view == VIEW_SESSION_PICKER &&
-			    streq_ci(buf, "ENC_BTN DOWN")) {
-				/* No sid selected — ENC_BTN is the picker
-				 * confirm key only; nothing else to do. */
+			if (streq_ci(buf, "KEY 4 DOWN")) {
+				if (*view == VIEW_SESSION_PICKER)
+					ui_ctrl_emit_view("terminal");
+				*view = VIEW_PET;
+				pet_set_scene_title(pet, PET_SCENE_STANDBY,
+						    "SLEEP", NULL);
+				release_intro_surfaces();
+				idle_sleep_start_now();
+				warnf("diag model key -> sleep");
 				len = 0;
 				continue;
 			}
-
 			/* SESSION opens the board-local picker. Stateless: we
 			 * do not remember which view we came from, so any
 			 * subsequent product key (including REJECT) just runs
@@ -5722,6 +6016,7 @@ static void process_event_fd(int fd, struct pet_state *pet, struct terminal *ter
 						g_lcd_selected_sid =
 							board_session_pick_first();
 					*view = VIEW_SESSION_PICKER;
+					g_picker_enc_accum = 0;
 					ui_ctrl_emit_view("picker");
 					if (g_lcd_selected_sid != 0)
 						ui_ctrl_emit_select(g_lcd_selected_sid);
@@ -5872,7 +6167,7 @@ static void copy_range(char *dst, size_t dst_sz, const char *begin,
 	dst[n] = '\0';
 }
 
-static bool process_session_ctrl_line(const char *line)
+static bool process_session_ctrl_line(const char *line, enum app_view *view)
 {
 	unsigned sid_val;
 	int rest_off = 0;
@@ -5885,11 +6180,22 @@ static bool process_session_ctrl_line(const char *line)
 
 	if (!strncmp(rest, "state ", 6)) {
 		enum board_session_state st;
+		enum board_session_state old_st = BSS_DISCONNECTED;
 		char state_name[24];
+		bool was_empty = board_session_count_live() == 0;
+		bool had_old_state =
+			board_session_get_state((uint16_t)sid_val, &old_st);
 
 		if (sscanf(rest + 6, "%23s", state_name) == 1 &&
-		    board_session_state_from_name(state_name, &st))
+		    board_session_state_from_name(state_name, &st)) {
 			board_session_upsert((uint16_t)sid_val, st);
+			if (g_idle_sleep_active && st == BSS_DONE &&
+			    (!had_old_state || old_st != BSS_DONE))
+				sleep_done_hint_start((uint16_t)sid_val, view);
+			else if (was_empty)
+				board_session_auto_show_first((uint16_t)sid_val,
+							      view);
+		}
 		return true;
 	}
 	if (!strncmp(rest, "removed", 7)) {
@@ -5897,12 +6203,14 @@ static bool process_session_ctrl_line(const char *line)
 		return true;
 	}
 	if (!strncmp(rest, "hint ", 5)) {
+		board_session_ensure_for_ctrl((uint16_t)sid_val, view);
 		board_session_update_hint((uint16_t)sid_val, rest + 5);
 		return true;
 	}
 	if (!strncmp(rest, "token ", 6)) {
 		unsigned long long input, output, cost;
 
+		board_session_ensure_for_ctrl((uint16_t)sid_val, view);
 		if (sscanf(rest + 6, "in=%llu out=%llu cost=%llu",
 			   &input, &output, &cost) == 3) {
 			board_session_update_token((uint16_t)sid_val,
@@ -5916,6 +6224,7 @@ static bool process_session_ctrl_line(const char *line)
 		char role[sizeof(g_board_sessions[0].turn.role)];
 		int text_off = 0;
 
+		board_session_ensure_for_ctrl((uint16_t)sid_val, view);
 		if (sscanf(rest + 5, "role=%11s text:%n", role, &text_off) == 1 &&
 		    text_off > 0) {
 			board_session_update_turn((uint16_t)sid_val, role,
@@ -5928,6 +6237,7 @@ static bool process_session_ctrl_line(const char *line)
 		char tool[sizeof(g_board_sessions[0].perm.tool)];
 		int args_off = 0;
 
+		board_session_ensure_for_ctrl((uint16_t)sid_val, view);
 		if (sscanf(rest + 11, "reqid=%llu tool=%23s args:%n",
 			   &req_id, tool, &args_off) == 2 && args_off > 0) {
 			board_session_update_perm((uint16_t)sid_val,
@@ -5944,6 +6254,7 @@ static bool process_session_ctrl_line(const char *line)
 		char cwd[sizeof(g_board_sessions[0].meta.cwd)];
 		char branch[sizeof(g_board_sessions[0].meta.branch)];
 
+		board_session_ensure_for_ctrl((uint16_t)sid_val, view);
 		if (kind_begin && cwd_begin && branch_begin &&
 		    kind_begin < cwd_begin && cwd_begin < branch_begin) {
 			kind_begin += 5;
@@ -6000,7 +6311,7 @@ static void process_ctrl_fd(int fd, struct font_ctx *font, struct terminal *t,
 					warnf("diag ctrl view=%s",
 					      app_view_name(*view));
 				} else {
-					(void)process_session_ctrl_line(buf);
+					(void)process_session_ctrl_line(buf, view);
 				}
 				len = 0;
 			} else if (len + 1 < sizeof(buf)) {
@@ -6111,6 +6422,10 @@ static void render_frame(struct canvas *c, enum app_view view,
 		anim_blit(&g_wait_anim, c);
 		return;
 	}
+	if (g_hint_anim.active && g_hint_anim.base) {
+		anim_blit(&g_hint_anim, c);
+		return;
+	}
 	if (g_idle_sleep_active && g_idle_sleep_anim.active &&
 	    g_idle_sleep_anim.base) {
 		anim_blit(&g_idle_sleep_anim, c);
@@ -6142,6 +6457,7 @@ static void usage(const char *argv0)
 	printf("  --boot-anim PATH   AKIM container (scripts/make_boot_anim.py) played once before splash\n");
 	printf("  --wait-anim PATH   AKIM container with LOOP flag, replays until first input byte\n");
 	printf("  --sleep-anim PATH  AKIM container shown after 3 minutes without local keys outside session views\n");
+	printf("  --hint-anim PATH   AKIM container played once when a session finishes during sleep\n");
 	printf("  --sleep-start-active show --sleep-anim immediately at startup until local key input\n");
 	printf("  --pet-asset-root PATH directory containing pet AKIM files such as asking.akim\n");
 	printf("  --pet-scene SCENE  initial pet scene for dumps/tests\n");
@@ -6172,6 +6488,7 @@ int main(int argc, char **argv)
 	const char *boot_anim_path = NULL;
 	const char *wait_anim_path = NULL;
 	const char *sleep_anim_path = NULL;
+	const char *hint_anim_path = NULL;
 	const char *pet_asset_root = NULL;
 	const char *pet_qa_dump_path = NULL;
 	enum rotation rotate = ROT_AUTO;
@@ -6246,6 +6563,8 @@ int main(int argc, char **argv)
 			wait_anim_path = argv[++i];
 		} else if (!strcmp(argv[i], "--sleep-anim") && i + 1 < argc) {
 			sleep_anim_path = argv[++i];
+		} else if (!strcmp(argv[i], "--hint-anim") && i + 1 < argc) {
+			hint_anim_path = argv[++i];
 		} else if (!strcmp(argv[i], "--sleep-start-active")) {
 			sleep_start_active = true;
 		} else if (!strcmp(argv[i], "--pet-asset-root") && i + 1 < argc) {
@@ -6312,8 +6631,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	if (sleep_anim_path && !boot_anim_path && !wait_anim_path && !splash_path)
-		sleep_start_active = true;
+	g_hint_anim_path = hint_anim_path;
 	startup_sleep_transition = sleep_start_active &&
 				   view_allows_idle_sleep(view);
 	if (sleep_anim_path)
@@ -6409,6 +6727,7 @@ int main(int argc, char **argv)
 		kitty_graphics_destroy(kitty);
 		font_destroy(&font);
 		anim_release(&g_idle_sleep_anim);
+		anim_release(&g_hint_anim);
 		for (int i = 0; i < PET_SCENE_COUNT; i++)
 			anim_release(&g_pet_anims[i]);
 		free(c.px);
@@ -6543,6 +6862,18 @@ int main(int argc, char **argv)
 			if (ms > 0 && ms < timeout)
 				timeout = (int)ms;
 		}
+		if (g_hint_anim.active) {
+			long ms = anim_advance(&g_hint_anim);
+			anim_active = true;
+			if (!g_hint_anim.active && g_hint_jump_pending) {
+				sleep_done_hint_jump_to_picker(g_hint_done_sid,
+							      &view);
+				needs_render = true;
+				next_render_ms = 0;
+			}
+			if (ms > 0 && ms < timeout)
+				timeout = (int)ms;
+		}
 		if (g_idle_sleep_active && g_idle_sleep_anim.active) {
 			long ms = anim_advance(&g_idle_sleep_anim);
 			anim_active = true;
@@ -6617,6 +6948,7 @@ int main(int argc, char **argv)
 	anim_release(&g_boot_anim);
 	anim_release(&g_wait_anim);
 	anim_release(&g_idle_sleep_anim);
+	anim_release(&g_hint_anim);
 	for (int i = 0; i < PET_SCENE_COUNT; i++)
 		anim_release(&g_pet_anims[i]);
 	return ret;

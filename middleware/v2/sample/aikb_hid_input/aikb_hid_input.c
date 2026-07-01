@@ -58,6 +58,7 @@
 #define HID_REPORT_LEN 64
 #define HID_HEADER_SIZE 6
 #define HID_MAX_PAYLOAD (HID_REPORT_LEN - HID_HEADER_SIZE)
+#define KBD_REPORT_LEN 8
 
 #define REPORT_ID_HOST_BOUND 0x10
 #define REPORT_ID_DEVICE_BOUND 0x20
@@ -117,6 +118,30 @@
 #define VOICE_KEY_INDEX 1
 #define CONFIRM_KEY_INDEX 6
 #define AIKB_USB_MIC_BRIDGE "/mnt/system/usr/bin/aikb_usb_mic_bridge"
+#define AIKB_NOTIFY_TONE "/mnt/system/usr/bin/aikb_notify_tone"
+#define NOTIFY_TONE_COOLDOWN_MS 800u
+#define AIKB_PROFILE_CONFIG_DIR "/mnt/system/etc/aikb"
+#define AIKB_PROFILE_CONFIG "/mnt/system/etc/aikb/profiles.conf"
+#define AIKB_PROFILE_BOOT_CONFIG "/boot/aikb_profiles.conf"
+#define AIKB_PROFILE_ID_MAX 16
+#define AIKB_PROFILE_SOUND_VOLUME_DEFAULT 35u
+#define VIBE_ACTION_NONE 0xffu
+
+#define HID_MOD_LEFT_CTRL 0x01u
+#define HID_USAGE_A 0x04u
+#define HID_USAGE_C 0x06u
+#define HID_USAGE_V 0x19u
+#define HID_USAGE_ENTER 0x28u
+#define HID_USAGE_ESC 0x29u
+#define HID_USAGE_TAB 0x2bu
+#define HID_USAGE_SPACE 0x2cu
+
+enum notify_tone_kind {
+	NOTIFY_TONE_PENDING = 0,
+	NOTIFY_TONE_DONE,
+	NOTIFY_TONE_ERROR,
+	NOTIFY_TONE_COUNT,
+};
 
 enum gpio_bank {
 	GPIO_BANK_A,
@@ -146,6 +171,7 @@ struct debouncer {
 
 struct config {
 	const char *hid_path;
+	const char *kbd_hid_path;
 	const char *screen_out_path;
 	const char *ctrl_out_path;
 	const char *event_out_path;
@@ -157,6 +183,11 @@ struct config {
 	bool no_hid;
 };
 
+struct key_binding {
+	uint8_t modifier;
+	uint8_t usage;
+};
+
 struct session_entry {
 	bool used;
 	bool disconnected;
@@ -164,6 +195,14 @@ struct session_entry {
 	uint64_t last_active_ms;
 	uint64_t last_heartbeat_ms;
 	char plugin_hint[PLUGIN_HINT_MAX];
+};
+
+struct profile_config {
+	char active_profile[AIKB_PROFILE_ID_MAX];
+	bool sound_enabled;
+	unsigned sound_volume;
+	struct key_binding keymap[KEY_COUNT];
+	uint8_t actionmap[KEY_COUNT];
 };
 
 /* View state owned by aikb_lcd_ui; mirrored here so KEY/ENC HID upstream knows
@@ -185,9 +224,64 @@ static uint64_t g_diag_vt100_drop_dead;
 static uint64_t g_diag_vt100_drop_sid;
 static uint64_t g_diag_vt100_write_retry;
 static uint64_t g_diag_vt100_write_fail;
+static uint64_t g_notify_tone_last_ms[NOTIFY_TONE_COUNT];
+static struct profile_config g_profile = {
+	.active_profile = "vibe",
+	.sound_enabled = false,
+	.sound_volume = AIKB_PROFILE_SOUND_VOLUME_DEFAULT,
+};
+
+struct key_preset {
+	const char *id;
+	uint8_t modifier;
+	uint8_t usage;
+};
+
+struct vibe_action_preset {
+	const char *id;
+	uint8_t bit;
+};
+
+static const struct key_preset g_key_presets[] = {
+	{ "none", 0, 0 },
+	{ "esc", 0, HID_USAGE_ESC },
+	{ "tab", 0, HID_USAGE_TAB },
+	{ "space", 0, HID_USAGE_SPACE },
+	{ "enter", 0, HID_USAGE_ENTER },
+	{ "ctrl_a", HID_MOD_LEFT_CTRL, HID_USAGE_A },
+	{ "ctrl_c", HID_MOD_LEFT_CTRL, HID_USAGE_C },
+	{ "ctrl_v", HID_MOD_LEFT_CTRL, HID_USAGE_V },
+};
+
+static const struct vibe_action_preset g_vibe_action_presets[] = {
+	{ "none", VIBE_ACTION_NONE },
+	{ "reject", 0 },
+	{ "voice", 1 },
+	{ "session", 2 },
+	{ "review", 3 },
+	{ "vote_review", 3 },
+	{ "sleep", 4 },
+	{ "agent_model", 4 },
+	{ "multi", 5 },
+	{ "multi_function", 5 },
+	{ "confirm", 6 },
+};
+
+static const struct key_binding g_default_keymap[KEY_COUNT] = {
+	{ 0, HID_USAGE_ESC },
+	{ 0, HID_USAGE_TAB },
+	{ 0, HID_USAGE_SPACE },
+	{ HID_MOD_LEFT_CTRL, HID_USAGE_A },
+	{ HID_MOD_LEFT_CTRL, HID_USAGE_C },
+	{ HID_MOD_LEFT_CTRL, HID_USAGE_V },
+	{ 0, HID_USAGE_ENTER },
+};
+
+static const uint8_t g_default_actionmap[KEY_COUNT] = {
+	0, 1, 2, 3, 4, 5, 6,
+};
 
 static const struct pin_def g_keys[] = {
-	/* Keep the HID/UI contract semantic: KEY0 is REJECT, KEY6 is CONFIRM. */
 	{ "key0_A15", GPIO_BANK_A, 15, 0x0300103cu, 0x03001908u, IOBLK_NONE },
 	{ "key1_A22", GPIO_BANK_A, 22, 0x03001050u, 0x0300191cu, IOBLK_NONE },
 	{ "key2_A25", GPIO_BANK_A, 25, 0x03001054u, 0x03001920u, IOBLK_NONE },
@@ -210,6 +304,7 @@ static const struct pin_def g_enc_e = {
 };
 
 static volatile sig_atomic_t g_stop;
+static volatile sig_atomic_t g_reload_profile;
 
 /* Session table. Index 0 is reserved as the broadcast sid; valid sids occupy
  * 1..MAX_SESSIONS so the C array indexes the wire sid directly. */
@@ -220,6 +315,12 @@ static void on_signal(int sig)
 {
 	(void)sig;
 	g_stop = 1;
+}
+
+static void on_reload_signal(int sig)
+{
+	(void)sig;
+	g_reload_profile = 1;
 }
 
 static uint64_t now_ms(void)
@@ -452,6 +553,21 @@ static uint8_t build_key_bits(const struct debouncer keys[KEY_COUNT])
 			bits |= (uint8_t)(1u << i);
 	}
 
+	return bits;
+}
+
+static uint8_t build_vibe_key_bits(uint8_t physical_bits)
+{
+	uint8_t bits = 0;
+
+	for (size_t i = 0; i < KEY_COUNT; i++) {
+		uint8_t action_bit = g_profile.actionmap[i];
+
+		if (!(physical_bits & (uint8_t)(1u << i)))
+			continue;
+		if (action_bit < 8u)
+			bits |= (uint8_t)(1u << action_bit);
+	}
 	return bits;
 }
 
@@ -701,6 +817,66 @@ static int send_key_event(int hid_fd, uint16_t sid, uint8_t key_bits,
 			       sid, payload, sizeof(payload), debug);
 }
 
+static bool kbd_report_has_usage(const uint8_t report[KBD_REPORT_LEN],
+				 uint8_t usage)
+{
+	for (size_t i = 2; i < KBD_REPORT_LEN; i++) {
+		if (report[i] == usage)
+			return true;
+	}
+	return false;
+}
+
+static void build_kbd_report(uint8_t key_bits, uint8_t report[KBD_REPORT_LEN])
+{
+	size_t slot = 2;
+
+	memset(report, 0, KBD_REPORT_LEN);
+	for (size_t i = 0; i < KEY_COUNT; i++) {
+		const struct key_binding *binding = &g_profile.keymap[i];
+
+		if (!(key_bits & (uint8_t)(1u << i)))
+			continue;
+		report[0] |= binding->modifier;
+		if (!binding->usage || slot >= KBD_REPORT_LEN ||
+		    kbd_report_has_usage(report, binding->usage))
+			continue;
+		report[slot++] = binding->usage;
+	}
+}
+
+static int write_kbd_report(int fd, const uint8_t report[KBD_REPORT_LEN])
+{
+	ssize_t n = write(fd, report, KBD_REPORT_LEN);
+
+	if (n < 0) {
+		if (errno == EAGAIN || errno == EWOULDBLOCK)
+			return 1;
+		return -1;
+	}
+	if (n != KBD_REPORT_LEN) {
+		errno = EIO;
+		return -1;
+	}
+	return 0;
+}
+
+static int send_kbd_report(int kbd_fd, uint8_t key_bits, bool debug)
+{
+	uint8_t report[KBD_REPORT_LEN];
+	int rc;
+
+	build_kbd_report(key_bits, report);
+	rc = write_kbd_report(kbd_fd, report);
+	if (debug && rc == 0) {
+		fprintf(stderr,
+			"aikb_hid_input: kbd tx mod=0x%02x keys=%02x,%02x,%02x,%02x,%02x,%02x bits=0x%02x\n",
+			report[0], report[2], report[3], report[4], report[5],
+			report[6], report[7], key_bits);
+	}
+	return rc;
+}
+
 static int send_encoder_event(int hid_fd, uint16_t sid, int delta, bool debug)
 {
 	uint8_t payload;
@@ -741,6 +917,542 @@ static int write_event_line(int *event_fd, const char *path, const char *line,
 	len = strlen(line);
 	return write_screen_bytes(event_fd, path, (const uint8_t *)line, len,
 				  debug);
+}
+
+static bool profile_id_valid(const char *id)
+{
+	return !strcmp(id, "normal") || !strcmp(id, "vibe") ||
+	       !strcmp(id, "custom1") || !strcmp(id, "custom2") ||
+	       !strcmp(id, "custom3");
+}
+
+static bool profile_is_vibe(void)
+{
+	return !strcmp(g_profile.active_profile, "vibe");
+}
+
+static bool profile_keyboard_enabled(void)
+{
+	return !profile_is_vibe();
+}
+
+static const char *key_binding_id(const struct key_binding *binding)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(g_key_presets); i++) {
+		if (g_key_presets[i].modifier == binding->modifier &&
+		    g_key_presets[i].usage == binding->usage)
+			return g_key_presets[i].id;
+	}
+	return NULL;
+}
+
+static void key_binding_format(const struct key_binding *binding,
+			       char *buf, size_t len)
+{
+	const char *id = key_binding_id(binding);
+
+	if (id) {
+		snprintf(buf, len, "%s", id);
+		return;
+	}
+	snprintf(buf, len, "mod:%02x,usage:%02x",
+		 binding->modifier, binding->usage);
+}
+
+static const char *vibe_action_id(uint8_t bit)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(g_vibe_action_presets); i++) {
+		if (g_vibe_action_presets[i].bit == bit)
+			return g_vibe_action_presets[i].id;
+	}
+	return NULL;
+}
+
+static void vibe_action_format(uint8_t bit, char *buf, size_t len)
+{
+	const char *id = vibe_action_id(bit);
+
+	if (id) {
+		snprintf(buf, len, "%s", id);
+		return;
+	}
+	snprintf(buf, len, "bit:%02x", bit);
+}
+
+static bool parse_hex_byte(const char *value, unsigned *out)
+{
+	char *end = NULL;
+	unsigned long v;
+
+	errno = 0;
+	v = strtoul(value, &end, 16);
+	if (errno || !end || *end || v > 0xfful)
+		return false;
+	*out = (unsigned)v;
+	return true;
+}
+
+static bool parse_key_binding_value(const char *value,
+				    struct key_binding *binding)
+{
+	char tmp[64];
+	char *mod_text;
+	char *usage_text;
+	char *sep;
+	unsigned mod;
+	unsigned usage;
+
+	for (size_t i = 0; i < ARRAY_SIZE(g_key_presets); i++) {
+		if (!strcmp(value, g_key_presets[i].id)) {
+			binding->modifier = g_key_presets[i].modifier;
+			binding->usage = g_key_presets[i].usage;
+			return true;
+		}
+	}
+
+	snprintf(tmp, sizeof(tmp), "%s", value);
+	mod_text = tmp;
+	if (!strncmp(mod_text, "mod:", 4))
+		mod_text += 4;
+	sep = strchr(mod_text, ',');
+	if (!sep)
+		sep = strchr(mod_text, ':');
+	if (!sep)
+		return false;
+	*sep = '\0';
+	usage_text = sep + 1;
+	if (!strncmp(usage_text, "usage:", 6))
+		usage_text += 6;
+	if (!parse_hex_byte(mod_text, &mod) ||
+	    !parse_hex_byte(usage_text, &usage))
+		return false;
+	binding->modifier = (uint8_t)mod;
+	binding->usage = (uint8_t)usage;
+	return true;
+}
+
+static bool parse_vibe_action_value(const char *value, uint8_t *bit)
+{
+	unsigned parsed;
+
+	for (size_t i = 0; i < ARRAY_SIZE(g_vibe_action_presets); i++) {
+		if (!strcmp(value, g_vibe_action_presets[i].id)) {
+			*bit = g_vibe_action_presets[i].bit;
+			return true;
+		}
+	}
+	if (!strncmp(value, "bit:", 4))
+		value += 4;
+	if (!parse_hex_byte(value, &parsed))
+		return false;
+	if (parsed >= KEY_COUNT && parsed != VIBE_ACTION_NONE)
+		return false;
+	*bit = (uint8_t)parsed;
+	return true;
+}
+
+static int profile_key_index(const char *key)
+{
+	char *end = NULL;
+	unsigned long idx;
+
+	if (strncmp(key, "key", 3) != 0)
+		return -1;
+	errno = 0;
+	idx = strtoul(key + 3, &end, 10);
+	if (errno || !end || *end || idx >= KEY_COUNT)
+		return -1;
+	return (int)idx;
+}
+
+static int profile_action_index(const char *key)
+{
+	char *end = NULL;
+	unsigned long idx;
+
+	if (strncmp(key, "action", 6) != 0)
+		return -1;
+	errno = 0;
+	idx = strtoul(key + 6, &end, 10);
+	if (errno || !end || *end || idx >= KEY_COUNT)
+		return -1;
+	return (int)idx;
+}
+
+static void profile_set_defaults(void)
+{
+	snprintf(g_profile.active_profile, sizeof(g_profile.active_profile),
+		 "%s", "vibe");
+	g_profile.sound_enabled = false;
+	g_profile.sound_volume = AIKB_PROFILE_SOUND_VOLUME_DEFAULT;
+	memcpy(g_profile.keymap, g_default_keymap, sizeof(g_profile.keymap));
+	memcpy(g_profile.actionmap, g_default_actionmap,
+	       sizeof(g_profile.actionmap));
+}
+
+static char *trim_ascii(char *s)
+{
+	char *end;
+
+	while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n')
+		s++;
+	end = s + strlen(s);
+	while (end > s &&
+	       (end[-1] == ' ' || end[-1] == '\t' ||
+		end[-1] == '\r' || end[-1] == '\n')) {
+		end--;
+	}
+	*end = '\0';
+	return s;
+}
+
+static bool parse_bool_value(const char *value, bool *out)
+{
+	if (!strcmp(value, "1") || !strcmp(value, "true") ||
+	    !strcmp(value, "on") || !strcmp(value, "yes")) {
+		*out = true;
+		return true;
+	}
+	if (!strcmp(value, "0") || !strcmp(value, "false") ||
+	    !strcmp(value, "off") || !strcmp(value, "no")) {
+		*out = false;
+		return true;
+	}
+	return false;
+}
+
+static bool parse_percent_value(const char *value, unsigned *out)
+{
+	char *end = NULL;
+	unsigned long v;
+
+	errno = 0;
+	v = strtoul(value, &end, 10);
+	if (errno || !end || *end || v > 100ul)
+		return false;
+	*out = (unsigned)v;
+	return true;
+}
+
+static void profile_apply_pair(const char *key, const char *value, bool debug)
+{
+	int key_index;
+	int action_index;
+	bool b;
+	unsigned percent;
+
+	key_index = profile_key_index(key);
+	if (key_index >= 0) {
+		struct key_binding binding;
+
+		if (parse_key_binding_value(value, &binding)) {
+			g_profile.keymap[key_index] = binding;
+		} else if (debug) {
+			fprintf(stderr,
+				"aikb_hid_input: ignored bad key binding %s=%s\n",
+				key, value);
+		}
+		return;
+	}
+	action_index = profile_action_index(key);
+	if (action_index >= 0) {
+		uint8_t bit;
+
+		if (parse_vibe_action_value(value, &bit)) {
+			g_profile.actionmap[action_index] = bit;
+		} else if (debug) {
+			fprintf(stderr,
+				"aikb_hid_input: ignored bad vibe action %s=%s\n",
+				key, value);
+		}
+		return;
+	}
+	if (!strcmp(key, "active_profile") || !strcmp(key, "profile")) {
+		if (profile_id_valid(value)) {
+			snprintf(g_profile.active_profile,
+				 sizeof(g_profile.active_profile), "%s", value);
+		} else if (debug) {
+			fprintf(stderr, "aikb_hid_input: ignored bad profile id: %s\n",
+				value);
+		}
+		return;
+	}
+	if (!strcmp(key, "sound_enabled") || !strcmp(key, "sound")) {
+		if (parse_bool_value(value, &b))
+			g_profile.sound_enabled = b;
+		return;
+	}
+	if (!strcmp(key, "sound_volume") || !strcmp(key, "volume")) {
+		if (parse_percent_value(value, &percent))
+			g_profile.sound_volume = percent;
+		return;
+	}
+}
+
+static bool profile_load_file(const char *path, bool debug)
+{
+	FILE *fp;
+	char line[160];
+	bool loaded = false;
+
+	fp = fopen(path, "r");
+	if (!fp)
+		return false;
+	while (fgets(line, sizeof(line), fp)) {
+		char *p = trim_ascii(line);
+		char *eq;
+		char *key;
+		char *value;
+
+		if (!p[0] || p[0] == '#')
+			continue;
+		eq = strchr(p, '=');
+		if (!eq)
+			continue;
+		*eq = '\0';
+		key = trim_ascii(p);
+		value = trim_ascii(eq + 1);
+		profile_apply_pair(key, value, debug);
+		loaded = true;
+	}
+	fclose(fp);
+	return loaded;
+}
+
+static void profile_load(bool debug)
+{
+	profile_set_defaults();
+	if (profile_load_file(AIKB_PROFILE_CONFIG, debug))
+		return;
+	(void)profile_load_file(AIKB_PROFILE_BOOT_CONFIG, debug);
+}
+
+static int write_all_fd(int fd, const char *buf, size_t len)
+{
+	size_t off = 0;
+
+	while (off < len) {
+		ssize_t n = write(fd, buf + off, len - off);
+
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		if (n == 0)
+			return -1;
+		off += (size_t)n;
+	}
+	return 0;
+}
+
+static bool profile_save(bool debug)
+{
+	char tmp_path[128];
+	char buf[1024];
+	int fd;
+	int dirfd;
+	int n;
+	size_t off = 0;
+	bool ok = false;
+
+	if (mkdir("/mnt/system/etc", 0755) != 0 && errno != EEXIST)
+		return false;
+	if (mkdir(AIKB_PROFILE_CONFIG_DIR, 0755) != 0 && errno != EEXIST)
+		return false;
+	snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", AIKB_PROFILE_CONFIG);
+	fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+	if (fd < 0)
+		return false;
+	n = snprintf(buf, sizeof(buf),
+		     "version=1\nactive_profile=%s\nsound_enabled=%u\nsound_volume=%u\n",
+		     g_profile.active_profile, g_profile.sound_enabled ? 1u : 0u,
+		     g_profile.sound_volume);
+	if (n > 0 && n < (int)sizeof(buf)) {
+		off = (size_t)n;
+		for (size_t i = 0; i < KEY_COUNT; i++) {
+			char binding[32];
+
+			key_binding_format(&g_profile.keymap[i], binding,
+					   sizeof(binding));
+			n = snprintf(buf + off, sizeof(buf) - off,
+				     "key%zu=%s\n", i, binding);
+			if (n < 0 || (size_t)n >= sizeof(buf) - off) {
+				off = sizeof(buf);
+				break;
+			}
+			off += (size_t)n;
+		}
+		for (size_t i = 0; i < KEY_COUNT; i++) {
+			char action[32];
+
+			vibe_action_format(g_profile.actionmap[i], action,
+					   sizeof(action));
+			n = snprintf(buf + off, sizeof(buf) - off,
+				     "action%zu=%s\n", i, action);
+			if (n < 0 || (size_t)n >= sizeof(buf) - off) {
+				off = sizeof(buf);
+				break;
+			}
+			off += (size_t)n;
+		}
+		if (off < sizeof(buf) &&
+		    write_all_fd(fd, buf, off) == 0 &&
+		    fsync(fd) == 0) {
+			ok = true;
+		}
+	}
+	close(fd);
+	if (!ok) {
+		unlink(tmp_path);
+		return false;
+	}
+	if (rename(tmp_path, AIKB_PROFILE_CONFIG) != 0) {
+		unlink(tmp_path);
+		return false;
+	}
+	dirfd = open(AIKB_PROFILE_CONFIG_DIR, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (dirfd >= 0) {
+		(void)fsync(dirfd);
+		close(dirfd);
+	}
+	if (debug)
+		fprintf(stderr, "aikb_hid_input: saved profile %s sound=%u volume=%u\n",
+			g_profile.active_profile, g_profile.sound_enabled ? 1u : 0u,
+			g_profile.sound_volume);
+	return true;
+}
+
+static void profile_format_state(char *buf, size_t len)
+{
+	snprintf(buf, len, "CFG v=1 p=%s s=%u vol=%u",
+		 g_profile.active_profile,
+		 g_profile.sound_enabled ? 1u : 0u, g_profile.sound_volume);
+}
+
+static void send_config_text(int hid_fd, const char *text, bool debug)
+{
+	size_t len;
+
+	if (hid_fd < 0 || !text)
+		return;
+	len = strlen(text);
+	if (len > HID_MAX_PAYLOAD)
+		len = HID_MAX_PAYLOAD;
+	(void)send_hid_packet(hid_fd, REPORT_ID_HOST_BOUND,
+			      CMD_FEEDBACK_EVENT, SESSION_BROADCAST,
+			      (const uint8_t *)text, (uint16_t)len, debug);
+}
+
+static void handle_config_command(int hid_fd, const uint8_t *payload,
+				  uint16_t plen, bool debug)
+{
+	char text[HID_MAX_PAYLOAD + 1];
+	char response[HID_MAX_PAYLOAD + 1];
+	char *cmd;
+
+	if (plen == 0)
+		return;
+	if (plen >= sizeof(text))
+		plen = sizeof(text) - 1;
+	memcpy(text, payload, plen);
+	text[plen] = '\0';
+	cmd = trim_ascii(text);
+	if (strncmp(cmd, "CFG", 3) != 0)
+		return;
+	cmd = trim_ascii(cmd + 3);
+	if (!strcmp(cmd, "GET")) {
+		profile_format_state(response, sizeof(response));
+		send_config_text(hid_fd, response, debug);
+		return;
+	}
+	if (!strcmp(cmd, "RESET")) {
+		profile_set_defaults();
+		if (!profile_save(debug)) {
+			send_config_text(hid_fd, "ERR save_failed", debug);
+			return;
+		}
+		profile_format_state(response, sizeof(response));
+		send_config_text(hid_fd, response, debug);
+		return;
+	}
+	if (!strncmp(cmd, "SET", 3)) {
+		char *saveptr = NULL;
+		char *tok;
+
+		cmd = trim_ascii(cmd + 3);
+		for (tok = strtok_r(cmd, " ", &saveptr); tok;
+		     tok = strtok_r(NULL, " ", &saveptr)) {
+			char *eq = strchr(tok, '=');
+
+			if (!eq)
+				continue;
+			*eq = '\0';
+			profile_apply_pair(trim_ascii(tok), trim_ascii(eq + 1),
+					   debug);
+		}
+		if (!profile_save(debug)) {
+			send_config_text(hid_fd, "ERR save_failed", debug);
+			return;
+		}
+		profile_format_state(response, sizeof(response));
+		send_config_text(hid_fd, response, debug);
+		return;
+	}
+	send_config_text(hid_fd, "ERR unknown_cfg_command", debug);
+}
+
+static const char *notify_tone_name(enum notify_tone_kind kind)
+{
+	switch (kind) {
+	case NOTIFY_TONE_PENDING: return "pending";
+	case NOTIFY_TONE_DONE:    return "done";
+	case NOTIFY_TONE_ERROR:   return "error";
+	default:                  return "pending";
+	}
+}
+
+static void spawn_notify_tone(enum notify_tone_kind kind, uint64_t now,
+			      bool debug)
+{
+	const char *name;
+	pid_t pid;
+
+	if (kind >= NOTIFY_TONE_COUNT)
+		return;
+	if (!g_profile.sound_enabled)
+		return;
+	if (now - g_notify_tone_last_ms[kind] < NOTIFY_TONE_COOLDOWN_MS)
+		return;
+	g_notify_tone_last_ms[kind] = now;
+	name = notify_tone_name(kind);
+
+	pid = fork();
+	if (pid < 0) {
+		if (debug)
+			fprintf(stderr, "aikb_hid_input: fork notify %s failed: %s\n",
+				name, strerror(errno));
+		return;
+	}
+	if (pid == 0) {
+		int nullfd = open("/dev/null", O_RDWR);
+		char volume[16];
+
+		if (nullfd >= 0) {
+			dup2(nullfd, STDIN_FILENO);
+			dup2(nullfd, STDOUT_FILENO);
+			dup2(nullfd, STDERR_FILENO);
+			if (nullfd > STDERR_FILENO)
+				close(nullfd);
+		}
+		snprintf(volume, sizeof(volume), "%u", g_profile.sound_volume);
+		setenv("AIKB_NOTIFY_VOLUME", volume, 1);
+		execl(AIKB_NOTIFY_TONE, AIKB_NOTIFY_TONE, name, (char *)NULL);
+		_exit(127);
+	}
+	if (debug)
+		fprintf(stderr, "aikb_hid_input: notify %s pid=%ld\n",
+			name, (long)pid);
 }
 
 static void reap_voice_mic_children(void)
@@ -824,6 +1536,9 @@ static void emit_key_down_events(int *event_fd, const struct config *cfg,
 	if (new_enc_pressed && !old_enc_pressed)
 		(void)write_event_line(event_fd, cfg->event_out_path,
 				       "ENC_BTN DOWN\n", cfg->debug);
+	else if (!new_enc_pressed && old_enc_pressed)
+		(void)write_event_line(event_fd, cfg->event_out_path,
+				       "ENC_BTN UP\n", cfg->debug);
 }
 
 static void emit_encoder_events(int *event_fd, const struct config *cfg,
@@ -1285,10 +2000,18 @@ static void handle_packet(int hid_fd, int *screen_fd, int *ctrl_fd,
 		touch_session(sid, now);
 		if (plen >= 1) {
 			uint8_t st = payload[0];
+			uint8_t old = g_sessions[sid].state_byte;
+
 			if (st <= SESSION_STATE_ERROR &&
-			    g_sessions[sid].state_byte != st) {
+			    old != st) {
 				g_sessions[sid].state_byte = st;
 				emit_session_state_line(ctrl_fd, cfg, sid);
+				if (st == SESSION_STATE_DONE)
+					spawn_notify_tone(NOTIFY_TONE_DONE, now,
+							  cfg->debug);
+				else if (st == SESSION_STATE_ERROR)
+					spawn_notify_tone(NOTIFY_TONE_ERROR, now,
+							  cfg->debug);
 			}
 		}
 		break;
@@ -1312,6 +2035,7 @@ static void handle_packet(int hid_fd, int *screen_fd, int *ctrl_fd,
 			break;
 		touch_session(sid, now);
 		emit_permission_line(ctrl_fd, cfg, sid, payload, plen);
+		spawn_notify_tone(NOTIFY_TONE_PENDING, now, cfg->debug);
 		break;
 
 	case CMD_AGENT_META:
@@ -1343,6 +2067,10 @@ static void handle_packet(int hid_fd, int *screen_fd, int *ctrl_fd,
 				"aikb_hid_input: ui_scale dropped sid=%u plen=%u (no --ctrl-out)\n",
 				sid, plen);
 		}
+		break;
+
+	case CMD_FEEDBACK_EVENT:
+		handle_config_command(hid_fd, payload, plen, cfg->debug);
 		break;
 
 	case CMD_WINDOW_SWITCH:
@@ -1590,7 +2318,7 @@ static void reap_sessions(int hid_fd, int *ctrl_fd, const struct config *cfg,
 static void usage(FILE *out)
 {
 	fprintf(out,
-		"Usage: aikb_hid_input [--hid PATH] [--screen-out PATH]\n"
+		"Usage: aikb_hid_input [--hid PATH] [--kbd-hid PATH] [--screen-out PATH]\n"
 		"                      [--ctrl-out PATH] [--event-out PATH]\n"
 		"                      [--ui-ctrl-in PATH]\n"
 		"                      [--poll-ms N] [--debounce-ms N]\n"
@@ -1615,6 +2343,7 @@ static int parse_args(int argc, char **argv, struct config *cfg)
 	int i;
 
 	cfg->hid_path = "/dev/hidg0";
+	cfg->kbd_hid_path = "/dev/hidg1";
 	cfg->screen_out_path = NULL;
 	cfg->ctrl_out_path = NULL;
 	cfg->event_out_path = NULL;
@@ -1628,6 +2357,8 @@ static int parse_args(int argc, char **argv, struct config *cfg)
 	for (i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--hid") == 0 && i + 1 < argc) {
 			cfg->hid_path = argv[++i];
+		} else if (strcmp(argv[i], "--kbd-hid") == 0 && i + 1 < argc) {
+			cfg->kbd_hid_path = argv[++i];
 		} else if (strcmp(argv[i], "--screen-out") == 0 && i + 1 < argc) {
 			cfg->screen_out_path = argv[++i];
 		} else if (strcmp(argv[i], "--ctrl-out") == 0 && i + 1 < argc) {
@@ -1688,25 +2419,32 @@ int main(int argc, char **argv)
 	int pending_delta = 0;
 	int event_delta_pending = 0;
 	bool keys_dirty = false;
+	bool kbd_need_sync = true;
 	uint8_t key_bits;
 	uint8_t hid_prev_key_bits = 0;
+	uint8_t kbd_sent_key_bits = 0;
 	uint8_t event_prev_key_bits = 0;
 	bool hid_prev_enc_pressed = false;
 	bool event_prev_enc_pressed = false;
 	int mem_fd = -1;
 	int hid_fd = -1;
+	int kbd_fd = -1;
 	int screen_fd = -1;
 	int ctrl_fd = -1;
 	int event_fd = -1;
 	int ui_ctrl_fd = -1;
 	uint64_t next_reap_ms = 0;
+	uint64_t next_kbd_try_ms = 0;
 	size_t i;
 
 	if (parse_args(argc, argv, &cfg) != 0)
 		return 2;
 
+	profile_load(cfg.debug);
+
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
+	signal(SIGHUP, on_reload_signal);
 	signal(SIGPIPE, SIG_IGN);
 
 	mem_fd = open("/dev/mem", O_RDWR | O_SYNC | O_CLOEXEC);
@@ -1745,13 +2483,54 @@ int main(int argc, char **argv)
 	enc_state = (pin_level(&g_enc_a, ext_a, ext_e) ? 2u : 0u) |
 		    (pin_level(&g_enc_b, ext_a, ext_e) ? 1u : 0u);
 	hid_prev_key_bits = build_key_bits(keys);
+	hid_prev_key_bits = build_vibe_key_bits(hid_prev_key_bits);
 	hid_prev_enc_pressed = enc_sw.stable;
-	event_prev_key_bits = build_key_bits(keys);
+	event_prev_key_bits = hid_prev_key_bits;
 	event_prev_enc_pressed = enc_sw.stable;
 
 	while (!g_stop) {
 		uint64_t now = now_ms();
 		unsigned new_enc_state;
+
+		if (g_reload_profile) {
+			uint8_t physical_bits;
+			uint8_t vibe_bits;
+
+			g_reload_profile = 0;
+			profile_load(cfg.debug);
+			physical_bits = build_key_bits(keys);
+			vibe_bits = build_vibe_key_bits(physical_bits);
+			hid_prev_key_bits = vibe_bits;
+			event_prev_key_bits = vibe_bits;
+			kbd_need_sync = true;
+			if (cfg.debug) {
+				fprintf(stderr,
+					"aikb_hid_input: reloaded profile %s sound=%u volume=%u\n",
+					g_profile.active_profile,
+					g_profile.sound_enabled ? 1u : 0u,
+					g_profile.sound_volume);
+			}
+		}
+
+		if (!cfg.no_hid && cfg.kbd_hid_path && kbd_fd < 0 &&
+		    now >= next_kbd_try_ms) {
+			kbd_fd = open_hid(cfg.kbd_hid_path);
+			if (kbd_fd < 0) {
+				if (cfg.debug) {
+					fprintf(stderr,
+						"aikb_hid_input: waiting for %s: %s\n",
+						cfg.kbd_hid_path, strerror(errno));
+				}
+				next_kbd_try_ms = now + 1000u;
+			} else {
+				kbd_sent_key_bits = 0;
+				kbd_need_sync = true;
+				if (cfg.debug) {
+					fprintf(stderr, "aikb_hid_input: opened %s\n",
+						cfg.kbd_hid_path);
+				}
+			}
+		}
 
 		if (!cfg.no_hid && hid_fd < 0 && now >= next_hid_try_ms) {
 			hid_fd = open_hid(cfg.hid_path);
@@ -1763,7 +2542,8 @@ int main(int argc, char **argv)
 				}
 				next_hid_try_ms = now + 1000u;
 			} else {
-				hid_prev_key_bits = build_key_bits(keys);
+				hid_prev_key_bits =
+					build_vibe_key_bits(build_key_bits(keys));
 				hid_prev_enc_pressed = enc_sw.stable;
 				keys_dirty = false;
 				pending_delta = 0;
@@ -1818,17 +2598,27 @@ int main(int argc, char **argv)
 			event_delta_pending = -127;
 
 		if (keys_dirty) {
+			uint8_t vibe_key_bits;
+
 			key_bits = build_key_bits(keys);
-			control_voice_mic(event_prev_key_bits, key_bits,
-					  cfg.debug);
-			emit_key_down_events(&event_fd, &cfg, event_prev_key_bits,
-					     key_bits, event_prev_enc_pressed,
-					     enc_sw.stable);
-			event_prev_key_bits = key_bits;
+			vibe_key_bits = build_vibe_key_bits(key_bits);
+			kbd_need_sync = true;
+			if (profile_is_vibe()) {
+				control_voice_mic(event_prev_key_bits, vibe_key_bits,
+						  cfg.debug);
+				emit_key_down_events(&event_fd, &cfg,
+						     event_prev_key_bits,
+						     vibe_key_bits,
+						     event_prev_enc_pressed,
+						     enc_sw.stable);
+			}
+			event_prev_key_bits = vibe_key_bits;
 			event_prev_enc_pressed = enc_sw.stable;
 		}
 		if (event_delta_pending) {
-			emit_encoder_events(&event_fd, &cfg, event_delta_pending);
+			if (profile_is_vibe())
+				emit_encoder_events(&event_fd, &cfg,
+						    event_delta_pending);
 			event_delta_pending = 0;
 		}
 
@@ -1850,6 +2640,37 @@ int main(int argc, char **argv)
 					   pending_delta);
 		}
 
+		if (!cfg.no_hid && kbd_fd >= 0) {
+			int rc = 0;
+
+			key_bits = build_key_bits(keys);
+			if (!profile_keyboard_enabled()) {
+				if (kbd_need_sync || kbd_sent_key_bits != 0)
+					rc = send_kbd_report(kbd_fd, 0, cfg.debug);
+				if (rc == 0) {
+					kbd_sent_key_bits = 0;
+					kbd_need_sync = false;
+				}
+			} else if (kbd_need_sync || key_bits != kbd_sent_key_bits) {
+				rc = send_kbd_report(kbd_fd, key_bits, cfg.debug);
+				if (rc == 0) {
+					kbd_sent_key_bits = key_bits;
+					kbd_need_sync = false;
+				}
+			}
+			if (rc < 0) {
+				if (cfg.debug) {
+					fprintf(stderr,
+						"aikb_hid_input: keyboard HID write failed: %s\n",
+						strerror(errno));
+				}
+				close(kbd_fd);
+				kbd_fd = -1;
+				kbd_need_sync = true;
+				next_kbd_try_ms = now + 1000u;
+			}
+		}
+
 		if (cfg.no_hid) {
 			keys_dirty = false;
 			pending_delta = 0;
@@ -1858,16 +2679,20 @@ int main(int argc, char **argv)
 			/* Per Board/Host contract: KEY/ENCODER events MUST carry
 			 * the currently-displayed sid, and picker-view input is
 			 * board-local (no HID emission). */
-			bool send_to_host = (g_view == BOARD_VIEW_TERMINAL) &&
+			bool send_to_host = profile_is_vibe() &&
+					     (g_view == BOARD_VIEW_TERMINAL) &&
 					     g_active_sid != 0;
 			uint16_t event_sid = g_active_sid;
 
 			if (keys_dirty) {
+				uint8_t vibe_key_bits;
 				uint8_t pressed_bits;
 				bool enc_pressed_event;
 
 				key_bits = build_key_bits(keys);
-				pressed_bits = key_bits & (uint8_t)~hid_prev_key_bits;
+				vibe_key_bits = build_vibe_key_bits(key_bits);
+				pressed_bits =
+					vibe_key_bits & (uint8_t)~hid_prev_key_bits;
 				enc_pressed_event =
 					enc_sw.stable && !hid_prev_enc_pressed;
 				if (send_to_host &&
@@ -1878,7 +2703,7 @@ int main(int argc, char **argv)
 							    cfg.debug);
 				}
 				if (rc == 0) {
-					hid_prev_key_bits = key_bits;
+					hid_prev_key_bits = vibe_key_bits;
 					hid_prev_enc_pressed = enc_sw.stable;
 					keys_dirty = false;
 				}
@@ -1914,6 +2739,10 @@ int main(int argc, char **argv)
 
 	if (hid_fd >= 0)
 		close(hid_fd);
+	if (kbd_fd >= 0) {
+		(void)send_kbd_report(kbd_fd, 0, cfg.debug);
+		close(kbd_fd);
+	}
 	if (screen_fd >= 0)
 		close(screen_fd);
 	if (ctrl_fd >= 0)
