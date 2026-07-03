@@ -60,6 +60,7 @@
 #define HID_MAX_PAYLOAD (HID_REPORT_LEN - HID_HEADER_SIZE)
 #define KBD_REPORT_LEN 8
 
+#define REPORT_ID_KEYBOARD 0x01
 #define REPORT_ID_HOST_BOUND 0x10
 #define REPORT_ID_DEVICE_BOUND 0x20
 #define REPORT_ID_FEATURE 0x30
@@ -861,16 +862,28 @@ static int write_kbd_report(int fd, const uint8_t report[KBD_REPORT_LEN])
 	return 0;
 }
 
-static int send_kbd_report(int kbd_fd, uint8_t key_bits, bool debug)
+static int write_merged_kbd_report(int fd, const uint8_t kbd[KBD_REPORT_LEN])
+{
+	uint8_t report[HID_REPORT_LEN];
+
+	memset(report, 0, sizeof(report));
+	report[0] = REPORT_ID_KEYBOARD;
+	memcpy(&report[1], kbd, KBD_REPORT_LEN);
+	return write_hid_report(fd, report);
+}
+
+static int send_kbd_report(int kbd_fd, bool merged, uint8_t key_bits, bool debug)
 {
 	uint8_t report[KBD_REPORT_LEN];
 	int rc;
 
 	build_kbd_report(key_bits, report);
-	rc = write_kbd_report(kbd_fd, report);
+	rc = merged ? write_merged_kbd_report(kbd_fd, report) :
+		write_kbd_report(kbd_fd, report);
 	if (debug && rc == 0) {
 		fprintf(stderr,
-			"aikb_hid_input: kbd tx mod=0x%02x keys=%02x,%02x,%02x,%02x,%02x,%02x bits=0x%02x\n",
+			"aikb_hid_input: kbd tx %s mod=0x%02x keys=%02x,%02x,%02x,%02x,%02x,%02x bits=0x%02x\n",
+			merged ? "merged" : "split",
 			report[0], report[2], report[3], report[4], report[5],
 			report[6], report[7], key_bits);
 	}
@@ -2322,7 +2335,8 @@ static void usage(FILE *out)
 		"                      [--ctrl-out PATH] [--event-out PATH]\n"
 		"                      [--ui-ctrl-in PATH]\n"
 		"                      [--poll-ms N] [--debounce-ms N]\n"
-		"                      [--reverse] [--debug] [--no-hid]\n");
+		"                      [--reverse] [--debug] [--no-hid]\n"
+		"                      Use --kbd-hid merged when keyboard reports share --hid.\n");
 }
 
 static int parse_uint(const char *s, unsigned *out)
@@ -2405,6 +2419,7 @@ int main(int argc, char **argv)
 		0, 1, -1, 0,
 	};
 	struct config cfg;
+	bool kbd_hid_merged = false;
 	struct mmio_page pinmux = { 0 };
 	struct mmio_page rtc_ioblk = { 0 };
 	struct mmio_page gpio_a = { 0 };
@@ -2439,6 +2454,8 @@ int main(int argc, char **argv)
 
 	if (parse_args(argc, argv, &cfg) != 0)
 		return 2;
+	kbd_hid_merged = cfg.kbd_hid_path &&
+		strcmp(cfg.kbd_hid_path, "merged") == 0;
 
 	profile_load(cfg.debug);
 
@@ -2512,7 +2529,8 @@ int main(int argc, char **argv)
 			}
 		}
 
-		if (!cfg.no_hid && cfg.kbd_hid_path && kbd_fd < 0 &&
+		if (!cfg.no_hid && cfg.kbd_hid_path && !kbd_hid_merged &&
+		    kbd_fd < 0 &&
 		    now >= next_kbd_try_ms) {
 			kbd_fd = open_hid(cfg.kbd_hid_path);
 			if (kbd_fd < 0) {
@@ -2545,6 +2563,8 @@ int main(int argc, char **argv)
 				hid_prev_key_bits =
 					build_vibe_key_bits(build_key_bits(keys));
 				hid_prev_enc_pressed = enc_sw.stable;
+				if (kbd_hid_merged)
+					kbd_need_sync = true;
 				keys_dirty = false;
 				pending_delta = 0;
 				if (cfg.debug) {
@@ -2640,19 +2660,26 @@ int main(int argc, char **argv)
 					   pending_delta);
 		}
 
-		if (!cfg.no_hid && kbd_fd >= 0) {
+		if (!cfg.no_hid &&
+		    ((kbd_hid_merged && hid_fd >= 0) ||
+		     (!kbd_hid_merged && kbd_fd >= 0))) {
 			int rc = 0;
+			int active_kbd_fd = kbd_hid_merged ? hid_fd : kbd_fd;
 
 			key_bits = build_key_bits(keys);
 			if (!profile_keyboard_enabled()) {
 				if (kbd_need_sync || kbd_sent_key_bits != 0)
-					rc = send_kbd_report(kbd_fd, 0, cfg.debug);
+					rc = send_kbd_report(active_kbd_fd,
+							     kbd_hid_merged,
+							     0, cfg.debug);
 				if (rc == 0) {
 					kbd_sent_key_bits = 0;
 					kbd_need_sync = false;
 				}
 			} else if (kbd_need_sync || key_bits != kbd_sent_key_bits) {
-				rc = send_kbd_report(kbd_fd, key_bits, cfg.debug);
+				rc = send_kbd_report(active_kbd_fd,
+						     kbd_hid_merged,
+						     key_bits, cfg.debug);
 				if (rc == 0) {
 					kbd_sent_key_bits = key_bits;
 					kbd_need_sync = false;
@@ -2664,10 +2691,16 @@ int main(int argc, char **argv)
 						"aikb_hid_input: keyboard HID write failed: %s\n",
 						strerror(errno));
 				}
-				close(kbd_fd);
-				kbd_fd = -1;
+				if (kbd_hid_merged) {
+					close(hid_fd);
+					hid_fd = -1;
+					next_hid_try_ms = now + 1000u;
+				} else {
+					close(kbd_fd);
+					kbd_fd = -1;
+					next_kbd_try_ms = now + 1000u;
+				}
 				kbd_need_sync = true;
-				next_kbd_try_ms = now + 1000u;
 			}
 		}
 
@@ -2737,10 +2770,12 @@ int main(int argc, char **argv)
 	spawn_voice_mic_cmd(false, cfg.debug);
 	reap_voice_mic_children();
 
+	if (kbd_hid_merged && hid_fd >= 0)
+		(void)send_kbd_report(hid_fd, true, 0, cfg.debug);
 	if (hid_fd >= 0)
 		close(hid_fd);
 	if (kbd_fd >= 0) {
-		(void)send_kbd_report(kbd_fd, 0, cfg.debug);
+		(void)send_kbd_report(kbd_fd, false, 0, cfg.debug);
 		close(kbd_fd);
 	}
 	if (screen_fd >= 0)

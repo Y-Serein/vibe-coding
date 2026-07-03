@@ -158,7 +158,12 @@ start_aikb_hid_input()
    [ "${AIKB_HID_DEBUG:-0}" = "1" ] && HID_DEBUG_ARG="--debug"
 
    HID_POLL_MS="${AIKB_HID_POLL_MS:-10}"
-   "${HID_INPUT}" --hid /dev/hidg0 --kbd-hid /dev/hidg1 --screen-out "${AIKB_LCD_INPUT}" --ctrl-out "${AIKB_LCD_CTRL}" --event-out "${AIKB_PET_EVENTS}" --ui-ctrl-in "${AIKB_UI_CTRL}" --poll-ms "${HID_POLL_MS}" ${HID_DEBUG_ARG} >> "${HID_LOG}" 2>&1 &
+   if [ -e /dev/hidg1 ]; then
+      AIKB_KBD_HID="/dev/hidg1"
+   else
+      AIKB_KBD_HID="merged"
+   fi
+   "${HID_INPUT}" --hid /dev/hidg0 --kbd-hid "${AIKB_KBD_HID}" --screen-out "${AIKB_LCD_INPUT}" --ctrl-out "${AIKB_LCD_CTRL}" --event-out "${AIKB_PET_EVENTS}" --ui-ctrl-in "${AIKB_UI_CTRL}" --poll-ms "${HID_POLL_MS}" ${HID_DEBUG_ARG} >> "${HID_LOG}" 2>&1 &
    HID_PID=$!
    sleep 1
    if kill -0 "${HID_PID}" >/dev/null 2>&1; then
